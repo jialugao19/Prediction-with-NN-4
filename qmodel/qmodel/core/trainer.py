@@ -118,7 +118,7 @@ class Trainer(AsyncTrainer):
 
         # Reset CUDA peak memory stats so max_* reflect this run only.
         if self.config.device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats(self.config.device)
+            torch.cuda.reset_peak_memory_stats()
 
         # Initialize NVML reader once so per-step reads are cheap.
         if self.config.device.type != "cuda":
