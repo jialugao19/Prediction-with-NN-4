@@ -1,0 +1,10 @@
+[flake8]
+max-line-length = 200
+exclude =
+    build,
+    train_logs,
+    tests/CQ1s/train_logs,
+    qmodel.egg-info,
+    .pytest_cache
+# help me ignore E251
+ignore = E251, E226, F401, F403, F405, E303, W504, E265, E221, E241, W503, F541, E202

@@ -1,0 +1,4 @@
+[console_scripts]
+qmodel-remote-submit = qmodel.scheduling.cli_remote_submit:main
+qmodel-run = qmodel.experiment.cli_run:main
+qmodel-submit = qmodel.scheduling.cli_submit:main
