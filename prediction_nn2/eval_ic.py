@@ -157,16 +157,59 @@ def attach_labels(pred_df: pd.DataFrame, config: EvalConfig) -> pd.DataFrame:
     yymmdd = pred_df["date"].astype(int).unique().tolist()
     yyyymmdd = [20000000 + int(d) for d in yymmdd]
 
-    # Load price panels and compute volatility labels per date.
-    panel = _load_price_panel_for_dates(config, yyyymmdd)
-    panel["trade_date"] = panel["Date"].astype(int)
-    panel["price_label"] = panel["Close"].astype(float)
-    panel["volatility_label"] = _forward_vol_label(panel, int(config.horizon_minutes)).astype(float)
+    # Merge per-day labels in a loop to keep peak memory bounded on multi-year spans.
+    parts: list[pd.DataFrame] = []
+    for d_yymmdd, d_yyyymmdd in zip(yymmdd, yyyymmdd):
+        # Select prediction rows for one trade date to minimize merge payload.
+        day_pred = pred_df.loc[pred_df["date"].astype(int) == int(d_yymmdd)].copy()
 
-    # Merge labels onto prediction rows using (StockCode, DateTime) keys.
-    key_cols = ["StockCode", "DateTime"]
-    merged = pred_df.merge(panel[key_cols + ["price_label", "volatility_label"]], on=key_cols, how="left", validate="many_to_one")
-    return merged
+        # Load price panel for this date and compute same-day labels.
+        panel = _load_price_panel_for_dates(config, [int(d_yyyymmdd)])
+        panel["price_label"] = panel["Close"].astype(float)
+        panel["volatility_label"] = _forward_vol_label(panel, int(config.horizon_minutes)).astype(float)
+
+        # Merge labels onto prediction rows using (StockCode, DateTime) keys.
+        key_cols = ["StockCode", "DateTime"]
+        day_merged = day_pred.merge(panel[key_cols + ["price_label", "volatility_label"]], on=key_cols, how="left", validate="many_to_one")
+        parts.append(day_merged)
+
+    # Concatenate day merges back into one dataframe in stable original order.
+    out = pd.concat(parts, axis=0).reset_index(drop=True)
+    return out
+
+
+def annual_pooled_ic(df: pd.DataFrame, out_csv: Path, out_png: Path) -> pd.DataFrame:
+    """Compute pooled IC per calendar year and persist a CSV plus bar plot."""
+    # Compute year integer from yymmdd date and keep only finite prediction/target rows.
+    tmp = df[["date", "prediction", "target"]].dropna(subset=["prediction", "target"]).copy()
+    tmp["year"] = (2000 + (tmp["date"].astype(int) // 10000)).astype(int)
+
+    # Aggregate pooled Pearson/Spearman IC per year.
+    rows: list[dict[str, object]] = []
+    for y, g in tmp.groupby("year", sort=True):
+        # Compute correlations using the shared correlation helpers.
+        pred = g["prediction"].to_numpy(dtype=float)
+        tgt = g["target"].to_numpy(dtype=float)
+        rows.append({"year": int(y), "pearson_ic": _pearson(pred, tgt), "rank_ic": _spearman(pred, tgt), "count": int(np.isfinite(pred).sum())})
+    out = pd.DataFrame(rows).sort_values("year", kind="stable").reset_index(drop=True)
+    out.to_csv(out_csv, index=False)
+
+    # Plot yearly IC bars for Pearson and Rank IC.
+    fig = plt.figure(figsize=(10, 4))
+    ax = fig.add_subplot(1, 1, 1)
+    xs = out["year"].to_numpy(dtype=int)
+    ax.bar(xs - 0.15, out["pearson_ic"].to_numpy(dtype=float), width=0.3, label="Pearson IC")
+    ax.bar(xs + 0.15, out["rank_ic"].to_numpy(dtype=float), width=0.3, label="Rank IC (Spearman)")
+    ax.axhline(0.0, color="#999999", linewidth=1.0)
+    ax.set_title("Annual pooled IC (prediction vs target)")
+    ax.set_xlabel("year")
+    ax.set_ylabel("IC")
+    ax.set_xticks(xs, [str(int(x)) for x in xs])
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=160)
+    plt.close(fig)
+    return out
 
 
 def _rolling_group_ic(
@@ -176,49 +219,131 @@ def _rolling_group_ic(
     step_size: int,
 ) -> pd.DataFrame:
     """Compute rolling-window IC over cross-sections sorted by a label."""
-    # Compute per-timestamp grouped IC rows.
-    rows: list[dict[str, object]] = []
-    for (d, t), g in df.groupby(["date", "time"], sort=True):
+    # Define helpers to compute Pearson correlation from windowed prefix sums.
+    def _corr_from_sums(sum_x: float, sum_y: float, sum_x2: float, sum_y2: float, sum_xy: float, w: int) -> float:
+        """Compute Pearson correlation from raw sums on a fixed window."""
+        # Compute covariance and variances with stable float math.
+        wf = float(w)
+        cov = float(sum_xy - (sum_x * sum_y) / wf)
+        var_x = float(sum_x2 - (sum_x * sum_x) / wf)
+        var_y = float(sum_y2 - (sum_y * sum_y) / wf)
+        if not (np.isfinite(cov) and np.isfinite(var_x) and np.isfinite(var_y)):
+            return float("nan")
+        if float(var_x) <= 0.0 or float(var_y) <= 0.0:
+            return float("nan")
+        return float(cov / float(np.sqrt(var_x * var_y)))
+
+    # Accumulate aggregated moments per rank bin to avoid materializing millions of window rows.
+    bins: dict[float, dict[str, float]] = {}
+    w = int(window_size)
+    step = int(step_size)
+    for (_d, _t), g in df.groupby(["date", "time"], sort=True):
         # Sort by the grouping label and drop missing rows.
         gg = g[["prediction", "target", label_col]].dropna(subset=["prediction", "target", label_col]).sort_values(label_col, kind="stable")
         n = int(gg.shape[0])
-        if n < int(window_size):
+        if int(n) < int(w):
             continue
 
-        # Slide a rolling window along sorted rows and compute IC per window.
-        pred = gg["prediction"].to_numpy(dtype=float)
-        tgt = gg["target"].to_numpy(dtype=float)
-        for st in range(0, n - int(window_size) + 1, int(step_size)):
-            # Define window center rank as percentile for cross-date comparability.
-            center = float(st + int(window_size) * 0.5)
-            center_rank = float(center / float(n))
-            p = pred[st : st + int(window_size)]
-            y = tgt[st : st + int(window_size)]
-            rows.append(
-                {
-                    "date": int(d),
-                    "time": int(t),
-                    "group_center_rank": float(center_rank),
-                    "ic": _pearson(p, y),
-                    "rank_ic": _spearman(p, y),
-                    "n": int(window_size),
-                }
-            )
-    out = pd.DataFrame(rows)
+        # Extract prediction/target arrays and cast once for stable prefix-sum accumulation.
+        pred = gg["prediction"].to_numpy(dtype=np.float64, copy=False)
+        tgt = gg["target"].to_numpy(dtype=np.float64, copy=False)
 
-    # Aggregate across all timestamps by binned center rank.
-    if out.shape[0] == 0:
-        return out
-    out["rank_bin"] = out["group_center_rank"].round(3)
-    agg = out.groupby("rank_bin", sort=True).agg(
-        group_center_rank=("group_center_rank", "mean"),
-        mean_ic=("ic", "mean"),
-        std_ic=("ic", "std"),
-        mean_rank_ic=("rank_ic", "mean"),
-        std_rank_ic=("rank_ic", "std"),
-        count=("ic", "count"),
-    )
-    return agg.reset_index(drop=True).sort_values("group_center_rank", kind="stable").reset_index(drop=True)
+        # Build prefix sums for Pearson IC computation on raw values.
+        ps = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(pred, dtype=np.float64)])
+        ts = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(tgt, dtype=np.float64)])
+        p2s = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(pred * pred, dtype=np.float64)])
+        t2s = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(tgt * tgt, dtype=np.float64)])
+        pts = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(pred * tgt, dtype=np.float64)])
+
+        # Build global ranks once and reuse for the rolling-window rank IC approximation.
+        pr = stats.rankdata(pred, method="average").astype(np.float64, copy=False)
+        tr = stats.rankdata(tgt, method="average").astype(np.float64, copy=False)
+        prs = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(pr, dtype=np.float64)])
+        trs = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(tr, dtype=np.float64)])
+        pr2s = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(pr * pr, dtype=np.float64)])
+        tr2s = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(tr * tr, dtype=np.float64)])
+        prts = np.concatenate([np.zeros((1,), dtype=np.float64), np.cumsum(pr * tr, dtype=np.float64)])
+
+        # Slide windows along sorted rows and accumulate moments per rank bin.
+        for st in range(0, int(n - w + 1), int(step)):
+            # Compute the window's center rank percentile for cross-date binning.
+            center = float(st + w * 0.5)
+            center_rank = float(center / float(n))
+            rank_bin = float(round(center_rank, 3))
+
+            # Compute Pearson IC from prefix sums on raw prediction/target.
+            ed = int(st + w)
+            sum_p = float(ps[ed] - ps[st])
+            sum_t = float(ts[ed] - ts[st])
+            sum_p2 = float(p2s[ed] - p2s[st])
+            sum_t2 = float(t2s[ed] - t2s[st])
+            sum_pt = float(pts[ed] - pts[st])
+            ic = _corr_from_sums(sum_p, sum_t, sum_p2, sum_t2, sum_pt, w)
+
+            # Compute rank IC from prefix sums on global ranks restricted to the same window.
+            sum_pr = float(prs[ed] - prs[st])
+            sum_tr = float(trs[ed] - trs[st])
+            sum_pr2 = float(pr2s[ed] - pr2s[st])
+            sum_tr2 = float(tr2s[ed] - tr2s[st])
+            sum_prt = float(prts[ed] - prts[st])
+            rank_ic = _corr_from_sums(sum_pr, sum_tr, sum_pr2, sum_tr2, sum_prt, w)
+
+            # Initialize accumulator buckets lazily per observed rank bin.
+            if rank_bin not in bins:
+                bins[rank_bin] = {
+                    "sum_center_rank": 0.0,
+                    "sum_ic": 0.0,
+                    "sum_ic2": 0.0,
+                    "n_ic": 0.0,
+                    "sum_rank_ic": 0.0,
+                    "sum_rank_ic2": 0.0,
+                    "n_rank_ic": 0.0,
+                    "count": 0.0,
+                }
+            acc = bins[rank_bin]
+
+            # Accumulate first and second moments for mean/std computation.
+            acc["sum_center_rank"] += float(center_rank)
+            if np.isfinite(ic):
+                acc["sum_ic"] += float(ic)
+                acc["sum_ic2"] += float(ic * ic)
+                acc["n_ic"] += 1.0
+            if np.isfinite(rank_ic):
+                acc["sum_rank_ic"] += float(rank_ic)
+                acc["sum_rank_ic2"] += float(rank_ic * rank_ic)
+                acc["n_rank_ic"] += 1.0
+            acc["count"] += 1.0
+
+    # Return empty output early when no bins were accumulated.
+    if len(bins) == 0:
+        return pd.DataFrame([])
+
+    # Convert aggregated moments into the stable curve dataframe schema.
+    rows: list[dict[str, object]] = []
+    for rank_bin in sorted(bins.keys()):
+        # Convert sums into mean/std while guarding against negative variance from float drift.
+        acc = bins[rank_bin]
+        c = float(acc["count"])
+        mean_center = float(acc["sum_center_rank"] / c)
+        # Compute mean/std for IC metrics using finite-only counts to match pandas semantics.
+        n_ic = float(acc["n_ic"])
+        n_rank_ic = float(acc["n_rank_ic"])
+        mean_ic = float(acc["sum_ic"] / n_ic) if n_ic > 0.0 else float("nan")
+        var_ic = float(acc["sum_ic2"] / n_ic - mean_ic * mean_ic) if n_ic > 1.0 else float("nan")
+        mean_rank_ic = float(acc["sum_rank_ic"] / n_rank_ic) if n_rank_ic > 0.0 else float("nan")
+        var_rank_ic = float(acc["sum_rank_ic2"] / n_rank_ic - mean_rank_ic * mean_rank_ic) if n_rank_ic > 1.0 else float("nan")
+        rows.append(
+            {
+                "group_center_rank": float(mean_center),
+                "mean_ic": float(mean_ic),
+                "std_ic": float(np.sqrt(max(var_ic, 0.0))) if np.isfinite(var_ic) else float("nan"),
+                "mean_rank_ic": float(mean_rank_ic),
+                "std_rank_ic": float(np.sqrt(max(var_rank_ic, 0.0))) if np.isfinite(var_rank_ic) else float("nan"),
+                "count": int(c),
+            }
+        )
+    out = pd.DataFrame(rows).sort_values("group_center_rank", kind="stable").reset_index(drop=True)
+    return out
 
 
 def _plot_group_curve(df: pd.DataFrame, title: str, out_png: Path) -> None:

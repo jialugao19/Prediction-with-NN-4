@@ -18,6 +18,7 @@ from prediction_nn2.dataset import NpzDatasetSpec, Stock1mNpzDataset
 from prediction_nn2.eval_ic import (
     EvalConfig,
     attach_labels,
+    annual_pooled_ic,
     intraday_time_series_ic,
     load_eval_predictions,
     pooled_ic,
@@ -76,6 +77,55 @@ def _eval_mse_metric(namespace: str, it: int, pred: np.ndarray, target: np.ndarr
     return {f"{str(namespace)}/objective/mse": mse}
 
 
+def _export_train_loss_curve(tb_dir: Path, out_png: Path) -> None:
+    """Export a training loss curve PNG from TensorBoard event files."""
+    # Load scalar events using TensorBoard's event accumulator.
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    # Read events and require the standard qmodel scalar tag to exist.
+    acc = EventAccumulator(tb_dir.as_posix(), size_guidance={"scalars": 0})
+    acc.Reload()
+    tag = "train/objective/loss"
+    scalars = acc.Scalars(tag)
+    steps = np.asarray([s.step for s in scalars], dtype=int)
+    values = np.asarray([s.value for s in scalars], dtype=float)
+
+    # Plot the raw loss curve with a log-y axis to emphasize early training dynamics.
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(10, 4))
+    ax = fig.add_subplot(1, 1, 1)
+    ax.plot(steps, values, linewidth=1.6, color="#4c72b0")
+    ax.set_title("Training loss curve (TensorBoard scalar: train/objective/loss)")
+    ax.set_xlabel("iteration")
+    ax.set_ylabel("loss")
+    ax.set_yscale("log")
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=160)
+    plt.close(fig)
+
+
+def _move_eval_dir(run_dir: Path, *, src_name: str, dst_name: str, it: int) -> Path:
+    """Move one qmodel eval iter directory to a new parent to avoid overwrites."""
+    # Resolve source and destination paths under the run directory.
+    src = Path(run_dir) / str(src_name) / f"iter_{int(it)}"
+    dst = Path(run_dir) / str(dst_name) / f"iter_{int(it)}"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # Remove any prior destination so repeated pipeline invocations can resume cleanly.
+    if dst.exists():
+        import shutil
+
+        shutil.rmtree(dst)
+
+    # Move the directory as an atomic rename when possible.
+    src.rename(dst)
+    return dst
+
+
 def _build_qmodel_config(cfg: PipelineConfig, feature_dim: int, run_root: Path) -> SimpleNamespace:
     """Build a qmodel-compatible flat config namespace for single-GPU training."""
     # Select training device; prefer CUDA when available.
@@ -101,7 +151,7 @@ def _build_qmodel_config(cfg: PipelineConfig, feature_dim: int, run_root: Path) 
 
     # Build evaluator config namespace to match qmodel evaluator expectations.
     evaluator = SimpleNamespace(
-        eval_checkpoint_iter=[int(cfg.num_iters)],
+        eval_checkpoint_iter=[int(cfg.num_iters) - 1],
         eval_all_num_iters=0,
         eval_batch_size=int(cfg.eval_batch_size),
     )
@@ -174,7 +224,7 @@ def _list_checkpoint_iters(run_dir: Path) -> list[int]:
             continue
         iters.append(int(parts[1]))
     if len(iters) == 0:
-        raise RuntimeError(f"No checkpoints found under: {ckpt_dir.as_posix()}")
+        return []
     return sorted(set(iters))
 
 def _select_best_checkpoint_by_val(run_root: Path, qconf: SimpleNamespace, checkpoint_iters: list[int]) -> tuple[int, dict[int, dict[str, float]]]:
@@ -237,6 +287,8 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
     (out_root / "artifacts").mkdir(parents=True, exist_ok=True)
 
     # Run data preparation and persist NPZ splits and distribution artifacts.
+    print(f"[pipeline] data_prep start out_root={out_root.as_posix()} start={start_trade_date} end={end_trade_date}", flush=True)
+    t_prep0 = time.time()
     prep = prepare_npz_splits(
         DataPrepConfig(
             stock1m_dir=Path(cfg.stock1m_dir),
@@ -249,27 +301,65 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
             seed=int(cfg.seed),
             horizon_minutes=int(cfg.horizon_minutes),
             sample_stocks_per_minute=int(cfg.sample_stocks_per_minute),
+            workers=32,
         )
     )
+    t_prep1 = time.time()
+    if not bool(prep["done"]):
+        print(
+            f"[pipeline] data_prep partial seconds={float(t_prep1 - t_prep0):.2f} next_stage={prep['stage']} index={int(prep['index'])}",
+            flush=True,
+        )
+        return
+    print(f"[pipeline] data_prep done seconds={float(t_prep1 - t_prep0):.2f} train_rows={int(prep['train_rows'])}", flush=True)
 
     # Build qmodel config and run training on the selected device.
     qconf = _build_qmodel_config(cfg, feature_dim=len(prep["feature_names"]), run_root=Path(out_root))
     device = torch.device(qconf.device)
     pin_memory = bool(device.type == "cuda")
-    if torch.device(qconf.device).type == "cuda":
-        from qmodel.core.trainer import Trainer
 
-        trainer = Trainer(qconf)
-        trainer.train()
+    # Chunk training by checkpoint interval so repeated invocations can eventually reach 100k+ iters.
+    final_iter = int(cfg.num_iters) - 1
+    ckpt_iters_before = _list_checkpoint_iters(Path(out_root))
+    last_ckpt = int(max(ckpt_iters_before)) if len(ckpt_iters_before) else -1
+    if int(last_ckpt) < int(final_iter):
+        # Decide the next target iteration as the next save boundary, capped at the final iteration.
+        step = int(cfg.save_every)
+        next_target = int(min(int(final_iter), int(last_ckpt + step) if int(last_ckpt) >= 0 else int(step)))
+        qconf.num_iters = int(next_target + 1)
+        qconf.load_from_iter = -1 if int(last_ckpt) >= 0 else None
+        print(
+            f"[pipeline] train chunk start last_ckpt={last_ckpt} target_iter={next_target} batch_size={int(cfg.batch_size)}",
+            flush=True,
+        )
+
+        if torch.device(qconf.device).type == "cuda":
+            from qmodel.core.trainer import Trainer
+
+            trainer = Trainer(qconf)
+            trainer.train()
+        else:
+            from qmodel.core.cpu_trainer import CpuTrainer
+
+            trainer = CpuTrainer(qconf)
+            trainer.train()
+
+        ckpt_iters_after = _list_checkpoint_iters(Path(out_root))
+        last_after = int(max(ckpt_iters_after)) if len(ckpt_iters_after) else -1
+        if int(last_after) < int(final_iter):
+            print(f"[pipeline] train partial last_ckpt={last_after} final_iter={final_iter}", flush=True)
+            return
     else:
-        from qmodel.core.cpu_trainer import CpuTrainer
-
-        trainer = CpuTrainer(qconf)
-        trainer.train()
+        print(f"[pipeline] train skip already_complete last_ckpt={last_ckpt} final_iter={final_iter}", flush=True)
 
     # Evaluate validation metrics for all checkpoints and pick the best one.
     ckpt_iters = _list_checkpoint_iters(Path(out_root))
     best_it, val_metrics_by_it = _select_best_checkpoint_by_val(Path(out_root), qconf, ckpt_iters)
+    print(f"[pipeline] train done best_it={int(best_it)} ckpts={len(ckpt_iters)}", flush=True)
+
+    # Export a loss-curve plot from TensorBoard events for the training log requirement.
+    loss_png = Path(out_root) / "train_loss.png"
+    _export_train_loss_curve(Path(qconf.root_dir) / "tb", loss_png)
 
     # Run evaluator on test split only once for the selected checkpoint.
     if torch.device(qconf.device).type == "cuda":
@@ -285,9 +375,12 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
         evaluator.eval_single(int(best_it), n_iter=0, namespace="eval")
         evaluator.close()
 
-    # Load predictions and compute all required IC diagnostics.
-    shard_path = Path(qconf.root_dir) / "eval" / f"iter_{int(best_it)}" / "rank0.feather"
-    pred_df = load_eval_predictions(shard_path)
+    # Move test evaluator outputs aside before running predict evaluation to avoid overwrite.
+    test_eval_iter_dir = _move_eval_dir(Path(qconf.root_dir), src_name="eval", dst_name="eval_test", it=int(best_it))
+
+    # Load test predictions and compute all required IC diagnostics.
+    test_shard_path = Path(test_eval_iter_dir) / "rank0.feather"
+    pred_df = load_eval_predictions(test_shard_path)
     pooled = pooled_ic(pred_df)
 
     # Emit intraday IC CSV and plot.
@@ -322,8 +415,51 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
     rank_png = Path(out_root) / "pred_vs_target_rank.png"
     score_ret_rank_plot(pred_df, rank_png)
 
+    # Run long-horizon predict evaluation and annual IC reporting.
+    if torch.device(qconf.device).type == "cuda":
+        from qmodel.core.evaluator import Evaluator
+
+        predictor = Evaluator(qconf, group="predict", writer=None, enable_logging=False)
+        predictor.eval_single(int(best_it), n_iter=0, namespace="predict")
+        predictor.close()
+    else:
+        from qmodel.core.cpu_evaluator import CpuEvaluator
+
+        predictor = CpuEvaluator(qconf, group="predict", writer=None, enable_logging=False)
+        predictor.eval_single(int(best_it), n_iter=0, namespace="predict")
+        predictor.close()
+
+    # Compute pooled/annual/intraday/rolling IC on the full-span predict set.
+    predict_shard_path = Path(qconf.root_dir) / "eval" / f"iter_{int(best_it)}" / "rank0.feather"
+    predict_df = load_eval_predictions(predict_shard_path)
+    predict_pooled = pooled_ic(predict_df)
+    annual_csv = Path(out_root) / "annual_ic.csv"
+    annual_png = Path(out_root) / "annual_ic.png"
+    annual_tbl = annual_pooled_ic(predict_df, annual_csv, annual_png)
+    predict_intraday_csv = Path(out_root) / "predict_intraday_ic.csv"
+    predict_intraday_png = Path(out_root) / "predict_intraday_ic.png"
+    intraday_time_series_ic(predict_df, predict_intraday_csv, predict_intraday_png)
+
+    # Attach labels and compute rolling IC curves on the long-horizon predict set.
+    t_attach_pred0 = time.time()
+    predict_labeled = attach_labels(predict_df, eval_cfg)
+    t_attach_pred1 = time.time()
+    predict_vol_csv = Path(out_root) / "predict_vol_rolling_ic.csv"
+    predict_vol_png = Path(out_root) / "predict_vol_rolling_ic.png"
+    predict_price_csv = Path(out_root) / "predict_price_rolling_ic.csv"
+    predict_price_png = Path(out_root) / "predict_price_rolling_ic.png"
+    t_roll_pred0 = time.time()
+    volatility_rolling_ic(predict_labeled, eval_cfg, predict_vol_csv, predict_vol_png)
+    price_rolling_ic(predict_labeled, eval_cfg, predict_price_csv, predict_price_png)
+    t_roll_pred1 = time.time()
+
     # Persist a small performance audit record for evaluation-time bottlenecks.
     perf = {
+        "data_prep": {
+            "elapsed_seconds": float(t_prep1 - t_prep0),
+            "audit": prep["audit"],
+            "audit_rates": prep["audit_rates"],
+        },
         "train": {
             "device": str(device),
             "pin_memory": bool(pin_memory),
@@ -332,6 +468,8 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
         "eval": {
             "attach_labels_seconds": float(t_attach1 - t_attach0),
             "rolling_ic_seconds": float(t_roll1 - t_roll0),
+            "predict_attach_labels_seconds": float(t_attach_pred1 - t_attach_pred0),
+            "predict_rolling_ic_seconds": float(t_roll_pred1 - t_roll_pred0),
         }
     }
     import yaml
@@ -353,8 +491,19 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
         vol_png,
         price_png,
         rank_png,
+        loss_png,
         vol_agg,
         price_agg,
+        predict_pooled,
+        annual_tbl,
+        annual_csv,
+        annual_png,
+        predict_intraday_csv,
+        predict_intraday_png,
+        predict_vol_csv,
+        predict_vol_png,
+        predict_price_csv,
+        predict_price_png,
         perf,
     )
     report_path.write_text(report, encoding="utf-8")
@@ -373,8 +522,19 @@ def _render_report(
     vol_png: Path,
     price_png: Path,
     rank_png: Path,
+    loss_png: Path,
     vol_agg,
     price_agg,
+    predict_pooled: dict[str, float],
+    annual_tbl,
+    annual_csv: Path,
+    annual_png: Path,
+    predict_intraday_csv: Path,
+    predict_intraday_png: Path,
+    predict_vol_csv: Path,
+    predict_vol_png: Path,
+    predict_price_csv: Path,
+    predict_price_png: Path,
     perf: dict[str, object],
 ) -> str:
     """Render the final markdown report content."""
@@ -382,20 +542,27 @@ def _render_report(
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     best_metrics = dict(val_metrics_by_it[int(best_it)])
     val_mse = float(best_metrics["val/objective/mse"])
-    val_ic = float(best_metrics.get("val/quality/global_ic", float("nan")))
-    val_rank_ic = float(best_metrics.get("val/quality/rank_ic", float("nan")))
+    val_ic = float(best_metrics["val/quality/global_ic"])
+    val_rank_ic = float(best_metrics["val/quality/rank_ic"])
     approx_epoch = _approx_epoch(int(best_it), int(prep["train_rows"]), int(cfg.batch_size))
     pooled_lines = (
         f"- Pearson IC: {pooled['pearson_ic']:.6f}\n"
         f"- Rank IC (Spearman): {pooled['rank_ic']:.6f}\n"
         f"- Count: {int(pooled['count'])}"
     )
+    predict_lines = (
+        f"- Pearson IC: {predict_pooled['pearson_ic']:.6f}\n"
+        f"- Rank IC (Spearman): {predict_pooled['rank_ic']:.6f}\n"
+        f"- Count: {int(predict_pooled['count'])}"
+    )
     split_meta_path = Path(prep["meta_path"])
     import yaml
 
     split_meta = yaml.safe_load(split_meta_path.read_text(encoding="utf-8"))
-    audit = dict(split_meta.get("audit", {}))
-    dates = dict(split_meta.get("dates", {}))
+    audit = dict(split_meta["audit"])
+    audit_rates = dict(split_meta["audit_rates"])
+    dates = dict(split_meta["dates"])
+    tb_dir = split_meta_path.parent.parent.parent / "run" / "tb"
 
     def _range_str(xs: list[int]) -> str:
         # Format a compact inclusive date range string.
@@ -403,16 +570,14 @@ def _render_report(
             return "[]"
         return f"[{int(xs[0])}, {int(xs[-1])}] ({len(xs)} days)"
 
-    def _missing_str(a: dict[str, object]) -> str:
+    def _missing_str(a: dict[str, object], r: dict[str, object]) -> str:
         # Convert raw/kept/sampled counters into simple missing rates.
-        raw = float(a.get("raw_rows", 0))
-        kept = float(a.get("kept_rows", 0))
-        sampled = float(a.get("sampled_rows", 0))
-        if raw <= 0.0:
-            return "raw_rows=0"
-        feat_drop = 1.0 - kept / raw
-        samp_drop = 0.0 if kept <= 0.0 else 1.0 - sampled / kept
-        return f"raw={int(raw)}, kept={int(kept)} (drop={feat_drop:.2%}), sampled={int(sampled)} (drop={samp_drop:.2%})"
+        raw = int(a["raw_rows"])
+        kept = int(a["kept_rows"])
+        sampled = int(a["sampled_rows"])
+        feat_drop = 1.0 - float(r["kept_rate"])
+        samp_drop = 1.0 - float(r["sampled_rate_vs_kept"])
+        return f"raw={raw}, kept={kept} (drop={feat_drop:.2%}), sampled={sampled} (drop={samp_drop:.2%})"
 
     # Summarize group curve inflections for volatility and price buckets.
     vol_desc = "Empty curve (n < window_size)."
@@ -428,6 +593,13 @@ def _render_report(
             price_agg["group_center_rank"].to_numpy(dtype=float),
         )
 
+    # Extract annual IC for 2021 vs 2026 for the requested regime comparison.
+    annual_idx = annual_tbl.set_index("year")
+    ic_2021 = float(annual_idx.loc[2021, "pearson_ic"])
+    ic_2026 = float(annual_idx.loc[2026, "pearson_ic"])
+    rank_ic_2021 = float(annual_idx.loc[2021, "rank_ic"])
+    rank_ic_2026 = float(annual_idx.loc[2026, "rank_ic"])
+
     # Render a structured markdown report matching the required sections.
     md = f"""# 神经网络预测与多维度 IC 评估报告
 
@@ -437,26 +609,30 @@ def _render_report(
 
 - 最佳 Checkpoint: iter={best_it} (approx_epoch={approx_epoch:.2f}), Val MSE={val_mse:.6e}, Val IC={val_ic:.6f}, Val RankIC={val_rank_ic:.6f}.
 - Test Pooled IC: Pearson={pooled['pearson_ic']:.6f}, RankIC={pooled['rank_ic']:.6f}, Count={int(pooled['count'])}.
+- Predict Pooled IC (2021-2026 全周期): Pearson={predict_pooled['pearson_ic']:.6f}, RankIC={predict_pooled['rank_ic']:.6f}, Count={int(predict_pooled['count'])}.
+- Annual IC 对比: 2021 Pearson={ic_2021:.6f}, RankIC={rank_ic_2021:.6f}; 2026 Pearson={ic_2026:.6f}, RankIC={rank_ic_2026:.6f}.
 - Volatility 分组拐点: {vol_desc}.
 - Price 分组拐点: {price_desc}.
 
 ## 数据集元数据 (Dataset Metadata)
 
 - Split 配置文件: `{split_meta_path.as_posix()}`
-- 日期范围: train={_range_str(list(dates.get('train', [])))}, val={_range_str(list(dates.get('val', [])))}, test={_range_str(list(dates.get('test', [])))}.
-- 样本量: train={int(prep['train_rows'])}, val={int(prep['val_rows'])}, test={int(prep['test_rows'])}.
-- 缺失/采样审计: train={_missing_str(dict(audit.get('train', {})))}, val={_missing_str(dict(audit.get('val', {})))}, test={_missing_str(dict(audit.get('test', {})))}.
+- 日期范围: train={_range_str(list(dates['train']))}, val={_range_str(list(dates['val']))}, test={_range_str(list(dates['test']))}, predict={_range_str(list(dates['predict']))}.
+- 样本量: train={int(prep['train_rows'])}, val={int(prep['val_rows'])}, test={int(prep['test_rows'])}, predict={int(prep['predict_rows'])}.
+- 缺失/采样审计: train={_missing_str(dict(audit['train']), dict(audit_rates['train']))}, val={_missing_str(dict(audit['val']), dict(audit_rates['val']))}, test={_missing_str(dict(audit['test']), dict(audit_rates['test']))}, predict={_missing_str(dict(audit['predict']), dict(audit_rates['predict']))}.
 
 ## 模型与训练协议 (Experiment Protocol)
 
 - 训练设备: `{str(perf['train']['device'])}`, DataLoader `pin_memory={bool(perf['train']['pin_memory'])}`, `num_workers={int(perf['train']['num_workers'])}`.
 - Checkpoint 选择: 仅使用 Validation (`val/objective/mse`) 选取最佳 iter, Test 仅做一次性最终评估.
+- TensorBoard: `{tb_dir.as_posix()}` (loss 标量: `train/objective/loss`).
 
 ## 模型性能 (Model Performance)
 
 - 最佳 Checkpoint: iter={best_it}, approx_epoch={approx_epoch:.2f}.
 - Val: MSE={val_mse:.6e}, IC={val_ic:.6f}, RankIC={val_rank_ic:.6f}.
 - Test Pooled:\n{pooled_lines}
+- Predict Pooled:\n{predict_lines}
 
 ## 分组结论 (Group Findings)
 
@@ -465,13 +641,15 @@ def _render_report(
 
 ## 性能审计 (Performance Audit)
 
-- attach_labels_seconds={float(perf['eval']['attach_labels_seconds']):.4f}, rolling_ic_seconds={float(perf['eval']['rolling_ic_seconds']):.4f}.
+- data_prep_seconds={float(perf['data_prep']['elapsed_seconds']):.4f}, test_attach_labels_seconds={float(perf['eval']['attach_labels_seconds']):.4f}, test_rolling_ic_seconds={float(perf['eval']['rolling_ic_seconds']):.4f}.
+- predict_attach_labels_seconds={float(perf['eval']['predict_attach_labels_seconds']):.4f}, predict_rolling_ic_seconds={float(perf['eval']['predict_rolling_ic_seconds']):.4f}.
 
 ## 文件输出 (Artifacts)
 
 - `{intraday_csv.as_posix()}`
 - `{vol_csv.as_posix()}`
 - `{price_csv.as_posix()}`
+- `{annual_csv.as_posix()}`
 
 ### 四张核心图表
 
@@ -479,6 +657,14 @@ def _render_report(
 2. Volatility Rolling IC: `{vol_png.as_posix()}`
 3. Price Rolling IC: `{price_png.as_posix()}`
 4. 预测收益率 vs 实际收益率 Rank 曲线: `{rank_png.as_posix()}`
+
+### 训练与长周期诊断
+
+1. Train Loss Curve: `{loss_png.as_posix()}`
+2. Annual Pooled IC: `{annual_png.as_posix()}`
+3. Predict Intraday IC: `{predict_intraday_png.as_posix()}`
+4. Predict Volatility Rolling IC: `{predict_vol_png.as_posix()}`
+5. Predict Price Rolling IC: `{predict_price_png.as_posix()}`
 """
     return md
 
@@ -487,10 +673,10 @@ def main() -> None:
     """Run the pipeline with module-level configuration constants."""
     # Define a small default experiment that is GPU-feasible while remaining fully general.
     cfg = PipelineConfig(
-        root_dir=Path("outputs") / "default",
+        root_dir=Path("outputs") / "upgrade_20260318",
         stock1m_dir=Path("/data/ashare/market/stock1m"),
-        start_trade_date=20240102,
-        end_trade_date=20240131,
+        start_trade_date=20210101,
+        end_trade_date=20260317,
         split_policy="tail_holdout",
         train_days=6,
         val_days=1,
@@ -499,16 +685,16 @@ def main() -> None:
         seed=7,
         horizon_minutes=30,
         sample_stocks_per_minute=800,
-        batch_size=2048,
+        batch_size=8192,
         num_workers=4,
-        num_iters=500,
-        save_every=250,
-        eval_every=250,
-        eval_during=True,
-        eval_during_num_iters=20,
-        eval_batch_size=4096,
+        num_iters=120001,
+        save_every=20000,
+        eval_every=20000,
+        eval_during=False,
+        eval_during_num_iters=0,
+        eval_batch_size=8192,
         learning_rate=2e-3,
-        hidden_dims=[128, 64],
+        hidden_dims=[512, 512],
         dropout=0.1,
         rolling_window=100,
         rolling_step=50,
@@ -516,11 +702,6 @@ def main() -> None:
 
     # Execute the full pipeline.
     run_pipeline(cfg)
-
-
-if __name__ == "__main__":
-    main()
-
 
 def run_pipeline(cfg: PipelineConfig) -> None:
     """Execute data prep, GPU training, evaluation, and report output under /data-cache."""
@@ -539,6 +720,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         seed=int(cfg.seed),
         horizon_minutes=int(cfg.horizon_minutes),
         sample_stocks_per_minute=int(cfg.sample_stocks_per_minute),
+        workers=32,
     )
     all_dates = list_trade_dates(probe)
     if len(all_dates) == 0:
@@ -590,3 +772,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         return
 
     raise RuntimeError(f"Unknown split_policy: {policy}")
+
+
+if __name__ == "__main__":
+    main()

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import yaml
 
 
 @dataclass(frozen=True)
@@ -18,27 +19,32 @@ class NpzDatasetSpec:
 
 
 class Stock1mNpzDataset:
-    """Load precomputed feature/label/meta arrays from NPZ for qmodel training and eval."""
+    """Load precomputed feature/label/meta arrays from raw binaries for qmodel training and eval."""
 
     def __init__(self, group: str, dtype: torch.dtype, spec: NpzDatasetSpec) -> None:
-        """Load group arrays from disk and keep them in CPU memory."""
-        # Resolve file path for the requested split.
+        """Load group arrays from disk via memmap to avoid multi-year RAM blowups."""
+        # Resolve group name and load the shared storage metadata.
         group = str(group)
-        path = Path(spec.data_dir) / f"{group}.npz"
-        if not path.exists():
-            raise FileNotFoundError(path.as_posix())
+        meta_path = Path(spec.data_dir) / "meta.yaml"
+        meta = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
+        storage = dict(meta["storage"])
+        groups = dict(storage["groups"])
+        g = dict(groups[group])
 
-        # Load arrays and cast them into stable dtypes.
-        with np.load(path, allow_pickle=False) as z:
-            x = z["x"].astype(np.float32, copy=False)
-            y = z["y"].astype(np.float32, copy=False)
-            meta = z["meta"].astype(np.int64, copy=False)
+        # Memory-map x/y/meta with shapes recorded in meta.yaml.
+        x_path = Path(spec.data_dir) / str(g["x"])
+        y_path = Path(spec.data_dir) / str(g["y"])
+        meta_bin_path = Path(spec.data_dir) / str(g["meta"])
+        rows = int(g["rows"])
+        feature_dim = int(g["feature_dim"])
+        x = np.memmap(x_path, mode="r", dtype=np.float32, shape=(int(rows), int(feature_dim)))
+        y = np.memmap(y_path, mode="r", dtype=np.float32, shape=(int(rows), 1))
+        meta_arr = np.memmap(meta_bin_path, mode="r", dtype=np.int64, shape=(int(rows), 3))
 
-        # Materialize tensors for fast __getitems__ batching.
+        # Wrap the memmaps with tensors so DataLoader can batch without reading everything upfront.
         self._x = torch.from_numpy(x).to(dtype=dtype)
         self._y = torch.from_numpy(y).to(dtype=dtype)
-        self._meta = torch.from_numpy(meta)
-        self._pin_memory = bool(spec.pin_memory)
+        self._meta = torch.from_numpy(meta_arr)
 
         # Validate expected shapes to match qmodel evaluator conventions.
         if self._x.dim() != 2:
@@ -59,12 +65,6 @@ class Stock1mNpzDataset:
         x = self._x[int(index)]
         y = self._y[int(index)]
         meta = self._meta[int(index)]
-
-        # Optionally pin memory to support CUDA async transfer in GPU mode.
-        if self._pin_memory:
-            x = x.pin_memory()
-            y = y.pin_memory()
-            meta = meta.pin_memory()
         return x, y, meta
 
     def __getitems__(self, indices) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -76,11 +76,4 @@ class Stock1mNpzDataset:
         x = self._x.index_select(0, idx)
         y = self._y.index_select(0, idx)
         meta = self._meta.index_select(0, idx)
-
-        # Optionally pin memory to match qmodel async CUDA trainer assumptions.
-        if self._pin_memory:
-            x = x.pin_memory()
-            y = y.pin_memory()
-            meta = meta.pin_memory()
         return x, y, meta
-

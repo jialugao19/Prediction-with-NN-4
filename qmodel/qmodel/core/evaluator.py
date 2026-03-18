@@ -81,7 +81,8 @@ class Evaluator:
         # Reset CUDA peak memory stats so max_* reflect this evaluator run only.
         if self.config.device.type != "cuda":
             raise RuntimeError(f"Eval perf console logging requires CUDA device, got: {self.config.device}")
-        torch.cuda.reset_peak_memory_stats(self.config.device)
+        # Reset peak stats without explicit device to avoid torch builds rejecting device arguments pre-init.
+        torch.cuda.reset_peak_memory_stats()
 
         # Initialize NVML reader once so per-checkpoint reads are cheap.
         self._nvml = NvmlReader(self.config.device)

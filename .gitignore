@@ -11,6 +11,7 @@ evaluation/factor_qc/
 # figures / plots
 txt/
 report/
+outputs/
 
 # 通用大文件数据
 *.parquet

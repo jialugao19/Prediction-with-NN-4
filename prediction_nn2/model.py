@@ -25,15 +25,18 @@ class MlpRegressor(nn.Module):
         """Build the MLP stack from the provided configuration."""
         super().__init__()
 
+        # Force all hidden layer widths to the upgraded capacity requested by the pipeline milestone.
+        hidden_dim = 512
+
         # Build a list of linear blocks according to hidden_dims.
         layers: list[nn.Module] = []
         prev = int(config.in_dim)
-        for h in list(config.hidden_dims):
+        for _h in list(config.hidden_dims):
             # Add linear + activation + dropout as one semantic block.
-            layers.append(nn.Linear(prev, int(h)))
+            layers.append(nn.Linear(prev, int(hidden_dim)))
             layers.append(nn.ReLU(inplace=True))
             layers.append(nn.Dropout(float(config.dropout)))
-            prev = int(h)
+            prev = int(hidden_dim)
 
         # Add the final projection into a single regression output.
         layers.append(nn.Linear(prev, 1))
