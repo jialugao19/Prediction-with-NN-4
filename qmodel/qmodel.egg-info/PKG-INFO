@@ -1,0 +1,65 @@
+Metadata-Version: 2.4
+Name: qmodel
+Version: 0.2.2
+Summary: Modular training and evaluation utilities
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.0
+Requires-Dist: numpy
+Requires-Dist: omegaconf
+Requires-Dist: nvidia-ml-py
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Provides-Extra: prefect
+Requires-Dist: prefect>=3.6.15; extra == "prefect"
+
+## Metrics（TensorBoard + Console）
+
+训练与评估的 metrics 已解耦为可配置的 callable 列表，用户可以在 `conf.py` 里通过以下字段控制“计算哪些 metrics / 写入哪些 tag / console 打印哪些”：
+
+- `train_metric_fns: list[callable]`
+- `eval_metric_fns: list[callable]`
+
+约定：
+
+- 这两个字段都是必填（必须在 `conf.py` 里显式提供）；缺失会直接报错。
+- 允许空 list：空 list 表示使用内置默认 metrics（train/eval 各自一套）。
+- 每个 metric callable 通过 `metric(**payload)` 调用，建议签名包含 `**kwargs` 以忽略不需要的字段。
+- callable 必须返回 `dict[str, MetricValue]`：
+  - scalar: `int|float`
+  - histogram: `qmodel.metrics.Histogram(values)`
+- 返回的 dict 会同时写入 TensorBoard 与 console（histogram 在 console 打印摘要）。
+- eval metrics 在 rank0 的 CPU 子进程（`multiprocessing` + `spawn`）里从 `rank*.feather` shards 读取并计算：
+  - metric fn 必须是可 import 的 top-level function，或 `functools.partial(top-level)`；不支持 lambda/嵌套函数。
+  - 目前只支持 scalar；Histogram 会直接报错。
+- `eval_during` 的 namespace 是 `ckpt_eval/*`，`evaluate()` 的 namespace 是 `eval/*`，训练是 `train/*`。
+- `group="predict"` 不做任何 metrics log。
+
+### 内置 metrics（builtin）
+
+内置函数在 `qmodel.metrics.builtin`：
+
+- `train_basic_metrics`（默认开启）
+- `train_param_grad_norm_metrics`（默认关闭，tag 很多）
+- `eval_global_ic`（默认开启）
+- `eval_distribution_scalars`（默认开启）
+- `eval_distribution_hist`（默认关闭）
+
+### 配置示例（conf.py）
+
+```python
+from qmodel.metrics import builtin
+
+def my_train_metric(namespace, step, loss, **kwargs):
+    return {f"{namespace}/loss_x2": float(loss) * 2.0}
+
+solver = {
+    # ...
+    "train_metric_fns": [builtin.train_basic_metrics, my_train_metric],  # required, [] => builtin defaults
+}
+eval = {
+    # ...
+    "eval_metric_fns": [builtin.eval_global_ic, builtin.eval_distribution_scalars],  # required, [] => builtin defaults
+}
+```

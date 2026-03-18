@@ -1,0 +1,11 @@
+torch>=2.0
+numpy
+omegaconf
+nvidia-ml-py
+
+[dev]
+pytest
+pytest-cov
+
+[prefect]
+prefect>=3.6.15

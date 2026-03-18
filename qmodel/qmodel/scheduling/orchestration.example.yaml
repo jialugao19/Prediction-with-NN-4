@@ -1,0 +1,57 @@
+# `orchestration.yaml` example for qmodel-submit (local) and qmodel-remote-submit (remote orchestration).
+#
+# This file is a template. Copy it into your project repo (e.g. qmodel-rch/orchestration.yaml) and edit values.
+
+prefect_submit:
+  # Prefect server API used by qmodel-submit.
+  # NOTE: remote runs also use this value, but evaluated on the remote machine (127.0.0.1 is remote).
+  prefect_api_url: http://127.0.0.1:4200/api
+  work_pool: gpu-pool-a
+  deployment: gpu-pool-a
+  run_name_prefix: qmodel-rch
+
+remote_orchestrate:
+  # Local project repo root (absolute path).
+  repo_path: /abs/path/to/qmodel-rch
+
+  # Base expm tag name (created by `expm tag`).
+  expm_tag: v0
+
+  # Training config path inside the experiment snapshot (relative to repo root).
+  conf_relpath: rch/conf.py
+
+  # Local Prefect server for the orchestrator flow itself.
+  local_prefect_api_url: http://127.0.0.1:4200/api
+  local_work_pool: orchestrator
+  local_deployment: orchestrator
+
+  # Remote machine connection and paths.
+  remote_host: autodl
+  remote_experiment_root: $HOME/experiment
+  remote_train_logs_root: $HOME/train_logs
+
+  # Where to sync back remote train_logs on local machine (relative to repo_path).
+  local_train_logs_remote_root: train_logs/remote
+
+  # Exclude patterns when syncing experiment code to remote.
+  rsync_excludes:
+    - runs
+    - train_logs
+    - .git
+    - __pycache__
+    - "*.pyc"
+
+  # Extra override tokens appended to the remote `qmodel-submit` command.
+  # Must be provided as `--key value` pairs (even-length list[str]).
+  submit_overrides: []
+
+  # Cache check and rebuild policy on remote.
+  cache_check:
+    enabled: true
+    config_relpath: config.yaml
+    marker_filename: meta.pkl
+    rebuild_cmd:
+      - python
+      - rch/build_data.py
+      - --config
+      - config.yaml
