@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import torch
 import numpy as np
+import pandas as pd
 
 from qmodel.config import LRSchedulerConfig
 from qmodel.metrics import builtin
@@ -19,12 +20,17 @@ from prediction_nn2.eval_ic import (
     EvalConfig,
     attach_labels,
     annual_pooled_ic,
+    ic_time_series_summary,
     intraday_time_series_ic,
     load_eval_predictions,
     pooled_ic,
     price_rolling_ic,
+    price_rolling_ic_parallel,
+    prediction_rank_turnover,
+    residual_diagnostics,
     score_ret_rank_plot,
     volatility_rolling_ic,
+    volatility_rolling_ic_parallel,
 )
 from prediction_nn2.model import MlpConfig, MlpRegressor
 
@@ -38,6 +44,8 @@ class PipelineConfig:
     start_trade_date: int
     end_trade_date: int
     split_policy: str
+    train_end_trade_date: int
+    val_end_trade_date: int
     train_days: int
     val_days: int
     test_days: int
@@ -45,6 +53,7 @@ class PipelineConfig:
     seed: int
     horizon_minutes: int
     sample_stocks_per_minute: int
+    use_cross_sectional_gaussianize: bool
     batch_size: int
     num_workers: int
     num_iters: int
@@ -106,6 +115,16 @@ def _export_train_loss_curve(tb_dir: Path, out_png: Path) -> None:
     fig.tight_layout()
     fig.savefig(out_png, dpi=160)
     plt.close(fig)
+
+
+def _format_seconds(seconds: float) -> str:
+    """Format a float second count into a short human-readable string."""
+    # Convert seconds into hour/minute/second integers for stable log output.
+    total = int(round(float(seconds)))
+    hours = int(total // 3600)
+    minutes = int((total % 3600) // 60)
+    secs = int(total % 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
 def _move_eval_dir(run_dir: Path, *, src_name: str, dst_name: str, it: int) -> Path:
@@ -289,50 +308,78 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
     # Run data preparation and persist NPZ splits and distribution artifacts.
     print(f"[pipeline] data_prep start out_root={out_root.as_posix()} start={start_trade_date} end={end_trade_date}", flush=True)
     t_prep0 = time.time()
-    prep = prepare_npz_splits(
-        DataPrepConfig(
-            stock1m_dir=Path(cfg.stock1m_dir),
-            out_dir=Path(out_root) / "artifacts",
-            start_trade_date=int(start_trade_date),
-            end_trade_date=int(end_trade_date),
-            train_days=int(train_days),
-            val_days=int(val_days),
-            test_days=int(test_days),
-            seed=int(cfg.seed),
-            horizon_minutes=int(cfg.horizon_minutes),
-            sample_stocks_per_minute=int(cfg.sample_stocks_per_minute),
-            workers=32,
-        )
+    prep_cfg = DataPrepConfig(
+        stock1m_dir=Path(cfg.stock1m_dir),
+        out_dir=Path(out_root) / "artifacts",
+        start_trade_date=int(start_trade_date),
+        end_trade_date=int(end_trade_date),
+        train_days=int(train_days),
+        val_days=int(val_days),
+        test_days=int(test_days),
+        seed=int(cfg.seed),
+        horizon_minutes=int(cfg.horizon_minutes),
+        sample_stocks_per_minute=int(cfg.sample_stocks_per_minute),
+        use_cross_sectional_gaussianize=bool(cfg.use_cross_sectional_gaussianize),
+        workers=32,
     )
-    t_prep1 = time.time()
-    if not bool(prep["done"]):
+
+    # Keep invoking data prep until every split is fully materialized on disk.
+    prep = prepare_npz_splits(prep_cfg)
+    while not bool(prep["done"]):
+        # Read progress metrics and print a stable ETA summary after each chunk.
+        progress = dict(prep["progress"])
+        elapsed = float(progress["elapsed_seconds"])
+        estimated = float(progress["estimated_total_seconds"])
+        remaining = float(progress["remaining_seconds"])
         print(
-            f"[pipeline] data_prep partial seconds={float(t_prep1 - t_prep0):.2f} next_stage={prep['stage']} index={int(prep['index'])}",
+            "[pipeline] data_prep partial "
+            f"stage={progress['stage']} "
+            f"days={int(progress['days_done'])}/{int(progress['days_total'])} "
+            f"elapsed={_format_seconds(elapsed)} "
+            f"eta_total={_format_seconds(estimated)} "
+            f"eta_remaining={_format_seconds(remaining)}",
             flush=True,
         )
-        return
-    print(f"[pipeline] data_prep done seconds={float(t_prep1 - t_prep0):.2f} train_rows={int(prep['train_rows'])}", flush=True)
+        prep = prepare_npz_splits(prep_cfg)
+    t_prep1 = time.time()
+    progress = dict(prep["progress"])
+    print(
+        "[pipeline] data_prep done "
+        f"seconds={float(t_prep1 - t_prep0):.2f} "
+        f"elapsed_total={_format_seconds(float(progress['elapsed_seconds']))} "
+        f"train_rows={int(prep['train_rows'])}",
+        flush=True,
+    )
 
     # Build qmodel config and run training on the selected device.
     qconf = _build_qmodel_config(cfg, feature_dim=len(prep["feature_names"]), run_root=Path(out_root))
     device = torch.device(qconf.device)
     pin_memory = bool(device.type == "cuda")
 
-    # Chunk training by checkpoint interval so repeated invocations can eventually reach 100k+ iters.
+    # Advance training chunk-by-chunk until the final checkpoint is materialized.
     final_iter = int(cfg.num_iters) - 1
     ckpt_iters_before = _list_checkpoint_iters(Path(out_root))
     last_ckpt = int(max(ckpt_iters_before)) if len(ckpt_iters_before) else -1
-    if int(last_ckpt) < int(final_iter):
+    if int(last_ckpt) >= int(final_iter):
+        # Skip training when the full checkpoint set is already available.
+        print(f"[pipeline] train skip already_complete last_ckpt={last_ckpt} final_iter={final_iter}", flush=True)
+    while int(last_ckpt) < int(final_iter):
         # Decide the next target iteration as the next save boundary, capped at the final iteration.
         step = int(cfg.save_every)
         next_target = int(min(int(final_iter), int(last_ckpt + step) if int(last_ckpt) >= 0 else int(step)))
+        chunk_save_every = int(cfg.save_every)
+        if int(next_target) == int(final_iter) and int(final_iter) % int(cfg.save_every) != 0:
+            chunk_save_every = int(max(int(final_iter), 1))
         qconf.num_iters = int(next_target + 1)
+        qconf.save_every = int(chunk_save_every)
         qconf.load_from_iter = -1 if int(last_ckpt) >= 0 else None
         print(
-            f"[pipeline] train chunk start last_ckpt={last_ckpt} target_iter={next_target} batch_size={int(cfg.batch_size)}",
+            f"[pipeline] train chunk start last_ckpt={last_ckpt} target_iter={next_target} "
+            f"save_every={int(chunk_save_every)} batch_size={int(cfg.batch_size)}",
             flush=True,
         )
 
+        # Run one trainer chunk on the selected device.
         if torch.device(qconf.device).type == "cuda":
             from qmodel.core.trainer import Trainer
 
@@ -344,13 +391,10 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
             trainer = CpuTrainer(qconf)
             trainer.train()
 
+        # Refresh checkpoint progress and continue until the final iteration is saved.
         ckpt_iters_after = _list_checkpoint_iters(Path(out_root))
-        last_after = int(max(ckpt_iters_after)) if len(ckpt_iters_after) else -1
-        if int(last_after) < int(final_iter):
-            print(f"[pipeline] train partial last_ckpt={last_after} final_iter={final_iter}", flush=True)
-            return
-    else:
-        print(f"[pipeline] train skip already_complete last_ckpt={last_ckpt} final_iter={final_iter}", flush=True)
+        last_ckpt = int(max(ckpt_iters_after)) if len(ckpt_iters_after) else -1
+        print(f"[pipeline] train chunk done last_ckpt={last_ckpt} final_iter={final_iter}", flush=True)
 
     # Evaluate validation metrics for all checkpoints and pick the best one.
     ckpt_iters = _list_checkpoint_iters(Path(out_root))
@@ -382,6 +426,8 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
     test_shard_path = Path(test_eval_iter_dir) / "rank0.feather"
     pred_df = load_eval_predictions(test_shard_path)
     pooled = pooled_ic(pred_df)
+    test_ic_summary_yaml = Path(out_root) / "ic_time_series_summary.yaml"
+    test_ic_summary = ic_time_series_summary(pred_df, test_ic_summary_yaml)
 
     # Emit intraday IC CSV and plot.
     intraday_csv = Path(out_root) / "intraday_ic.csv"
@@ -415,6 +461,15 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
     rank_png = Path(out_root) / "pred_vs_target_rank.png"
     score_ret_rank_plot(pred_df, rank_png)
 
+    # Emit prediction-rank turnover and residual diagnostics on the test split.
+    turnover_csv = Path(out_root) / "prediction_rank_turnover.csv"
+    turnover_png = Path(out_root) / "prediction_rank_turnover.png"
+    turnover_yaml = Path(out_root) / "prediction_rank_turnover.yaml"
+    _turnover_tbl, test_turnover_summary = prediction_rank_turnover(pred_df, turnover_csv, turnover_png, turnover_yaml)
+    residual_yaml = Path(out_root) / "residual_diagnostics.yaml"
+    residual_png = Path(out_root) / "residual_diagnostics.png"
+    test_residual_summary = residual_diagnostics(pred_df, residual_yaml, residual_png)
+
     # Run long-horizon predict evaluation and annual IC reporting.
     if torch.device(qconf.device).type == "cuda":
         from qmodel.core.evaluator import Evaluator
@@ -433,6 +488,8 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
     predict_shard_path = Path(qconf.root_dir) / "eval" / f"iter_{int(best_it)}" / "rank0.feather"
     predict_df = load_eval_predictions(predict_shard_path)
     predict_pooled = pooled_ic(predict_df)
+    predict_ic_summary_yaml = Path(out_root) / "predict_ic_time_series_summary.yaml"
+    predict_ic_summary = ic_time_series_summary(predict_df, predict_ic_summary_yaml)
     annual_csv = Path(out_root) / "annual_ic.csv"
     annual_png = Path(out_root) / "annual_ic.png"
     annual_tbl = annual_pooled_ic(predict_df, annual_csv, annual_png)
@@ -440,17 +497,16 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
     predict_intraday_png = Path(out_root) / "predict_intraday_ic.png"
     intraday_time_series_ic(predict_df, predict_intraday_csv, predict_intraday_png)
 
-    # Attach labels and compute rolling IC curves on the long-horizon predict set.
-    t_attach_pred0 = time.time()
-    predict_labeled = attach_labels(predict_df, eval_cfg)
-    t_attach_pred1 = time.time()
     predict_vol_csv = Path(out_root) / "predict_vol_rolling_ic.csv"
     predict_vol_png = Path(out_root) / "predict_vol_rolling_ic.png"
     predict_price_csv = Path(out_root) / "predict_price_rolling_ic.csv"
     predict_price_png = Path(out_root) / "predict_price_rolling_ic.png"
+    # Compute rolling IC curves on the long-horizon predict set via per-date multiprocessing label joins.
+    t_attach_pred0 = time.time()
+    t_attach_pred1 = time.time()
     t_roll_pred0 = time.time()
-    volatility_rolling_ic(predict_labeled, eval_cfg, predict_vol_csv, predict_vol_png)
-    price_rolling_ic(predict_labeled, eval_cfg, predict_price_csv, predict_price_png)
+    volatility_rolling_ic_parallel(predict_df, eval_cfg, predict_vol_csv, predict_vol_png, workers=32)
+    price_rolling_ic_parallel(predict_df, eval_cfg, predict_price_csv, predict_price_png, workers=32)
     t_roll_pred1 = time.time()
 
     # Persist a small performance audit record for evaluation-time bottlenecks.
@@ -482,6 +538,8 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
         cfg,
         prep,
         pooled,
+        test_ic_summary,
+        test_ic_summary_yaml,
         best_it,
         val_metrics_by_it,
         intraday_csv,
@@ -498,12 +556,21 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
         annual_tbl,
         annual_csv,
         annual_png,
+        predict_ic_summary,
+        predict_ic_summary_yaml,
         predict_intraday_csv,
         predict_intraday_png,
         predict_vol_csv,
         predict_vol_png,
         predict_price_csv,
         predict_price_png,
+        turnover_csv,
+        turnover_png,
+        turnover_yaml,
+        test_turnover_summary,
+        residual_yaml,
+        residual_png,
+        test_residual_summary,
         perf,
     )
     report_path.write_text(report, encoding="utf-8")
@@ -513,6 +580,8 @@ def _render_report(
     cfg: PipelineConfig,
     prep: dict[str, object],
     pooled: dict[str, float],
+    test_ic_summary: dict[str, object],
+    test_ic_summary_yaml: Path,
     best_it: int,
     val_metrics_by_it: dict[int, dict[str, float]],
     intraday_csv: Path,
@@ -529,12 +598,21 @@ def _render_report(
     annual_tbl,
     annual_csv: Path,
     annual_png: Path,
+    predict_ic_summary: dict[str, object],
+    predict_ic_summary_yaml: Path,
     predict_intraday_csv: Path,
     predict_intraday_png: Path,
     predict_vol_csv: Path,
     predict_vol_png: Path,
     predict_price_csv: Path,
     predict_price_png: Path,
+    turnover_csv: Path,
+    turnover_png: Path,
+    turnover_yaml: Path,
+    test_turnover_summary: dict[str, object],
+    residual_yaml: Path,
+    residual_png: Path,
+    test_residual_summary: dict[str, object],
     perf: dict[str, object],
 ) -> str:
     """Render the final markdown report content."""
@@ -550,10 +628,24 @@ def _render_report(
         f"- Rank IC (Spearman): {pooled['rank_ic']:.6f}\n"
         f"- Count: {int(pooled['count'])}"
     )
+    test_ic_lines = (
+        f"- Pearson IC t-stat: {float(test_ic_summary['pearson_ic']['t_stat']):.4f}\n"
+        f"- Pearson IC>0 占比: {float(test_ic_summary['pearson_ic']['positive_ratio']):.2%}\n"
+        f"- Rank IC t-stat: {float(test_ic_summary['rank_ic']['t_stat']):.4f}\n"
+        f"- Rank IC>0 占比: {float(test_ic_summary['rank_ic']['positive_ratio']):.2%}\n"
+        f"- Timestamp Count: {int(test_ic_summary['timestamp_count'])}"
+    )
     predict_lines = (
         f"- Pearson IC: {predict_pooled['pearson_ic']:.6f}\n"
         f"- Rank IC (Spearman): {predict_pooled['rank_ic']:.6f}\n"
         f"- Count: {int(predict_pooled['count'])}"
+    )
+    predict_ic_lines = (
+        f"- Pearson IC t-stat: {float(predict_ic_summary['pearson_ic']['t_stat']):.4f}\n"
+        f"- Pearson IC>0 占比: {float(predict_ic_summary['pearson_ic']['positive_ratio']):.2%}\n"
+        f"- Rank IC t-stat: {float(predict_ic_summary['rank_ic']['t_stat']):.4f}\n"
+        f"- Rank IC>0 占比: {float(predict_ic_summary['rank_ic']['positive_ratio']):.2%}\n"
+        f"- Timestamp Count: {int(predict_ic_summary['timestamp_count'])}"
     )
     split_meta_path = Path(prep["meta_path"])
     import yaml
@@ -562,7 +654,16 @@ def _render_report(
     audit = dict(split_meta["audit"])
     audit_rates = dict(split_meta["audit_rates"])
     dates = dict(split_meta["dates"])
+    invalid_values = dict(split_meta["invalid_values"])
+    data_clean_feature_moments_path = split_meta_path.parent.parent / "data_clean" / "feature_moments.csv"
+    data_clean_report_rel = Path("artifacts") / "data_clean" / "report.md"
+    data_clean_feature_moments_rel = Path("artifacts") / "data_clean" / "feature_moments.csv"
+    data_clean_pooled_png_rel = Path("artifacts") / "data_clean" / "pooled_feature_grid.png"
     tb_dir = split_meta_path.parent.parent.parent / "run" / "tb"
+    invalid_stats_path = split_meta_path.parent.parent / str(invalid_values["stats_path"])
+    invalid_report_path = split_meta_path.parent.parent / str(invalid_values["report_path"])
+    invalid_tbl = pd.read_csv(invalid_stats_path)
+    moment_tbl = pd.read_csv(data_clean_feature_moments_path)
 
     def _range_str(xs: list[int]) -> str:
         # Format a compact inclusive date range string.
@@ -579,6 +680,17 @@ def _render_report(
         samp_drop = 1.0 - float(r["sampled_rate_vs_kept"])
         return f"raw={raw}, kept={kept} (drop={feat_drop:.2%}), sampled={sampled} (drop={samp_drop:.2%})"
 
+    def _invalid_row_str(row: dict[str, object]) -> str:
+        # Format one invalid-stat row into a compact report line.
+        return (
+            f"{str(row['field'])} ({str(row['field_type'])}): "
+            f"nan_ratio={float(row['nan_ratio']):.4%}, "
+            f"inf_ratio={float(row['inf_ratio']):.4%}, "
+            f"invalid_ratio={float(row['invalid_ratio']):.4%}, "
+            f"skew={float(row['skew_finite']):.4f}, "
+            f"kurtosis={float(row['kurtosis_finite']):.4f}"
+        )
+
     # Summarize group curve inflections for volatility and price buckets.
     vol_desc = "Empty curve (n < window_size)."
     if hasattr(vol_agg, "shape") and int(vol_agg.shape[0]) > 0:
@@ -593,12 +705,48 @@ def _render_report(
             price_agg["group_center_rank"].to_numpy(dtype=float),
         )
 
-    # Extract annual IC for 2021 vs 2026 for the requested regime comparison.
+    # Extract the first and last available annual IC rows for a regime comparison summary.
     annual_idx = annual_tbl.set_index("year")
-    ic_2021 = float(annual_idx.loc[2021, "pearson_ic"])
-    ic_2026 = float(annual_idx.loc[2026, "pearson_ic"])
-    rank_ic_2021 = float(annual_idx.loc[2021, "rank_ic"])
-    rank_ic_2026 = float(annual_idx.loc[2026, "rank_ic"])
+    annual_years = annual_tbl["year"].astype(int).tolist()
+    first_year = int(annual_years[0])
+    last_year = int(annual_years[-1])
+    first_year_ic = float(annual_idx.loc[int(first_year), "pearson_ic"])
+    last_year_ic = float(annual_idx.loc[int(last_year), "pearson_ic"])
+    first_year_rank_ic = float(annual_idx.loc[int(first_year), "rank_ic"])
+    last_year_rank_ic = float(annual_idx.loc[int(last_year), "rank_ic"])
+    predict_year_range = f"{int(first_year)}-{int(last_year)}" if int(first_year) != int(last_year) else f"{int(first_year)}"
+
+    # Summarize the most important invalid-value rows for the data-clean section.
+    invalid_top = invalid_tbl.sort_values(["invalid_ratio", "field"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    invalid_lines = "\n".join([f"- {_invalid_row_str(row)}" for row in invalid_top.head(5).to_dict(orient="records")])
+
+    # Summarize the post-clean pooled distribution rows with the largest residual tails.
+    moment_top = moment_tbl.sort_values(["kurtosis", "feature"], ascending=[False, True], key=lambda s: s.abs() if s.name == "kurtosis" else s, kind="stable").reset_index(drop=True)
+    moment_lines = "\n".join(
+        [
+            f"- {str(row['feature'])}: mean={float(row['mean']):.4f}, std={float(row['std']):.4f}, "
+            f"skew={float(row['skew']):.4f}, kurtosis={float(row['kurtosis']):.4f}"
+            for row in moment_top.head(5).to_dict(orient="records")
+        ]
+    )
+
+    # Summarize the test prediction-rank turnover in one compact paragraph.
+    turnover_lines = (
+        f"- Mean turnover: {float(test_turnover_summary['mean_rank_turnover']):.6f}\n"
+        f"- Mean rank corr: {float(test_turnover_summary['mean_rank_corr']):.6f}\n"
+        f"- Positive rank corr 占比: {float(test_turnover_summary['positive_rank_corr_ratio']):.2%}\n"
+        f"- Lowest turnover time: {int(test_turnover_summary['lowest_turnover_time'])}, value={float(test_turnover_summary['lowest_turnover_value']):.6f}\n"
+        f"- Highest turnover time: {int(test_turnover_summary['highest_turnover_time'])}, value={float(test_turnover_summary['highest_turnover_value']):.6f}"
+    )
+
+    # Summarize the test residual distribution in one compact paragraph.
+    residual_lines = (
+        f"- Residual mean: {float(test_residual_summary['residual_mean']):.6e}\n"
+        f"- Residual std: {float(test_residual_summary['residual_std']):.6e}\n"
+        f"- Residual skew/kurtosis: {float(test_residual_summary['residual_skew']):.4f} / {float(test_residual_summary['residual_kurtosis']):.4f}\n"
+        f"- MAE / RMSE: {float(test_residual_summary['mae']):.6e} / {float(test_residual_summary['rmse']):.6e}\n"
+        f"- Corr(prediction, residual): {float(test_residual_summary['corr_prediction_residual']):.6f}"
+    )
 
     # Render a structured markdown report matching the required sections.
     md = f"""# 神经网络预测与多维度 IC 评估报告
@@ -609,8 +757,8 @@ def _render_report(
 
 - 最佳 Checkpoint: iter={best_it} (approx_epoch={approx_epoch:.2f}), Val MSE={val_mse:.6e}, Val IC={val_ic:.6f}, Val RankIC={val_rank_ic:.6f}.
 - Test Pooled IC: Pearson={pooled['pearson_ic']:.6f}, RankIC={pooled['rank_ic']:.6f}, Count={int(pooled['count'])}.
-- Predict Pooled IC (2021-2026 全周期): Pearson={predict_pooled['pearson_ic']:.6f}, RankIC={predict_pooled['rank_ic']:.6f}, Count={int(predict_pooled['count'])}.
-- Annual IC 对比: 2021 Pearson={ic_2021:.6f}, RankIC={rank_ic_2021:.6f}; 2026 Pearson={ic_2026:.6f}, RankIC={rank_ic_2026:.6f}.
+- Predict Pooled IC ({predict_year_range} 全周期): Pearson={predict_pooled['pearson_ic']:.6f}, RankIC={predict_pooled['rank_ic']:.6f}, Count={int(predict_pooled['count'])}.
+- Annual IC 对比: {first_year} Pearson={first_year_ic:.6f}, RankIC={first_year_rank_ic:.6f}; {last_year} Pearson={last_year_ic:.6f}, RankIC={last_year_rank_ic:.6f}.
 - Volatility 分组拐点: {vol_desc}.
 - Price 分组拐点: {price_desc}.
 
@@ -621,9 +769,27 @@ def _render_report(
 - 样本量: train={int(prep['train_rows'])}, val={int(prep['val_rows'])}, test={int(prep['test_rows'])}, predict={int(prep['predict_rows'])}.
 - 缺失/采样审计: train={_missing_str(dict(audit['train']), dict(audit_rates['train']))}, val={_missing_str(dict(audit['val']), dict(audit_rates['val']))}, test={_missing_str(dict(audit['test']), dict(audit_rates['test']))}, predict={_missing_str(dict(audit['predict']), dict(audit_rates['predict']))}.
 
+## Data Clean Invalid Audit
+
+- Invalid 数值表: `{invalid_stats_path.as_posix()}`
+- Invalid 报告: `{invalid_report_path.as_posix()}`
+{invalid_lines}
+
+## Data Clean Pooled Distribution
+
+- Data clean 报告: `{data_clean_report_rel.as_posix()}`
+- Feature moments: `{data_clean_feature_moments_rel.as_posix()}`
+- Pooled 分布图: `{data_clean_pooled_png_rel.as_posix()}`
+{moment_lines}
+
+![]({data_clean_pooled_png_rel.as_posix()})
+
 ## 模型与训练协议 (Experiment Protocol)
 
 - 训练设备: `{str(perf['train']['device'])}`, DataLoader `pin_memory={bool(perf['train']['pin_memory'])}`, `num_workers={int(perf['train']['num_workers'])}`.
+- 模型结构: `MLP`, hidden layers 使用 `ReLU(inplace=True)`, 输出层为线性回归头, 不额外添加 activation.
+- Optimizer: `AdamW`, base learning rate=`{float(cfg.learning_rate):.6g}`.
+- LR Scheduler: 已启用, `use_lr_sched="custom"`, 采用 `Linear Warmup + Cosine Annealing`; `warmup_iters=200`, `start_factor=0.001`, `end_factor=1.0`, `finish_decay_iter={int(cfg.num_iters)}`, `eta_min=1e-6`.
 - Checkpoint 选择: 仅使用 Validation (`val/objective/mse`) 选取最佳 iter, Test 仅做一次性最终评估.
 - TensorBoard: `{tb_dir.as_posix()}` (loss 标量: `train/objective/loss`).
 
@@ -632,12 +798,41 @@ def _render_report(
 - 最佳 Checkpoint: iter={best_it}, approx_epoch={approx_epoch:.2f}.
 - Val: MSE={val_mse:.6e}, IC={val_ic:.6f}, RankIC={val_rank_ic:.6f}.
 - Test Pooled:\n{pooled_lines}
+- Test IC 时序诊断:\n{test_ic_lines}
 - Predict Pooled:\n{predict_lines}
+- Predict IC 时序诊断:\n{predict_ic_lines}
 
 ## 分组结论 (Group Findings)
 
 - Volatility rolling IC: {vol_desc}.
 - Price rolling IC: {price_desc}.
+
+## 诊断补充 (Diagnostics)
+
+- Test IC 时序摘要: `{test_ic_summary_yaml.as_posix()}`
+- Predict IC 时序摘要: `{predict_ic_summary_yaml.as_posix()}`
+- Prediction rank turnover 数值表: `{turnover_csv.as_posix()}`
+- Prediction rank turnover 摘要: `{turnover_yaml.as_posix()}`
+- Residual diagnostics 摘要: `{residual_yaml.as_posix()}`
+{turnover_lines}
+{residual_lines}
+
+### 公式补充
+
+- IC t-stat: `mean(IC_t) / (std(IC_t) / sqrt(T))`
+- IC>0 占比: `mean(1[IC_t > 0])`
+- 排序换手: `1 - corr(rank_t, rank_t-1)`
+- 残差: `residual = target - prediction`
+
+### 图表补充
+
+#### Prediction Rank Turnover
+
+![]({turnover_png.name})
+
+#### Residual Diagnostics
+
+![]({residual_png.name})
 
 ## 性能审计 (Performance Audit)
 
@@ -658,6 +853,12 @@ def _render_report(
 3. Price Rolling IC: `{price_png.as_posix()}`
 4. 预测收益率 vs 实际收益率 Rank 曲线: `{rank_png.as_posix()}`
 
+### 核心图表预览
+
+#### Prediction Rank Curve
+
+![]({rank_png.name})
+
 ### 训练与长周期诊断
 
 1. Train Loss Curve: `{loss_png.as_posix()}`
@@ -676,8 +877,10 @@ def main() -> None:
         root_dir=Path("outputs") / "upgrade_20260318",
         stock1m_dir=Path("/data/ashare/market/stock1m"),
         start_trade_date=20210101,
-        end_trade_date=20260317,
-        split_policy="tail_holdout",
+        end_trade_date=20231231,
+        split_policy="date_ranges",
+        train_end_trade_date=20221231,
+        val_end_trade_date=20230228,
         train_days=6,
         val_days=1,
         test_days=1,
@@ -685,10 +888,11 @@ def main() -> None:
         seed=7,
         horizon_minutes=30,
         sample_stocks_per_minute=800,
+        use_cross_sectional_gaussianize=False,
         batch_size=8192,
         num_workers=4,
         num_iters=120001,
-        save_every=20000,
+        save_every=10000,
         eval_every=20000,
         eval_during=False,
         eval_during_num_iters=0,
@@ -696,8 +900,8 @@ def main() -> None:
         learning_rate=2e-3,
         hidden_dims=[512, 512],
         dropout=0.1,
-        rolling_window=100,
-        rolling_step=50,
+        rolling_window=500,
+        rolling_step=1,
     )
 
     # Execute the full pipeline.
@@ -720,6 +924,7 @@ def run_pipeline(cfg: PipelineConfig) -> None:
         seed=int(cfg.seed),
         horizon_minutes=int(cfg.horizon_minutes),
         sample_stocks_per_minute=int(cfg.sample_stocks_per_minute),
+        use_cross_sectional_gaussianize=bool(cfg.use_cross_sectional_gaussianize),
         workers=32,
     )
     all_dates = list_trade_dates(probe)
@@ -742,6 +947,33 @@ def run_pipeline(cfg: PipelineConfig) -> None:
             train_days=int(train_days),
             val_days=int(cfg.val_days),
             test_days=int(cfg.test_days),
+        )
+        return
+
+    if policy == "date_ranges":
+        # Validate configured split boundaries before deriving split sizes.
+        train_end = int(cfg.train_end_trade_date)
+        val_end = int(cfg.val_end_trade_date)
+        if not (int(cfg.start_trade_date) <= int(train_end) < int(val_end) < int(cfg.end_trade_date)):
+            raise RuntimeError("date_ranges requires start_trade_date <= train_end_trade_date < val_end_trade_date < end_trade_date")
+
+        # Convert calendar boundaries into split counts on the available trade-date list.
+        train_dates = [int(d) for d in list(all_dates) if int(cfg.start_trade_date) <= int(d) <= int(train_end)]
+        val_dates = [int(d) for d in list(all_dates) if int(train_end) < int(d) <= int(val_end)]
+        test_dates = [int(d) for d in list(all_dates) if int(val_end) < int(d) <= int(cfg.end_trade_date)]
+        if len(train_dates) == 0 or len(val_dates) == 0 or len(test_dates) == 0:
+            raise RuntimeError(f"date_ranges produced empty split: train={len(train_dates)} val={len(val_dates)} test={len(test_dates)}")
+
+        # Run one split that exactly follows the requested calendar ranges.
+        out_root = root_dir / "date_ranges"
+        _run_single_split(
+            cfg,
+            out_root=out_root,
+            start_trade_date=int(cfg.start_trade_date),
+            end_trade_date=int(cfg.end_trade_date),
+            train_days=int(len(train_dates)),
+            val_days=int(len(val_dates)),
+            test_days=int(len(test_dates)),
         )
         return
 
