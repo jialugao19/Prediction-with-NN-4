@@ -48,6 +48,7 @@ class DataPrepConfig:
     seed: int
     horizon_minutes: int
     sample_stocks_per_minute: int
+    use_cross_sectional_gaussianize: bool
     workers: int
 
 
@@ -82,7 +83,7 @@ def _read_stock1m_day(trade_date: int, config: DataPrepConfig) -> pd.DataFrame:
     return df
 
 
-def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> pd.DataFrame:
+def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[pd.DataFrame, list[dict[str, object]]]:
     """Compute non-rank feature transforms and a forward return label."""
     # Drop invalid price rows so log/ratio transforms are well-defined.
     df = df.copy()
@@ -127,7 +128,7 @@ def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> pd.Data
     h = int(config.horizon_minutes)
     df["label_ret"] = g["log_close"].shift(-h) - df["log_close"]
 
-    # Keep only rows with finite features and label.
+    # Prepare the ordered feature/label columns for invalid-value accounting.
     feat_cols = [
         "ret_1m",
         "ret_5m",
@@ -145,13 +146,66 @@ def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> pd.Data
         "session_id",
         "session_minute_norm",
     ]
+
+    # Summarize NaN/inf statistics before dropping invalid rows.
     need = feat_cols + ["label_ret"]
+    invalid_feature_stats = _collect_invalid_feature_stats(df, feat_cols, "label_ret")
+
+    # Keep only rows with finite features and label.
     m = np.ones((df.shape[0],), dtype=bool)
     for c in need:
         v = df[c].to_numpy(dtype=float)
         m &= np.isfinite(v)
     df = df.loc[m, ["StockCode", "DateTime", "Date", "MinuteIndex"] + feat_cols + ["label_ret"]].reset_index(drop=True)
-    return df
+    return df, invalid_feature_stats
+
+
+def _collect_invalid_feature_stats(df: pd.DataFrame, feat_cols: list[str], label_col: str) -> list[dict[str, object]]:
+    """Collect pooled NaN/inf counters and finite-value moments for features and label."""
+    # Define the ordered fields once so output tables stay stable.
+    fields = [(str(name), "feature") for name in list(feat_cols)] + [(str(label_col), "label")]
+    rows: list[dict[str, object]] = []
+    for name, field_type in fields:
+        # Compute invalid counters and finite moments for one field.
+        v = df[str(name)].to_numpy(dtype=np.float64, copy=False)
+        total = int(v.shape[0])
+        nan_mask = np.isnan(v)
+        posinf_mask = np.isposinf(v)
+        neginf_mask = np.isneginf(v)
+        finite_mask = np.isfinite(v)
+        finite = v[finite_mask]
+        if int(finite.shape[0]) > 0:
+            s1 = float(finite.sum(dtype=np.float64))
+            s2 = float((finite * finite).sum(dtype=np.float64))
+            s3 = float((finite * finite * finite).sum(dtype=np.float64))
+            s4 = float((finite * finite * finite * finite).sum(dtype=np.float64))
+            vmin = float(finite.min())
+            vmax = float(finite.max())
+        else:
+            s1 = 0.0
+            s2 = 0.0
+            s3 = 0.0
+            s4 = 0.0
+            vmin = float("nan")
+            vmax = float("nan")
+        rows.append(
+            {
+                "field": str(name),
+                "field_type": str(field_type),
+                "total_count": int(total),
+                "finite_count": int(finite.shape[0]),
+                "nan_count": int(nan_mask.sum()),
+                "posinf_count": int(posinf_mask.sum()),
+                "neginf_count": int(neginf_mask.sum()),
+                "sum1": float(s1),
+                "sum2": float(s2),
+                "sum3": float(s3),
+                "sum4": float(s4),
+                "min_finite": float(vmin),
+                "max_finite": float(vmax),
+            }
+        )
+    return rows
 
 
 def _sample_per_minute(df: pd.DataFrame, config: DataPrepConfig) -> pd.DataFrame:
@@ -190,6 +244,14 @@ def _cross_sectional_gaussianize(df: pd.DataFrame, stock_features: list[str]) ->
     return out
 
 
+def _stock_feature_output_names(config: DataPrepConfig) -> list[str]:
+    """Return the persisted stock-feature column names for the current config."""
+    # Switch between raw stock features and gaussianized columns.
+    if bool(config.use_cross_sectional_gaussianize):
+        return [f"{c}_cs" for c in list(_STOCK_FEATURES)]
+    return list(_STOCK_FEATURES)
+
+
 def _date_time_int_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Convert DateTime into qmodel-style int date/time columns."""
     # Compute yymmdd date int to match qmodel merge_date_time_dataframe convention.
@@ -220,10 +282,264 @@ def _standardize(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray
     return ((x - mean) / std).astype(np.float32, copy=False)
 
 
+def _compute_norm_stats_from_bin(x_path: Path, rows: int, feature_dim: int) -> tuple[np.ndarray, np.ndarray]:
+    """Compute pooled mean/std from a raw float32 feature matrix on disk."""
+    # Memory-map the raw feature matrix so pooled moments can be streamed.
+    x = np.memmap(Path(x_path), mode="r", dtype=np.float32, shape=(int(rows), int(feature_dim)))
+
+    # Accumulate first and second moments in float64 for numerical stability.
+    count = np.zeros((int(feature_dim),), dtype=np.int64)
+    s1 = np.zeros((int(feature_dim),), dtype=np.float64)
+    s2 = np.zeros((int(feature_dim),), dtype=np.float64)
+    chunk_rows = 1_000_000
+    for st in range(0, int(rows), int(chunk_rows)):
+        # Slice one chunk and upcast once before moment accumulation.
+        ed = min(int(rows), int(st + chunk_rows))
+        blk = np.asarray(x[int(st) : int(ed)], dtype=np.float64)
+
+        # Update pooled sums feature-by-feature to keep the logic explicit.
+        for j in range(int(feature_dim)):
+            v = blk[:, int(j)]
+            v = v[np.isfinite(v)]
+            if int(v.shape[0]) == 0:
+                continue
+            count[int(j)] += int(v.shape[0])
+            s1[int(j)] += float(v.sum(dtype=np.float64))
+            s2[int(j)] += float((v * v).sum(dtype=np.float64))
+
+    # Convert pooled sums into mean/std vectors.
+    mean = s1 / count.astype(np.float64)
+    var = s2 / count.astype(np.float64) - mean * mean
+    std = np.sqrt(np.maximum(var, 0.0))
+    if bool((std <= 0.0).any()):
+        raise RuntimeError("Pooled zscore std contains non-positive values.")
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
+def _standardize_bin_inplace(x_path: Path, rows: int, feature_dim: int, mean: np.ndarray, std: np.ndarray) -> None:
+    """Apply pooled zscore to a raw float32 feature matrix on disk in place."""
+    # Memory-map the matrix in read-write mode so normalization can stream in place.
+    x = np.memmap(Path(x_path), mode="r+", dtype=np.float32, shape=(int(rows), int(feature_dim)))
+
+    # Rewrite one chunk at a time to bound peak memory.
+    chunk_rows = 1_000_000
+    for st in range(0, int(rows), int(chunk_rows)):
+        # Standardize one chunk and write it back to disk.
+        ed = min(int(rows), int(st + chunk_rows))
+        blk = np.asarray(x[int(st) : int(ed)], dtype=np.float32)
+        x[int(st) : int(ed)] = _standardize(blk, mean, std)
+    x.flush()
+
+
+def _write_pooled_zscore_artifacts(
+    stats_path: Path,
+    report_path: Path,
+    feature_names: list[str],
+    mean: np.ndarray,
+    std: np.ndarray,
+    moment_table: pd.DataFrame,
+    rows: int,
+) -> None:
+    """Write pooled zscore parameters and a compact markdown report."""
+    # Persist pooled mean/std vectors in YAML for reproducibility.
+    import yaml
+
+    # Resolve companion artifact paths once so the markdown report can link them.
+    feature_moments_path = report_path.parent / "feature_moments.csv"
+    overview_png_path = report_path.parent / "pooled_feature_grid.png"
+
+    rows_yaml = []
+    for j, name in enumerate(list(feature_names)):
+        # Store one feature's pooled parameters with stable scalar conversions.
+        rows_yaml.append({"feature": str(name), "mean": float(mean[int(j)]), "std": float(std[int(j)])})
+    stats_path.write_text(yaml.safe_dump({"scope": "predict_all_dates", "rows": int(rows), "features": rows_yaml}, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+    # Build a short markdown report summarizing post-zscore distribution quality.
+    max_abs_mean = float(moment_table["mean"].abs().max())
+    std_dev = (moment_table["std"] - 1.0).abs()
+    max_abs_std_shift = float(std_dev.max())
+    max_abs_skew = float(moment_table["skew"].abs().max())
+    max_abs_kurt = float(moment_table["kurtosis"].abs().max())
+    order = moment_table["kurtosis"].abs().sort_values(ascending=False).index.tolist()
+    top_rows = moment_table.loc[order[:5], ["feature", "mean", "std", "skew", "kurtosis", "count"]].reset_index(drop=True)
+
+    # Render the compact report body in Chinese for local review.
+    lines = [
+        "# Data Clean pooled zscore 报告",
+        "",
+        f"- Scope: `predict_all_dates`, rows={int(rows)}",
+        f"- Max abs mean: {max_abs_mean:.6f}",
+        f"- Max abs std shift from 1: {max_abs_std_shift:.6f}",
+        f"- Max abs skew: {max_abs_skew:.6f}",
+        f"- Max abs kurtosis: {max_abs_kurt:.6f}",
+        f"- 参数文件: `{stats_path.as_posix()}`",
+        f"- 数值表: `{feature_moments_path.as_posix()}`",
+        f"- Pooled 分布图: `{overview_png_path.as_posix()}`",
+        "",
+        "## Kurtosis Top 5",
+        "",
+        "| feature | mean | std | skew | kurtosis | count |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in top_rows.to_dict(orient="records"):
+        # Append one stable markdown table row per feature.
+        lines.append(
+            f"| {row['feature']} | {float(row['mean']):.6f} | {float(row['std']):.6f} | "
+            f"{float(row['skew']):.6f} | {float(row['kurtosis']):.6f} | {int(row['count'])} |"
+        )
+    lines.extend(["", "## Pooled 分布图", "", f"![]({overview_png_path.name})"])
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _aggregate_invalid_feature_stats(daily_audits: list[dict[str, object]]) -> pd.DataFrame:
+    """Aggregate daily invalid-value stats into a pooled dataframe."""
+    # Merge per-day field statistics by summing counters and raw moments.
+    merged: dict[tuple[str, str], dict[str, object]] = {}
+    for audit in list(daily_audits):
+        # Read the per-day invalid stats list from the audit payload.
+        for row in list(audit["invalid_feature_stats"]):
+            key = (str(row["field"]), str(row["field_type"]))
+            if key not in merged:
+                merged[key] = {
+                    "field": str(row["field"]),
+                    "field_type": str(row["field_type"]),
+                    "total_count": 0,
+                    "finite_count": 0,
+                    "nan_count": 0,
+                    "posinf_count": 0,
+                    "neginf_count": 0,
+                    "sum1": 0.0,
+                    "sum2": 0.0,
+                    "sum3": 0.0,
+                    "sum4": 0.0,
+                    "min_finite": float("nan"),
+                    "max_finite": float("nan"),
+                }
+            acc = merged[key]
+            acc["total_count"] = int(acc["total_count"]) + int(row["total_count"])
+            acc["finite_count"] = int(acc["finite_count"]) + int(row["finite_count"])
+            acc["nan_count"] = int(acc["nan_count"]) + int(row["nan_count"])
+            acc["posinf_count"] = int(acc["posinf_count"]) + int(row["posinf_count"])
+            acc["neginf_count"] = int(acc["neginf_count"]) + int(row["neginf_count"])
+            acc["sum1"] = float(acc["sum1"]) + float(row["sum1"])
+            acc["sum2"] = float(acc["sum2"]) + float(row["sum2"])
+            acc["sum3"] = float(acc["sum3"]) + float(row["sum3"])
+            acc["sum4"] = float(acc["sum4"]) + float(row["sum4"])
+            if np.isfinite(float(row["min_finite"])):
+                acc["min_finite"] = (
+                    float(row["min_finite"])
+                    if not np.isfinite(float(acc["min_finite"]))
+                    else float(min(float(acc["min_finite"]), float(row["min_finite"])))
+                )
+            if np.isfinite(float(row["max_finite"])):
+                acc["max_finite"] = (
+                    float(row["max_finite"])
+                    if not np.isfinite(float(acc["max_finite"]))
+                    else float(max(float(acc["max_finite"]), float(row["max_finite"])))
+                )
+
+    # Convert merged counters and moments into a stable summary table.
+    rows: list[dict[str, object]] = []
+    for key in sorted(merged.keys()):
+        # Compute descriptive statistics from pooled finite moments.
+        acc = merged[key]
+        total = int(acc["total_count"])
+        finite = int(acc["finite_count"])
+        nan_count = int(acc["nan_count"])
+        posinf_count = int(acc["posinf_count"])
+        neginf_count = int(acc["neginf_count"])
+        inf_count = int(posinf_count + neginf_count)
+        invalid_count = int(nan_count + inf_count)
+        if int(finite) > 0:
+            mean = float(acc["sum1"]) / float(finite)
+            m2 = float(acc["sum2"]) / float(finite)
+            m3 = float(acc["sum3"]) / float(finite)
+            m4 = float(acc["sum4"]) / float(finite)
+            mu2 = float(m2 - mean * mean)
+            std = float(np.sqrt(max(mu2, 0.0)))
+            if float(std) > 0.0:
+                mu3 = float(m3 - 3.0 * m2 * mean + 2.0 * mean * mean * mean)
+                mu4 = float(m4 - 4.0 * m3 * mean + 6.0 * m2 * mean * mean - 3.0 * mean**4)
+                skew = float(mu3 / (std**3))
+                kurtosis = float(mu4 / (mu2 * mu2) - 3.0) if float(mu2) > 0.0 else float("nan")
+            else:
+                skew = float("nan")
+                kurtosis = float("nan")
+        else:
+            mean = float("nan")
+            std = float("nan")
+            skew = float("nan")
+            kurtosis = float("nan")
+        rows.append(
+            {
+                "field": str(acc["field"]),
+                "field_type": str(acc["field_type"]),
+                "total_count": int(total),
+                "finite_count": int(finite),
+                "nan_count": int(nan_count),
+                "posinf_count": int(posinf_count),
+                "neginf_count": int(neginf_count),
+                "inf_count": int(inf_count),
+                "invalid_count": int(invalid_count),
+                "nan_ratio": float(nan_count / total),
+                "inf_ratio": float(inf_count / total),
+                "invalid_ratio": float(invalid_count / total),
+                "mean_finite": float(mean),
+                "std_finite": float(std),
+                "skew_finite": float(skew),
+                "kurtosis_finite": float(kurtosis),
+                "min_finite": float(acc["min_finite"]),
+                "max_finite": float(acc["max_finite"]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _write_invalid_feature_artifacts(invalid_table: pd.DataFrame, out_dir: Path) -> None:
+    """Write invalid-value statistics to CSV and markdown report."""
+    # Ensure the data-clean output directory exists before writing files.
+    out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = out_dir / "invalid_feature_stats.csv"
+    md_path = out_dir / "invalid_feature_report.md"
+    invalid_table.to_csv(csv_path, index=False)
+
+    # Summarize the most problematic fields for fast inspection.
+    top_invalid = invalid_table.sort_values(["invalid_ratio", "field"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    top_nan = invalid_table.sort_values(["nan_ratio", "field"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    top_inf = invalid_table.sort_values(["inf_ratio", "field"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    lines = [
+        "# Data Clean NaN/inf 报告",
+        "",
+        f"- 数值表: `{csv_path.as_posix()}`",
+        f"- 字段数: {int(invalid_table.shape[0])}",
+        f"- Max invalid ratio: {float(top_invalid.iloc[0]['invalid_ratio']):.6f} (`{str(top_invalid.iloc[0]['field'])}`)",
+        f"- Max NaN ratio: {float(top_nan.iloc[0]['nan_ratio']):.6f} (`{str(top_nan.iloc[0]['field'])}`)",
+        f"- Max inf ratio: {float(top_inf.iloc[0]['inf_ratio']):.6f} (`{str(top_inf.iloc[0]['field'])}`)",
+        "",
+        "## Invalid Ratio Top 8",
+        "",
+        "| field | type | nan_ratio | inf_ratio | invalid_ratio | mean_finite | std_finite | skew_finite | kurtosis_finite |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for row in top_invalid.head(8).to_dict(orient="records"):
+        # Append one markdown row per high-invalid field.
+        lines.append(
+            f"| {row['field']} | {row['field_type']} | {float(row['nan_ratio']):.6f} | {float(row['inf_ratio']):.6f} | "
+            f"{float(row['invalid_ratio']):.6f} | {float(row['mean_finite']):.6f} | {float(row['std_finite']):.6f} | "
+            f"{float(row['skew_finite']):.6f} | {float(row['kurtosis_finite']):.6f} |"
+        )
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _write_feature_distribution_artifacts(x: np.ndarray, feature_names: list[str], out_dir: Path) -> pd.DataFrame:
     """Compute distribution stats and write per-feature histogram plots."""
     # Ensure output directory exists before writing artifacts.
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Predefine histogram bins so the combined overview shares one stable x-axis.
+    edges = np.linspace(-5.0, 5.0, 81, dtype=np.float64)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    hist_counts = np.zeros((int(len(feature_names)), int(edges.shape[0] - 1)), dtype=np.int64)
 
     # Compute mean/std/skew/kurtosis and store in a table.
     rows: list[dict[str, object]] = []
@@ -242,6 +558,11 @@ def _write_feature_distribution_artifacts(x: np.ndarray, feature_names: list[str
             }
         )
 
+        # Update histogram counts for the pooled overview figure.
+        idx = np.searchsorted(edges, v, side="right") - 1
+        idx = np.clip(idx, 0, int(edges.shape[0] - 2))
+        hist_counts[int(j)] = np.bincount(idx.astype(np.int64, copy=False), minlength=int(edges.shape[0] - 1)).astype(np.int64, copy=False)
+
         # Plot histogram with an overlaid standard normal curve.
         fig = plt.figure(figsize=(6, 4))
         ax = fig.add_subplot(1, 1, 1)
@@ -257,6 +578,7 @@ def _write_feature_distribution_artifacts(x: np.ndarray, feature_names: list[str
 
     table = pd.DataFrame(rows)
     table.to_csv(out_dir / "feature_moments.csv", index=False)
+    _write_feature_distribution_overview(table, hist_counts, centers, edges, list(feature_names), out_dir / "pooled_feature_grid.png")
     return table
 
 
@@ -357,7 +679,62 @@ def _write_feature_distribution_artifacts_from_bin(
 
     table = pd.DataFrame(rows)
     table.to_csv(out_dir / "feature_moments.csv", index=False)
+    _write_feature_distribution_overview(table, hist_counts, centers, edges, list(feature_names), out_dir / "pooled_feature_grid.png")
     return table
+
+
+def _write_feature_distribution_overview(
+    moment_table: pd.DataFrame,
+    hist_counts: np.ndarray,
+    centers: np.ndarray,
+    edges: np.ndarray,
+    feature_names: list[str],
+    out_path: Path,
+) -> None:
+    """Write one pooled feature-distribution overview grid."""
+    # Ensure the output directory exists before writing the combined figure.
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build a compact subplot grid that covers all pooled cleaned features.
+    n_feat = int(len(feature_names))
+    n_cols = 4
+    n_rows = int(np.ceil(float(n_feat) / float(n_cols)))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 3 * n_rows), squeeze=False)
+    axes_flat = axes.reshape(-1)
+
+    # Precompute the standard normal reference curve once for all subplots.
+    grid = np.linspace(-5.0, 5.0, 400)
+    ref_pdf = stats.norm.pdf(grid, loc=0.0, scale=1.0)
+    bin_width = float(edges[1] - edges[0])
+    moments = moment_table.set_index("feature")
+
+    # Render one histogram-plus-moments panel per feature.
+    for j, name in enumerate(list(feature_names)):
+        ax = axes_flat[int(j)]
+        dens = hist_counts[int(j)].astype(np.float64) / float(max(int(hist_counts[int(j)].sum()), 1))
+        dens = dens / float(bin_width)
+        row = moments.loc[str(name)]
+        ax.bar(centers, dens, width=bin_width, alpha=0.6, color="#4c72b0", align="center")
+        ax.plot(grid, ref_pdf, color="#dd8452", linewidth=1.6)
+        ax.axvline(0.0, color="#999999", linewidth=0.8, linestyle="--")
+        ax.set_xlim(-5.0, 5.0)
+        ax.set_title(
+            f"{name}\nμ={float(row['mean']):.2f}, σ={float(row['std']):.2f}, "
+            f"skew={float(row['skew']):.2f}, kurt={float(row['kurtosis']):.2f}",
+            fontsize=9,
+        )
+        ax.set_xlabel("zscore")
+        ax.set_ylabel("density")
+
+    # Hide unused subplots so the overview stays visually clean.
+    for j in range(int(n_feat), int(len(axes_flat))):
+        axes_flat[int(j)].axis("off")
+
+    # Save the combined pooled overview figure.
+    fig.suptitle("Data Clean pooled feature distributions", fontsize=14)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=160)
+    plt.close(fig)
 
 
 def _build_single_day_table(trade_date: int, config: DataPrepConfig) -> tuple[pd.DataFrame, dict[str, object]]:
@@ -367,19 +744,23 @@ def _build_single_day_table(trade_date: int, config: DataPrepConfig) -> tuple[pd
     raw_rows = int(day_raw.shape[0])
 
     # Compute raw features/label and then sample within each minute.
-    day_feat = _add_features_and_label(day_raw, config)
+    day_feat, invalid_feature_stats = _add_features_and_label(day_raw, config)
     kept_rows = int(day_feat.shape[0])
     day_samp = _sample_per_minute(day_feat, config)
     sampled_rows = int(day_samp.shape[0])
 
-    # Apply cross-sectional normalization on stock-varying features only.
-    day_norm = _cross_sectional_gaussianize(day_samp, list(_STOCK_FEATURES))
+    # Apply the configured stock-feature transform on each minute cross-section.
+    if bool(config.use_cross_sectional_gaussianize):
+        day_feat_out = _cross_sectional_gaussianize(day_samp, list(_STOCK_FEATURES))
+    else:
+        day_feat_out = day_samp
 
     # Attach date/time integer columns and keep only schema columns.
-    day_norm = _date_time_int_columns(day_norm)
+    day_norm = _date_time_int_columns(day_feat_out)
+    stock_feature_names = _stock_feature_output_names(config)
     keep_cols = (
         ["StockCode", "DateTime", "Date", "MinuteIndex"]
-        + [f"{c}_cs" for c in list(_STOCK_FEATURES)]
+        + list(stock_feature_names)
         + list(_TIME_FEATURES)
         + ["label_ret", "date_int", "time_int"]
     )
@@ -392,6 +773,7 @@ def _build_single_day_table(trade_date: int, config: DataPrepConfig) -> tuple[pd
         "kept_rows": int(kept_rows),
         "sampled_rows": int(sampled_rows),
         "out_rows": int(day_out.shape[0]),
+        "invalid_feature_stats": list(invalid_feature_stats),
     }
     return day_out, audit
 
@@ -403,6 +785,51 @@ def _build_single_day_table_task(args: tuple[int, DataPrepConfig]) -> tuple[pd.D
     return _build_single_day_table(int(trade_date), config)
 
 
+def _progress_metrics(
+    progress: dict[str, object],
+    train_dates: list[int],
+    val_dates: list[int],
+    test_dates: list[int],
+) -> dict[str, object]:
+    """Summarize chunked data-prep progress into days and time estimates."""
+    # Define split order once so cumulative processed-day counting is explicit.
+    stage_order = ["train", "val", "test"]
+    stage_days = {"train": int(len(train_dates)), "val": int(len(val_dates)), "test": int(len(test_dates))}
+    curr_stage = str(progress["stage"])
+
+    # Count processed days by summing completed stages plus the current split index.
+    days_total = int(sum(int(v) for v in stage_days.values()))
+    days_done = 0
+    for stage in list(stage_order):
+        # Add fully completed stages before the current progress stage.
+        if str(curr_stage) == "done":
+            days_done += int(stage_days[stage])
+            continue
+        if int(stage_order.index(stage)) < int(stage_order.index(curr_stage)):
+            days_done += int(stage_days[stage])
+            continue
+        if str(stage) == str(curr_stage):
+            days_done += int(progress["index"])
+            break
+
+    # Convert elapsed split counters into aggregate elapsed and ETA estimates.
+    elapsed = dict(progress["elapsed_seconds"])
+    elapsed_seconds = float(sum(float(elapsed[s]) for s in list(stage_order)))
+    seconds_per_day = float(elapsed_seconds / float(days_done)) if int(days_done) > 0 else float("nan")
+    estimated_total_seconds = float(seconds_per_day * float(days_total)) if int(days_done) > 0 else float("nan")
+    remaining_seconds = float(estimated_total_seconds - elapsed_seconds) if int(days_done) > 0 else float("nan")
+    return {
+        "stage": str(curr_stage),
+        "index": int(progress["index"]),
+        "days_total": int(days_total),
+        "days_done": int(days_done),
+        "seconds_per_day": float(seconds_per_day),
+        "elapsed_seconds": float(elapsed_seconds),
+        "estimated_total_seconds": float(estimated_total_seconds),
+        "remaining_seconds": float(remaining_seconds),
+    }
+
+
 def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
     """Prepare train/val/test NPZ datasets and data-clean artifacts."""
     # Resolve IO paths and short-circuit when a completed meta.yaml already exists.
@@ -410,18 +837,39 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
     meta_path = npz_dir / "meta.yaml"
     npz_dir.mkdir(parents=True, exist_ok=True)
     import yaml
+    time_features = list(_TIME_FEATURES)
+    feature_names = list(_stock_feature_output_names(config)) + list(time_features)
+    expected_stock_norm = (
+        {"type": "cross_sectional_gaussianize", "rank_clip": 1e-3}
+        if bool(config.use_cross_sectional_gaussianize)
+        else {"type": "pooled_zscore", "scope": "predict_all_dates", "params_path": "pooled_zscore.yaml"}
+    )
 
     if meta_path.exists():
         # Load the persisted metadata so repeated invocations can resume at training without rebuilding.
         meta = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
-        feature_names = list(meta["feature_names"])
+        meta_feature_names = list(meta["feature_names"])
+        meta_stock_norm = dict(meta["feature_transform"]["stock_norm"])
+        if list(meta_feature_names) != list(feature_names) or dict(meta_stock_norm) != dict(expected_stock_norm):
+            raise RuntimeError(
+                f"Existing meta.yaml does not match current preprocessing config: expected_features={feature_names} expected_stock_norm={expected_stock_norm}"
+            )
         storage = dict(meta["storage"])
         groups = dict(storage["groups"])
         stats_dir = Path(config.out_dir) / "data_clean"
         moment_table = pd.read_csv(stats_dir / "feature_moments.csv")
+        progress = {
+            "stage": "done",
+            "index": 0,
+            "elapsed_seconds": {
+                "train": float(meta["audit"]["train"]["elapsed_seconds"]),
+                "val": float(meta["audit"]["val"]["elapsed_seconds"]),
+                "test": float(meta["audit"]["test"]["elapsed_seconds"]),
+            },
+        }
         return {
             "done": True,
-            "feature_names": feature_names,
+            "feature_names": meta_feature_names,
             "train_rows": int(groups["train"]["rows"]),
             "val_rows": int(groups["val"]["rows"]),
             "test_rows": int(groups["test"]["rows"]),
@@ -430,6 +878,7 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             "meta_path": meta_path,
             "audit": dict(meta["audit"]),
             "audit_rates": dict(meta["audit_rates"]),
+            "progress": _progress_metrics(progress, list(meta["dates"]["train"]), list(meta["dates"]["val"]), list(meta["dates"]["test"])),
         }
 
     # Resolve trade dates and validate that splits are feasible.
@@ -445,10 +894,6 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
     test_dates = dates[n_train + n_val : n_train + n_val + n_test]
 
     # Define the stable feature ordering early so array materialization is consistent.
-    stock_cs_features = [f"{c}_cs" for c in list(_STOCK_FEATURES)]
-    time_features = list(_TIME_FEATURES)
-    feature_names = list(stock_cs_features) + list(time_features)
-
     # Create a shared worker pool once so per-day processing runs in parallel.
     workers = int(config.workers)
     ctx = mp.get_context("fork")
@@ -587,18 +1032,21 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
 
     # Return early when data prep is still incomplete so the outer pipeline can be re-invoked.
     if str(progress["stage"]) != "done":
+        progress_metrics = _progress_metrics(progress, train_dates, val_dates, test_dates)
         return {
             "done": False,
             "feature_names": feature_names,
             "meta_path": meta_path,
             "stage": str(progress["stage"]),
             "index": int(progress["index"]),
+            "progress": progress_metrics,
         }
 
     # Load full daily audit tables now that all splits are complete.
     train_daily_audits = list(yaml.safe_load((npz_dir / "audit_daily_train.yaml").read_text(encoding="utf-8")))
     val_daily_audits = list(yaml.safe_load((npz_dir / "audit_daily_val.yaml").read_text(encoding="utf-8")))
     test_daily_audits = list(yaml.safe_load((npz_dir / "audit_daily_test.yaml").read_text(encoding="utf-8")))
+    predict_daily_audits = list(train_daily_audits) + list(val_daily_audits) + list(test_daily_audits)
 
     # Compute split-level audit summaries from the daily audit tables.
     def _sum_audits(tag: str, xs: list[dict[str, object]], elapsed: float) -> dict[str, object]:
@@ -633,10 +1081,33 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         "elapsed_seconds": float(train_audit["elapsed_seconds"]) + float(val_audit["elapsed_seconds"]) + float(test_audit["elapsed_seconds"]),
     }
 
-    # Compute data-clean distribution artifacts from the full training matrix via memmap scanning.
+    # Resolve the data-clean output directory before writing aggregated reports.
     stats_dir = Path(config.out_dir) / "data_clean"
-    train_rows = int(train_audit["out_rows"])
-    moment_table = _write_feature_distribution_artifacts_from_bin(npz_dir / "train_x.f32", int(train_rows), int(len(feature_names)), list(feature_names), stats_dir)
+
+    # Aggregate invalid-value stats before any downstream normalization/reporting.
+    invalid_stats_table = _aggregate_invalid_feature_stats(predict_daily_audits)
+    _write_invalid_feature_artifacts(invalid_stats_table, stats_dir)
+
+    # Compute pooled zscore parameters on all dates when Gaussianize is disabled.
+    predict_rows = int(predict_audit["out_rows"])
+    pooled_stats_path = stats_dir / "pooled_zscore.yaml"
+    data_clean_report_path = stats_dir / "report.md"
+    if bool(config.use_cross_sectional_gaussianize):
+        # Reuse the already transformed matrices and inspect pooled all-date feature moments.
+        moment_table = _write_feature_distribution_artifacts_from_bin(npz_dir / "predict_x.f32", int(predict_rows), int(len(feature_names)), list(feature_names), stats_dir)
+    else:
+        # Estimate pooled mean/std from the all-date matrix before any zscore rewrite.
+        mean, std = _compute_norm_stats_from_bin(npz_dir / "predict_x.f32", int(predict_rows), int(len(feature_names)))
+
+        # Rewrite every split with the same pooled zscore parameters.
+        _standardize_bin_inplace(npz_dir / "train_x.f32", int(train_audit["out_rows"]), int(len(feature_names)), mean, std)
+        _standardize_bin_inplace(npz_dir / "val_x.f32", int(val_audit["out_rows"]), int(len(feature_names)), mean, std)
+        _standardize_bin_inplace(npz_dir / "test_x.f32", int(test_audit["out_rows"]), int(len(feature_names)), mean, std)
+        _standardize_bin_inplace(npz_dir / "predict_x.f32", int(predict_rows), int(len(feature_names)), mean, std)
+
+        # Inspect post-zscore pooled feature moments and persist the numerical report.
+        moment_table = _write_feature_distribution_artifacts_from_bin(npz_dir / "predict_x.f32", int(predict_rows), int(len(feature_names)), list(feature_names), stats_dir)
+        _write_pooled_zscore_artifacts(pooled_stats_path, data_clean_report_path, list(feature_names), mean, std, moment_table, int(predict_rows))
 
     # Convert raw/kept/sampled counters into float rates for report consumption.
     def _audit_rates(a: dict[str, object]) -> dict[str, float]:
@@ -669,7 +1140,11 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         "storage": storage,
         "feature_transform": {
             "stock_features": list(_STOCK_FEATURES),
-            "stock_norm": {"type": "cross_sectional_gaussianize", "rank_clip": 1e-3},
+            "stock_norm": (
+                {"type": "cross_sectional_gaussianize", "rank_clip": 1e-3}
+                if bool(config.use_cross_sectional_gaussianize)
+                else {"type": "pooled_zscore", "scope": "predict_all_dates", "params_path": pooled_stats_path.name}
+            ),
             "time_features": list(time_features),
         },
         "dates": {"train": train_dates, "val": val_dates, "test": test_dates, "predict": dates},
@@ -682,12 +1157,22 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             "test": _audit_rates(test_audit),
             "predict": _audit_rates(predict_audit),
         },
+        "invalid_values": {
+            "stats_path": "data_clean/invalid_feature_stats.csv",
+            "report_path": "data_clean/invalid_feature_report.md",
+        },
+        "data_clean_artifacts": {
+            "report_path": "data_clean/report.md",
+            "feature_moments_path": "data_clean/feature_moments.csv",
+            "pooled_distribution_overview_path": "data_clean/pooled_feature_grid.png",
+        },
         "audit_daily": {"train": train_daily_audits, "val": val_daily_audits, "test": test_daily_audits},
     }
     meta_path.write_text(yaml.safe_dump(meta, sort_keys=False, allow_unicode=True), encoding="utf-8")
     progress_path.unlink()
 
     # Return a small in-memory summary for the pipeline.
+    progress = {"stage": "done", "index": 0, "elapsed_seconds": dict(progress["elapsed_seconds"])}
     return {
         "done": True,
         "feature_names": feature_names,
@@ -699,4 +1184,5 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         "meta_path": meta_path,
         "audit": meta["audit"],
         "audit_rates": meta["audit_rates"],
+        "progress": _progress_metrics(progress, train_dates, val_dates, test_dates),
     }

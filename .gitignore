@@ -12,6 +12,7 @@ evaluation/factor_qc/
 txt/
 report/
 outputs/
+tests/
 
 # 通用大文件数据
 *.parquet
