@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from qmodel.metrics import builtin
 
 from prediction_nn2.data_prep import DataPrepConfig, list_trade_dates, prepare_npz_splits
 from prediction_nn2.dataset import NpzDatasetSpec, Stock1mNpzDataset
+from prediction_nn2.clean_report import render_clean_report_from_meta
 from prediction_nn2.eval_ic import (
     EvalConfig,
     attach_labels,
@@ -35,6 +37,7 @@ from prediction_nn2.model import MlpConfig, MlpRegressor
 class PipelineConfig:
     """Define top-level pipeline knobs and output paths."""
 
+    pipeline_mode: str
     root_dir: Path
     stock1m_dir: Path
     start_trade_date: int
@@ -50,6 +53,10 @@ class PipelineConfig:
     horizon_minutes: int
     sample_stocks_per_minute: int
     use_cross_sectional_gaussianize: bool
+    data_prep_include_predict_split: bool
+    data_prep_norm_fit_scope: str
+    data_prep_days_per_call: int
+    data_prep_workers: int
     batch_size: int
     num_workers: int
     num_iters: int
@@ -122,6 +129,39 @@ def _format_seconds(seconds: float) -> str:
     minutes = int((total % 3600) // 60)
     secs = int(total % 60)
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _stage_manifest_path(out_root: Path, stage: str) -> Path:
+    """Resolve the YAML manifest path for one pipeline stage."""
+    # Keep all stage markers in a single folder so skip logic is easy to inspect.
+    p = Path(out_root) / "manifests" / f"{str(stage)}.yaml"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _stage_fingerprint(payload: dict[str, object]) -> str:
+    """Compute a stable SHA256 fingerprint for stage skip decisions."""
+    # Hash YAML text so fingerprint remains stable across Python versions.
+    import yaml
+
+    txt = yaml.safe_dump(payload, sort_keys=True, allow_unicode=True)
+    return hashlib.sha256(txt.encode("utf-8")).hexdigest()
+
+
+def _load_stage_manifest(path: Path) -> dict[str, object]:
+    """Load a stage YAML manifest into a dict."""
+    # Parse YAML without fallback so corrupt manifests fail loudly.
+    import yaml
+
+    return dict(yaml.safe_load(Path(path).read_text(encoding="utf-8")))
+
+
+def _write_stage_manifest(path: Path, payload: dict[str, object]) -> None:
+    """Persist one stage manifest as YAML."""
+    # Write the manifest with stable key ordering disabled so humans can diff it.
+    import yaml
+
+    Path(path).write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
 
 def _move_eval_dir(run_dir: Path, *, src_name: str, dst_name: str, it: int) -> Path:
@@ -322,27 +362,14 @@ def _prepare_split_inputs(
         horizon_minutes=int(cfg.horizon_minutes),
         sample_stocks_per_minute=int(prep_sample_stocks_per_minute),
         use_cross_sectional_gaussianize=bool(cfg.use_cross_sectional_gaussianize),
-        workers=32,
+        include_predict_split=bool(cfg.data_prep_include_predict_split),
+        norm_fit_scope=str(cfg.data_prep_norm_fit_scope),
+        days_per_call=int(cfg.data_prep_days_per_call),
+        workers=int(cfg.data_prep_workers),
     )
 
-    # Keep invoking data prep until every split is fully materialized on disk.
+    # Run data prep and rely on persisted artifacts to make reruns cheap.
     prep = prepare_npz_splits(prep_cfg)
-    while not bool(prep["done"]):
-        # Read progress metrics and print a stable ETA summary after each chunk.
-        progress = dict(prep["progress"])
-        elapsed = float(progress["elapsed_seconds"])
-        estimated = float(progress["estimated_total_seconds"])
-        remaining = float(progress["remaining_seconds"])
-        print(
-            "[pipeline] data_prep partial "
-            f"stage={progress['stage']} "
-            f"days={int(progress['days_done'])}/{int(progress['days_total'])} "
-            f"elapsed={_format_seconds(elapsed)} "
-            f"eta_total={_format_seconds(estimated)} "
-            f"eta_remaining={_format_seconds(remaining)}",
-            flush=True,
-        )
-        prep = prepare_npz_splits(prep_cfg)
     t_prep1 = time.time()
     progress = dict(prep["progress"])
     print(
@@ -373,7 +400,7 @@ def _load_existing_predict_manifest(qconf: SimpleNamespace, best_it: int) -> Pat
     return manifest_path
 
 
-def _run_postprocess_report(
+def _run_train_report_postprocess(
     cfg: PipelineConfig,
     prep: dict[str, object],
     prep_elapsed_seconds: float,
@@ -383,7 +410,7 @@ def _run_postprocess_report(
     val_metrics_by_it: dict[int, dict[str, float]],
     require_existing_eval: bool,
 ) -> None:
-    """Run report postprocess from existing artifacts or freshly generated eval outputs."""
+    """Build the train report from existing artifacts or freshly generated test eval outputs."""
     # Export a loss-curve plot from TensorBoard events for the training log requirement.
     loss_png = Path(out_root) / "train_loss.png"
     _export_train_loss_curve(Path(qconf.root_dir) / "tb", loss_png)
@@ -437,59 +464,6 @@ def _run_postprocess_report(
     price_agg = price_rolling_ic(labeled_df, eval_cfg, price_csv, price_png)
     t_roll1 = time.time()
 
-    # Resolve the predict manifest from disk or by running the evaluator once.
-    if bool(require_existing_eval):
-        manifest_path = _load_existing_predict_manifest(qconf, int(best_it))
-    else:
-        if torch.device(qconf.device).type == "cuda":
-            from qmodel.core.evaluator import Evaluator
-
-            predictor = Evaluator(qconf, group="predict", writer=None, enable_logging=False)
-            predictor.eval_single(int(best_it), n_iter=0, namespace="predict")
-            predictor.close()
-        else:
-            from qmodel.core.cpu_evaluator import CpuEvaluator
-
-            predictor = CpuEvaluator(qconf, group="predict", writer=None, enable_logging=False)
-            predictor.eval_single(int(best_it), n_iter=0, namespace="predict")
-            predictor.close()
-        manifest_path = Path(qconf.root_dir) / "eval" / f"iter_{int(best_it)}" / "predict_manifest.yaml"
-
-    # Compute pooled, annual, intraday, and rolling diagnostics on the predict split.
-    t_pred_report0 = time.time()
-    predict_artifacts = compute_predict_report_from_manifest(Path(manifest_path), eval_cfg, Path(out_root))
-    t_pred_report1 = time.time()
-    predict_pooled = dict(predict_artifacts.pooled)
-    annual_tbl = predict_artifacts.annual_tbl
-    annual_csv = Path(predict_artifacts.annual_csv)
-    annual_png = Path(predict_artifacts.annual_png)
-    predict_ic_summary = dict(predict_artifacts.ic_summary)
-    predict_ic_summary_yaml = Path(predict_artifacts.ic_summary_yaml)
-    predict_intraday_csv = Path(predict_artifacts.intraday_csv)
-    predict_intraday_png = Path(predict_artifacts.intraday_png)
-    predict_vol_csv = Path(predict_artifacts.vol_csv)
-    predict_vol_png = Path(predict_artifacts.vol_png)
-    predict_vol_yaml = Path(predict_artifacts.vol_yaml)
-    predict_price_csv = Path(predict_artifacts.price_csv)
-    predict_price_png = Path(predict_artifacts.price_png)
-    predict_price_yaml = Path(predict_artifacts.price_yaml)
-    rank_png = Path(predict_artifacts.rank_png)
-    turnover_csv = Path(predict_artifacts.turnover_csv)
-    turnover_png = Path(predict_artifacts.turnover_png)
-    turnover_yaml = Path(predict_artifacts.turnover_yaml)
-    turnover_summary = dict(predict_artifacts.turnover_summary)
-    residual_yaml = Path(predict_artifacts.residual_yaml)
-    residual_png = Path(predict_artifacts.residual_png)
-    residual_summary = dict(predict_artifacts.residual_summary)
-
-    # Load chunk counts and stream write wall time from the manifest.
-    import yaml
-
-    manifest = yaml.safe_load(Path(manifest_path).read_text(encoding="utf-8"))
-    predict_row_count = int(manifest["row_count"])
-    predict_chunk_count = int(manifest["chunk_count"])
-    predict_stream_write_seconds = float(manifest["stream_write_seconds"])
-
     # Persist a compact performance audit for the evaluation and report stage.
     device = torch.device(qconf.device)
     pin_memory = bool(device.type == "cuda")
@@ -507,19 +481,15 @@ def _run_postprocess_report(
         "eval": {
             "attach_labels_seconds": float(t_attach1 - t_attach0),
             "rolling_ic_seconds": float(t_roll1 - t_roll0),
-            "predict_row_count": int(predict_row_count),
-            "predict_chunk_count": int(predict_chunk_count),
-            "predict_stream_write_seconds": float(predict_stream_write_seconds),
-            "predict_stream_report_seconds": float(t_pred_report1 - t_pred_report0),
         },
     }
     import yaml
 
     (Path(out_root) / "perf_audit.yaml").write_text(yaml.safe_dump(perf, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
-    # Render and persist the final markdown report.
-    report_path = Path(out_root) / "report.md"
-    report = _render_report(
+    # Render and persist the train markdown report.
+    report_path = Path(out_root) / "train_report.md"
+    report = _render_train_report(
         cfg,
         prep,
         pooled,
@@ -533,32 +503,129 @@ def _run_postprocess_report(
         intraday_png,
         vol_png,
         price_png,
-        rank_png,
         loss_png,
         vol_agg,
         price_agg,
-        predict_pooled,
-        annual_tbl,
-        annual_csv,
-        annual_png,
-        predict_ic_summary,
-        predict_ic_summary_yaml,
-        predict_intraday_csv,
-        predict_intraday_png,
-        predict_vol_csv,
-        predict_vol_png,
-        predict_price_csv,
-        predict_price_png,
-        turnover_csv,
-        turnover_png,
-        turnover_yaml,
-        residual_yaml,
-        residual_png,
-        turnover_summary,
-        residual_summary,
         perf,
     )
     report_path.write_text(report, encoding="utf-8")
+
+
+def _render_train_report(
+    cfg: PipelineConfig,
+    prep: dict[str, object],
+    pooled: dict[str, float],
+    test_ic_summary: dict[str, object],
+    test_ic_summary_yaml: Path,
+    best_it: int,
+    val_metrics_by_it: dict[int, dict[str, float]],
+    intraday_csv: Path,
+    vol_csv: Path,
+    price_csv: Path,
+    intraday_png: Path,
+    vol_png: Path,
+    price_png: Path,
+    loss_png: Path,
+    vol_agg,
+    price_agg,
+    perf: dict[str, object],
+) -> str:
+    """Render the train-report markdown content."""
+    # Build a compact report body that focuses on training and test diagnostics only.
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    best_metrics = dict(val_metrics_by_it[int(best_it)])
+    val_mse = float(best_metrics["val/objective/mse"])
+    val_ic = float(best_metrics["val/quality/global_ic"])
+    val_rank_ic = float(best_metrics["val/quality/rank_ic"])
+    approx_epoch = _approx_epoch(int(best_it), int(prep["train_rows"]), int(cfg.batch_size))
+
+    # Summarize test pooled and time-series IC stats for quick scanning.
+    pooled_lines = (
+        f"- Pearson IC: {pooled['pearson_ic']:.6f}\n"
+        f"- Rank IC (Spearman): {pooled['rank_ic']:.6f}\n"
+        f"- Count: {int(pooled['count'])}"
+    )
+    test_ic_lines = (
+        f"- Pearson IC t-stat: {float(test_ic_summary['pearson_ic']['t_stat']):.4f}\n"
+        f"- Pearson IC>0 占比: {float(test_ic_summary['pearson_ic']['positive_ratio']):.2%}\n"
+        f"- Rank IC t-stat: {float(test_ic_summary['rank_ic']['t_stat']):.4f}\n"
+        f"- Rank IC>0 占比: {float(test_ic_summary['rank_ic']['positive_ratio']):.2%}\n"
+        f"- Timestamp Count: {int(test_ic_summary['timestamp_count'])}"
+    )
+
+    # Build a short val-sweep table sorted by MSE to document checkpoint selection.
+    def _mse_row(it: int) -> tuple[int, float, float, float]:
+        m = dict(val_metrics_by_it[int(it)])
+        return int(it), float(m["val/objective/mse"]), float(m["val/quality/global_ic"]), float(m["val/quality/rank_ic"])
+
+    sweep = sorted([_mse_row(it) for it in list(val_metrics_by_it.keys())], key=lambda r: float(r[1]))[:10]
+    sweep_lines = ["| iter | val_mse | val_ic | val_rank_ic |", "| ---: | ---: | ---: | ---: |"]
+    for it, mse, ic, ric in sweep:
+        sweep_lines.append(f"| {int(it)} | {float(mse):.6e} | {float(ic):.6f} | {float(ric):.6f} |")
+
+    # Render the final report body in Chinese with explicit artifact links.
+    md = f"""# NN Train Report
+
+- generated_at: `{now}`
+- root_dir: `{Path(cfg.root_dir).as_posix()}`
+- out_root: `{Path(prep['meta_path']).parent.parent.parent.as_posix()}`
+
+## 数据清洗 (Data Clean)
+
+- meta: `{Path(prep['meta_path']).as_posix()}`
+- rows: train={int(prep['train_rows'])}, val={int(prep['val_rows'])}, test={int(prep['test_rows'])}
+- audit_rates: train.kept_rate={float(prep['audit_rates']['train']['kept_rate']):.2%}, train.sampled_rate_vs_raw={float(prep['audit_rates']['train']['sampled_rate_vs_raw']):.2%}
+
+## 模型训练 (Training)
+
+- best_checkpoint: iter={int(best_it)}, approx_epoch={float(approx_epoch):.2f}
+- val: MSE={float(val_mse):.6e}, IC={float(val_ic):.6f}, RankIC={float(val_rank_ic):.6f}
+
+### Val Checkpoint Sweep (Top 10 by MSE)
+
+{chr(10).join(sweep_lines)}
+
+### Train Loss Curve
+
+![]({loss_png.name})
+
+## 测试集诊断 (Test Diagnostics)
+
+### Test Pooled IC
+
+{pooled_lines}
+
+### Test IC Time Series Summary
+
+{test_ic_lines}
+
+- summary_yaml: `{Path(test_ic_summary_yaml).as_posix()}`
+
+### Intraday IC
+
+- csv: `{Path(intraday_csv).as_posix()}`
+- png: `{Path(intraday_png).as_posix()}`
+
+![]({intraday_png.name})
+
+### Rolling IC
+
+- volatility: `{Path(vol_csv).as_posix()}`, `{Path(vol_png).as_posix()}`
+- price: `{Path(price_csv).as_posix()}`, `{Path(price_png).as_posix()}`
+- volatility_desc: {vol_agg.desc}
+- price_desc: {price_agg.desc}
+
+![]({vol_png.name})
+
+![]({price_png.name})
+
+## 性能审计 (Performance Audit)
+
+- data_prep_seconds={float(perf['data_prep']['elapsed_seconds']):.4f}
+- attach_labels_seconds={float(perf['eval']['attach_labels_seconds']):.4f}
+- rolling_ic_seconds={float(perf['eval']['rolling_ic_seconds']):.4f}
+"""
+    return md
 
 def _approx_epoch(step: int, train_rows: int, batch_size: int) -> float:
     """Convert qmodel iteration step into an approximate epoch count."""
@@ -588,10 +655,76 @@ def _describe_group_inflection(df: np.ndarray, ranks: np.ndarray) -> str:
     return f"max@{max_rank:.3f}({max_val:.4f}), min@{min_rank:.3f}({min_val:.4f})"
 
 
-def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: int, end_trade_date: int, train_days: int, val_days: int, test_days: int) -> None:
-    """Run one end-to-end split: prep, train, val-select, test-eval, IC report."""
-    # Prepare split artifacts and load the persisted preprocessing metadata.
-    prep, prep_elapsed_seconds = _prepare_split_inputs(
+def _load_prep_summary_from_meta(meta_path: Path) -> dict[str, object]:
+    """Load a minimal prep summary dict from an existing `artifacts/npz/meta.yaml`."""
+    # Parse meta.yaml and map it onto the keys expected by report stages.
+    import yaml
+
+    meta_path = Path(meta_path)
+    meta = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
+    groups = dict(meta["storage"]["groups"])
+    out_dir = meta_path.parent.parent
+    stats_dir = Path(out_dir) / "data_clean"
+    moment_path = stats_dir / "feature_moments.csv"
+    moment_table = pd.read_csv(moment_path) if moment_path.exists() else pd.DataFrame([])
+    out = {
+        "done": True,
+        "feature_names": list(meta["feature_names"]),
+        "train_rows": int(groups["train"]["rows"]),
+        "val_rows": int(groups["val"]["rows"]),
+        "test_rows": int(groups["test"]["rows"]),
+        "moment_table": moment_table,
+        "meta_path": meta_path,
+        "audit": dict(meta["audit"]),
+        "audit_rates": dict(meta["audit_rates"]),
+        "groups": sorted(list(groups.keys())),
+    }
+    if "predict" in groups:
+        out["predict_rows"] = int(groups["predict"]["rows"])
+    return out
+
+
+def run_data_clean_stage(
+    cfg: PipelineConfig,
+    *,
+    out_root: Path,
+    start_trade_date: int,
+    end_trade_date: int,
+    train_days: int,
+    val_days: int,
+    test_days: int,
+) -> tuple[dict[str, object], float]:
+    """Run the data-clean stage and return (prep_summary, elapsed_seconds)."""
+    # Build a stage fingerprint so repeated runs can skip the heavy prep work.
+    stage_cfg = {
+        "stage": "data_clean",
+        "start_trade_date": int(start_trade_date),
+        "end_trade_date": int(end_trade_date),
+        "train_days": int(train_days),
+        "val_days": int(val_days),
+        "test_days": int(test_days),
+        "use_cross_sectional_gaussianize": bool(cfg.use_cross_sectional_gaussianize),
+        "include_predict_split": bool(cfg.data_prep_include_predict_split),
+        "norm_fit_scope": str(cfg.data_prep_norm_fit_scope),
+        "days_per_call": int(cfg.data_prep_days_per_call),
+        "workers": int(cfg.data_prep_workers),
+        "horizon_minutes": int(cfg.horizon_minutes),
+        "sample_stocks_per_minute": int(cfg.sample_stocks_per_minute),
+        "input_window_size": int(cfg.input_window_size),
+        "seed": int(cfg.seed),
+    }
+    manifest_path = _stage_manifest_path(Path(out_root), "data_clean")
+    fp = _stage_fingerprint(stage_cfg)
+
+    # Skip the stage when the manifest and meta.yaml already match.
+    meta_path = Path(out_root) / "artifacts" / "npz" / "meta.yaml"
+    if manifest_path.exists() and meta_path.exists():
+        m = _load_stage_manifest(manifest_path)
+        if str(m.get("fingerprint")) == str(fp):
+            return _load_prep_summary_from_meta(meta_path), float(m.get("elapsed_seconds", 0.0))
+
+    # Run split data prep and persist the stage manifest after completion.
+    prep, elapsed = _prepare_split_inputs(
         cfg,
         out_root=Path(out_root),
         start_trade_date=int(start_trade_date),
@@ -600,16 +733,91 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
         val_days=int(val_days),
         test_days=int(test_days),
     )
+    _write_stage_manifest(
+        manifest_path,
+        {
+            "stage": "data_clean",
+            "fingerprint": str(fp),
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "elapsed_seconds": float(elapsed),
+            "meta_path": str(meta_path.as_posix()),
+        },
+    )
+    return prep, float(elapsed)
 
-    # Build qmodel config and run training on the selected device.
-    qconf = _build_qmodel_config(cfg, feature_dim=len(prep["feature_names"]), run_root=Path(out_root))
 
-    # Advance training chunk-by-chunk until the final checkpoint is materialized.
+def run_clean_report_stage(cfg: PipelineConfig, *, out_root: Path) -> Path:
+    """Render the clean report from existing data-clean artifacts."""
+    # Build a stage fingerprint so report rebuild can skip when config stays unchanged.
+    stage_cfg = {
+        "stage": "clean_report",
+        "use_cross_sectional_gaussianize": bool(cfg.use_cross_sectional_gaussianize),
+        "norm_fit_scope": str(cfg.data_prep_norm_fit_scope),
+    }
+    manifest_path = _stage_manifest_path(Path(out_root), "clean_report")
+    fp = _stage_fingerprint(stage_cfg)
+
+    # Skip the stage when the manifest and report path already match.
+    meta_path = Path(out_root) / "artifacts" / "npz" / "meta.yaml"
+    report_path = Path(out_root) / "artifacts" / "data_clean" / "report.md"
+    if manifest_path.exists() and report_path.exists():
+        m = _load_stage_manifest(manifest_path)
+        if str(m.get("fingerprint")) == str(fp):
+            return report_path
+
+    # Render the clean report purely from persisted artifacts.
+    out_path = render_clean_report_from_meta(meta_path)
+    _write_stage_manifest(
+        manifest_path,
+        {
+            "stage": "clean_report",
+            "fingerprint": str(fp),
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "report_path": str(out_path.as_posix()),
+        },
+    )
+    return out_path
+
+
+def run_train_stage(
+    cfg: PipelineConfig,
+    *,
+    out_root: Path,
+    feature_dim: int,
+) -> tuple[SimpleNamespace, int, dict[int, dict[str, float]]]:
+    """Run NN training (skip if complete) and return (qconf, best_it, val_metrics_by_it)."""
+    # Build a stage fingerprint so training can skip cleanly across repeated invocations.
+    stage_cfg = {
+        "stage": "train",
+        "seed": int(cfg.seed),
+        "num_iters": int(cfg.num_iters),
+        "save_every": int(cfg.save_every),
+        "batch_size": int(cfg.batch_size),
+        "learning_rate": float(cfg.learning_rate),
+        "hidden_dims": list(cfg.hidden_dims),
+        "dropout": float(cfg.dropout),
+        "input_window_size": int(cfg.input_window_size),
+        "feature_dim": int(feature_dim),
+    }
+    manifest_path = _stage_manifest_path(Path(out_root), "train")
+    fp = _stage_fingerprint(stage_cfg)
+
+    # Always build qmodel config so checkpoint paths resolve consistently.
+    qconf = _build_qmodel_config(cfg, feature_dim=int(feature_dim), run_root=Path(out_root))
     final_iter = int(cfg.num_iters) - 1
+
+    # Skip training when the final checkpoint already exists and the stage manifest matches.
     ckpt_iters_before = _list_checkpoint_iters(Path(out_root))
     last_ckpt = int(max(ckpt_iters_before)) if len(ckpt_iters_before) else -1
+    if manifest_path.exists() and int(last_ckpt) >= int(final_iter):
+        m = _load_stage_manifest(manifest_path)
+        if str(m.get("fingerprint")) == str(fp):
+            best_it = int(m["best_it"])
+            val_metrics_by_it = _load_val_metrics_from_disk(Path(out_root), _list_checkpoint_iters(Path(out_root)))[1]
+            return qconf, int(best_it), dict(val_metrics_by_it)
+
+    # Advance training chunk-by-chunk until the final checkpoint is materialized.
     if int(last_ckpt) >= int(final_iter):
-        # Skip training when the full checkpoint set is already available.
         print(f"[pipeline] train skip already_complete last_ckpt={last_ckpt} final_iter={final_iter}", flush=True)
     while int(last_ckpt) < int(final_iter):
         # Decide the next target iteration as the next save boundary, capped at the final iteration.
@@ -647,38 +855,319 @@ def _run_single_split(cfg: PipelineConfig, *, out_root: Path, start_trade_date: 
     # Evaluate validation metrics for all checkpoints and pick the best one.
     ckpt_iters = _list_checkpoint_iters(Path(out_root))
     best_it, val_metrics_by_it = _select_best_checkpoint_by_val(Path(out_root), qconf, ckpt_iters)
-    print(f"[pipeline] train done best_it={int(best_it)} ckpts={len(ckpt_iters)}", flush=True)
-    _run_postprocess_report(cfg, prep, float(prep_elapsed_seconds), Path(out_root), qconf, int(best_it), val_metrics_by_it, False)
+    _write_stage_manifest(
+        manifest_path,
+        {
+            "stage": "train",
+            "fingerprint": str(fp),
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "final_iter": int(final_iter),
+            "best_it": int(best_it),
+        },
+    )
+    return qconf, int(best_it), dict(val_metrics_by_it)
 
 
-def _run_single_split_postprocess_only(
+def run_train_report_stage(
     cfg: PipelineConfig,
     *,
     out_root: Path,
-    start_trade_date: int,
-    end_trade_date: int,
-    train_days: int,
-    val_days: int,
-    test_days: int,
-) -> None:
-    """Run report postprocess only from existing checkpoints and evaluator outputs."""
-    # Prepare split artifacts and load the persisted preprocessing metadata.
-    prep, prep_elapsed_seconds = _prepare_split_inputs(
-        cfg,
-        out_root=Path(out_root),
-        start_trade_date=int(start_trade_date),
-        end_trade_date=int(end_trade_date),
-        train_days=int(train_days),
-        val_days=int(val_days),
-        test_days=int(test_days),
-    )
+    prep: dict[str, object],
+    prep_elapsed_seconds: float,
+    qconf: SimpleNamespace,
+    best_it: int,
+    val_metrics_by_it: dict[int, dict[str, float]],
+    require_existing_eval: bool,
+) -> Path:
+    """Build the train report and return its markdown path."""
+    # Build a stage fingerprint so report rebuild can skip when inputs are unchanged.
+    stage_cfg = {"stage": "train_report", "best_it": int(best_it)}
+    manifest_path = _stage_manifest_path(Path(out_root), "train_report")
+    fp = _stage_fingerprint(stage_cfg)
+    report_path = Path(out_root) / "train_report.md"
 
-    # Build qmodel config so existing run directories resolve to the same paths as training.
-    qconf = _build_qmodel_config(cfg, feature_dim=len(prep["feature_names"]), run_root=Path(out_root))
-    ckpt_iters = _list_checkpoint_iters(Path(out_root))
-    best_it, val_metrics_by_it = _load_val_metrics_from_disk(Path(out_root), ckpt_iters)
-    print(f"[pipeline] postprocess load best_it={int(best_it)} ckpts={len(ckpt_iters)}", flush=True)
-    _run_postprocess_report(cfg, prep, float(prep_elapsed_seconds), Path(out_root), qconf, int(best_it), val_metrics_by_it, True)
+    # Skip the stage when the manifest and report already match.
+    if manifest_path.exists() and report_path.exists():
+        m = _load_stage_manifest(manifest_path)
+        if str(m.get("fingerprint")) == str(fp):
+            return report_path
+
+    # Run the postprocess that generates test diagnostics and writes train_report.md.
+    _run_train_report_postprocess(
+        cfg,
+        prep,
+        float(prep_elapsed_seconds),
+        Path(out_root),
+        qconf,
+        int(best_it),
+        dict(val_metrics_by_it),
+        bool(require_existing_eval),
+    )
+    _write_stage_manifest(
+        manifest_path,
+        {"stage": "train_report", "fingerprint": str(fp), "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "report_path": str(report_path.as_posix())},
+    )
+    return report_path
+
+
+def run_predict_eval_stage(cfg: PipelineConfig, *, out_root: Path, qconf: SimpleNamespace, best_it: int, require_existing_eval: bool) -> Path:
+    """Run predict evaluator (or reuse existing) and return the predict manifest path."""
+    # Build a stage fingerprint so predict evaluator can be rerun deterministically.
+    stage_cfg = {"stage": "predict_eval", "best_it": int(best_it)}
+    manifest_path = _stage_manifest_path(Path(out_root), "predict_eval")
+    fp = _stage_fingerprint(stage_cfg)
+
+    # Resolve the expected predict manifest output path.
+    predict_manifest_path = Path(qconf.root_dir) / "eval" / f"iter_{int(best_it)}" / "predict_manifest.yaml"
+    if manifest_path.exists() and predict_manifest_path.exists():
+        m = _load_stage_manifest(manifest_path)
+        if str(m.get("fingerprint")) == str(fp):
+            return predict_manifest_path
+
+    # Require an existing manifest for report-only modes.
+    if bool(require_existing_eval):
+        return _load_existing_predict_manifest(qconf, int(best_it))
+
+    # Run the predict evaluator to produce the manifest and chunk artifacts.
+    if torch.device(qconf.device).type == "cuda":
+        from qmodel.core.evaluator import Evaluator
+
+        predictor = Evaluator(qconf, group="predict", writer=None, enable_logging=False)
+        predictor.eval_single(int(best_it), n_iter=0, namespace="predict")
+        predictor.close()
+    else:
+        from qmodel.core.cpu_evaluator import CpuEvaluator
+
+        predictor = CpuEvaluator(qconf, group="predict", writer=None, enable_logging=False)
+        predictor.eval_single(int(best_it), n_iter=0, namespace="predict")
+        predictor.close()
+    _write_stage_manifest(
+        manifest_path,
+        {
+            "stage": "predict_eval",
+            "fingerprint": str(fp),
+            "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "predict_manifest_path": str(predict_manifest_path.as_posix()),
+        },
+    )
+    return predict_manifest_path
+
+
+def run_predict_report_from_manifest(manifest_path: Path, cfg: PipelineConfig, out_root: Path) -> Path:
+    """Compute predict report artifacts from an existing predict manifest."""
+    # Compute the predict report in a dedicated folder so heavy artifacts stay isolated.
+    out_root = Path(out_root)
+    manifest_path = Path(manifest_path)
+    report_dir = Path(out_root) / "predict_report"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build evaluator config and compute the full predict report from the manifest.
+    eval_cfg = EvalConfig(
+        stock1m_dir=Path(cfg.stock1m_dir),
+        window_size=int(cfg.rolling_window),
+        step_size=int(cfg.rolling_step),
+        horizon_minutes=int(cfg.horizon_minutes),
+    )
+    artifacts = compute_predict_report_from_manifest(Path(manifest_path), eval_cfg, Path(report_dir))
+
+    # Render a minimal markdown wrapper that links to the produced artifacts.
+    md_path = Path(out_root) / "predict_report.md"
+    md = _render_predict_report(cfg, manifest_path, artifacts, report_dir)
+    md_path.write_text(md, encoding="utf-8")
+    return md_path
+
+
+def _render_predict_report(cfg: PipelineConfig, manifest_path: Path, artifacts, report_dir: Path) -> str:
+    """Render the predict-report markdown content."""
+    # Summarize the heavy predict diagnostics into a compact markdown report.
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    pooled = dict(artifacts.pooled)
+    ic_summary = dict(artifacts.ic_summary)
+    turnover_summary = dict(artifacts.turnover_summary)
+    residual_summary = dict(artifacts.residual_summary)
+    annual_tbl = artifacts.annual_tbl
+    annual_years = annual_tbl["year"].astype(int).tolist()
+    year_range = f"{int(annual_years[0])}-{int(annual_years[-1])}" if int(annual_years[0]) != int(annual_years[-1]) else f"{int(annual_years[0])}"
+    md = f"""# Predict Report
+
+- generated_at: `{now}`
+- manifest: `{Path(manifest_path).as_posix()}`
+- report_dir: `{Path(report_dir).as_posix()}`
+
+## Pooled
+
+- Pearson IC: {float(pooled['pearson_ic']):.6f}
+- Rank IC (Spearman): {float(pooled['rank_ic']):.6f}
+- Count: {int(pooled['count'])}
+
+## IC Time Series Summary
+
+- ic_summary_yaml: `{Path(artifacts.ic_summary_yaml).as_posix()}`
+- pearson_t_stat: {float(ic_summary['pearson_ic']['t_stat']):.4f}
+- rank_t_stat: {float(ic_summary['rank_ic']['t_stat']):.4f}
+
+## Annual IC ({year_range})
+
+- annual_csv: `{Path(artifacts.annual_csv).as_posix()}`
+- annual_png: `{Path(artifacts.annual_png).as_posix()}`
+
+![]({Path(artifacts.annual_png).name})
+
+## Intraday IC
+
+- intraday_csv: `{Path(artifacts.intraday_csv).as_posix()}`
+- intraday_png: `{Path(artifacts.intraday_png).as_posix()}`
+
+![]({Path(artifacts.intraday_png).name})
+
+## Rolling IC
+
+- vol_csv: `{Path(artifacts.vol_csv).as_posix()}`
+- vol_png: `{Path(artifacts.vol_png).as_posix()}`
+- price_csv: `{Path(artifacts.price_csv).as_posix()}`
+- price_png: `{Path(artifacts.price_png).as_posix()}`
+
+![]({Path(artifacts.vol_png).name})
+
+![]({Path(artifacts.price_png).name})
+
+## Rank Diagnostics
+
+- rank_png: `{Path(artifacts.rank_png).as_posix()}`
+
+![]({Path(artifacts.rank_png).name})
+
+## Turnover
+
+- turnover_csv: `{Path(artifacts.turnover_csv).as_posix()}`
+- turnover_png: `{Path(artifacts.turnover_png).as_posix()}`
+- summary: {turnover_summary}
+
+![]({Path(artifacts.turnover_png).name})
+
+## Residual
+
+- residual_yaml: `{Path(artifacts.residual_yaml).as_posix()}`
+- residual_png: `{Path(artifacts.residual_png).as_posix()}`
+- summary: {residual_summary}
+
+![]({Path(artifacts.residual_png).name})
+"""
+    return md
+
+
+def run_predict_report_stage(cfg: PipelineConfig, *, out_root: Path, predict_manifest_path: Path) -> Path:
+    """Build the predict report from an existing predict manifest and return its path."""
+    # Build a stage fingerprint so report rebuild can skip when manifest stays the same.
+    stage_cfg = {"stage": "predict_report", "manifest": str(Path(predict_manifest_path).as_posix())}
+    manifest_path = _stage_manifest_path(Path(out_root), "predict_report")
+    fp = _stage_fingerprint(stage_cfg)
+    report_md = Path(out_root) / "predict_report.md"
+
+    # Skip the stage when the manifest and report already match.
+    if manifest_path.exists() and report_md.exists():
+        m = _load_stage_manifest(manifest_path)
+        if str(m.get("fingerprint")) == str(fp):
+            return report_md
+
+    # Compute predict report purely from the predict manifest.
+    out_path = run_predict_report_from_manifest(Path(predict_manifest_path), cfg, Path(out_root))
+    _write_stage_manifest(
+        manifest_path,
+        {"stage": "predict_report", "fingerprint": str(fp), "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "report_path": str(out_path.as_posix())},
+    )
+    return out_path
+
+
+def _run_single_split_staged(cfg: PipelineConfig, *, out_root: Path, start_trade_date: int, end_trade_date: int, train_days: int, val_days: int, test_days: int) -> None:
+    """Run one split in the configured pipeline mode using explicit stages."""
+    # Dispatch stage execution based on the configured pipeline_mode string.
+    mode = str(cfg.pipeline_mode)
+    out_root = Path(out_root)
+
+    if mode == "train_full":
+        # Run data clean, clean report, train, and train report without predict heavy stages.
+        prep, prep_elapsed = run_data_clean_stage(
+            cfg,
+            out_root=out_root,
+            start_trade_date=int(start_trade_date),
+            end_trade_date=int(end_trade_date),
+            train_days=int(train_days),
+            val_days=int(val_days),
+            test_days=int(test_days),
+        )
+        run_clean_report_stage(cfg, out_root=out_root)
+        qconf, best_it, val_metrics_by_it = run_train_stage(cfg, out_root=out_root, feature_dim=len(prep["feature_names"]))
+        run_train_report_stage(
+            cfg,
+            out_root=out_root,
+            prep=prep,
+            prep_elapsed_seconds=float(prep_elapsed),
+            qconf=qconf,
+            best_it=int(best_it),
+            val_metrics_by_it=dict(val_metrics_by_it),
+            require_existing_eval=False,
+        )
+        return
+
+    if mode == "train_report_only":
+        # Rebuild train report from disk artifacts without rerunning data prep or training.
+        meta_path = Path(out_root) / "artifacts" / "npz" / "meta.yaml"
+        prep = _load_prep_summary_from_meta(meta_path)
+        qconf = _build_qmodel_config(cfg, feature_dim=len(prep["feature_names"]), run_root=Path(out_root))
+        ckpt_iters = _list_checkpoint_iters(Path(out_root))
+        best_it, val_metrics_by_it = _load_val_metrics_from_disk(Path(out_root), ckpt_iters)
+        run_train_report_stage(
+            cfg,
+            out_root=out_root,
+            prep=prep,
+            prep_elapsed_seconds=float(prep["audit"]["train"]["elapsed_seconds"]) + float(prep["audit"]["val"]["elapsed_seconds"]) + float(prep["audit"]["test"]["elapsed_seconds"]),
+            qconf=qconf,
+            best_it=int(best_it),
+            val_metrics_by_it=dict(val_metrics_by_it),
+            require_existing_eval=True,
+        )
+        return
+
+    if mode == "predict_full":
+        # Run the full heavy pipeline including predict evaluator and predict report.
+        prep, prep_elapsed = run_data_clean_stage(
+            cfg,
+            out_root=out_root,
+            start_trade_date=int(start_trade_date),
+            end_trade_date=int(end_trade_date),
+            train_days=int(train_days),
+            val_days=int(val_days),
+            test_days=int(test_days),
+        )
+        run_clean_report_stage(cfg, out_root=out_root)
+        qconf, best_it, val_metrics_by_it = run_train_stage(cfg, out_root=out_root, feature_dim=len(prep["feature_names"]))
+        run_train_report_stage(
+            cfg,
+            out_root=out_root,
+            prep=prep,
+            prep_elapsed_seconds=float(prep_elapsed),
+            qconf=qconf,
+            best_it=int(best_it),
+            val_metrics_by_it=dict(val_metrics_by_it),
+            require_existing_eval=False,
+        )
+        predict_manifest_path = run_predict_eval_stage(cfg, out_root=out_root, qconf=qconf, best_it=int(best_it), require_existing_eval=False)
+        run_predict_report_stage(cfg, out_root=out_root, predict_manifest_path=predict_manifest_path)
+        return
+
+    if mode == "predict_report_only":
+        # Rebuild predict report from an existing manifest without rerunning training or data clean.
+        meta_path = Path(out_root) / "artifacts" / "npz" / "meta.yaml"
+        prep = _load_prep_summary_from_meta(meta_path)
+        qconf = _build_qmodel_config(cfg, feature_dim=len(prep["feature_names"]), run_root=Path(out_root))
+        ckpt_iters = _list_checkpoint_iters(Path(out_root))
+        best_it, _val_metrics_by_it = _load_val_metrics_from_disk(Path(out_root), ckpt_iters)
+        predict_manifest_path = run_predict_eval_stage(cfg, out_root=out_root, qconf=qconf, best_it=int(best_it), require_existing_eval=True)
+        run_predict_report_stage(cfg, out_root=out_root, predict_manifest_path=predict_manifest_path)
+        return
+
+    raise RuntimeError(f"Unknown pipeline_mode: {mode}")
 
 
 def _render_report(
@@ -979,6 +1468,7 @@ def _default_config() -> PipelineConfig:
     """Build the module-level default pipeline config."""
     # Define a small default experiment that is GPU-feasible while remaining fully general.
     return PipelineConfig(
+        pipeline_mode="train_full",
         root_dir=Path("outputs") / "upgrade_20260320_seq60",
         stock1m_dir=Path("/data/ashare/market/stock1m"),
         start_trade_date=20210101,
@@ -994,6 +1484,10 @@ def _default_config() -> PipelineConfig:
         horizon_minutes=30,
         sample_stocks_per_minute=800,
         use_cross_sectional_gaussianize=False,
+        data_prep_include_predict_split=False,
+        data_prep_norm_fit_scope="train_only",
+        data_prep_days_per_call=100,
+        data_prep_workers=32,
         batch_size=8192,
         num_workers=4,
         num_iters=120001,
@@ -1041,6 +1535,9 @@ def _run_pipeline_with_split_runner(cfg: PipelineConfig, split_runner) -> None:
         horizon_minutes=int(cfg.horizon_minutes),
         sample_stocks_per_minute=int(probe_sample_stocks_per_minute),
         use_cross_sectional_gaussianize=bool(cfg.use_cross_sectional_gaussianize),
+        include_predict_split=False,
+        norm_fit_scope="train_only",
+        days_per_call=100,
         workers=32,
     )
     all_dates = list_trade_dates(probe)
@@ -1123,15 +1620,33 @@ def _run_pipeline_with_split_runner(cfg: PipelineConfig, split_runner) -> None:
 
 
 def run_pipeline(cfg: PipelineConfig) -> None:
-    """Execute data prep, GPU training, evaluation, and report output under /data-cache."""
-    # Dispatch split execution through the full pipeline runner.
-    _run_pipeline_with_split_runner(cfg, _run_single_split)
+    """Execute the staged pipeline under /data-cache based on cfg.pipeline_mode."""
+    # Dispatch split execution through the staged runner so predict work is optional.
+    _run_pipeline_with_split_runner(cfg, _run_single_split_staged)
 
 
 def run_pipeline_postprocess_only(cfg: PipelineConfig) -> None:
-    """Execute report postprocess only from existing checkpoints and eval artifacts."""
-    # Dispatch split execution through the postprocess-only runner.
-    _run_pipeline_with_split_runner(cfg, _run_single_split_postprocess_only)
+    """Backward-compatible alias for rebuilding the train report only."""
+    # Reuse the staged runner with train_report_only semantics.
+    from dataclasses import replace
+
+    _run_pipeline_with_split_runner(replace(cfg, pipeline_mode="train_report_only"), _run_single_split_staged)
+
+
+def run_train_report_postprocess_only(cfg: PipelineConfig) -> None:
+    """Rebuild train_report.md from existing artifacts without rerunning data prep or training."""
+    # Force pipeline_mode to the report-only mode and dispatch through the staged runner.
+    from dataclasses import replace
+
+    _run_pipeline_with_split_runner(replace(cfg, pipeline_mode="train_report_only"), _run_single_split_staged)
+
+
+def run_predict_report_postprocess_only(cfg: PipelineConfig) -> None:
+    """Rebuild predict_report.md from an existing predict manifest without rerunning training."""
+    # Force pipeline_mode to the predict-report-only mode and dispatch through the staged runner.
+    from dataclasses import replace
+
+    _run_pipeline_with_split_runner(replace(cfg, pipeline_mode="predict_report_only"), _run_single_split_staged)
 
 
 if __name__ == "__main__":
