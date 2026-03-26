@@ -49,6 +49,9 @@ class DataPrepConfig:
     horizon_minutes: int
     sample_stocks_per_minute: int
     use_cross_sectional_gaussianize: bool
+    include_predict_split: bool
+    norm_fit_scope: str
+    days_per_call: int
     workers: int
 
 
@@ -316,6 +319,44 @@ def _compute_norm_stats_from_bin(x_path: Path, rows: int, feature_dim: int) -> t
     return mean.astype(np.float32), std.astype(np.float32)
 
 
+def _compute_norm_stats_from_bins(x_paths: list[Path], rows_list: list[int], feature_dim: int) -> tuple[np.ndarray, np.ndarray]:
+    """Compute pooled mean/std from multiple raw float32 matrices on disk."""
+    # Validate aligned path/row inputs so accumulated moments are meaningful.
+    if int(len(x_paths)) != int(len(rows_list)):
+        raise RuntimeError(f"x_paths and rows_list length mismatch: {len(x_paths)} vs {len(rows_list)}")
+
+    # Accumulate first and second moments in float64 for numerical stability.
+    count = np.zeros((int(feature_dim),), dtype=np.int64)
+    s1 = np.zeros((int(feature_dim),), dtype=np.float64)
+    s2 = np.zeros((int(feature_dim),), dtype=np.float64)
+    chunk_rows = 1_000_000
+    for x_path, rows in zip(list(x_paths), list(rows_list)):
+        # Memory-map each matrix so pooled moments can stream without materializing all splits.
+        x = np.memmap(Path(x_path), mode="r", dtype=np.float32, shape=(int(rows), int(feature_dim)))
+        for st in range(0, int(rows), int(chunk_rows)):
+            # Slice one chunk and upcast once before moment accumulation.
+            ed = min(int(rows), int(st + chunk_rows))
+            blk = np.asarray(x[int(st) : int(ed)], dtype=np.float64)
+
+            # Update pooled sums feature-by-feature to keep the logic explicit.
+            for j in range(int(feature_dim)):
+                v = blk[:, int(j)]
+                v = v[np.isfinite(v)]
+                if int(v.shape[0]) == 0:
+                    continue
+                count[int(j)] += int(v.shape[0])
+                s1[int(j)] += float(v.sum(dtype=np.float64))
+                s2[int(j)] += float((v * v).sum(dtype=np.float64))
+
+    # Convert pooled sums into mean/std vectors.
+    mean = s1 / count.astype(np.float64)
+    var = s2 / count.astype(np.float64) - mean * mean
+    std = np.sqrt(np.maximum(var, 0.0))
+    if bool((std <= 0.0).any()):
+        raise RuntimeError("Pooled zscore std contains non-positive values.")
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
 def _standardize_bin_inplace(x_path: Path, rows: int, feature_dim: int, mean: np.ndarray, std: np.ndarray) -> None:
     """Apply pooled zscore to a raw float32 feature matrix on disk in place."""
     # Memory-map the matrix in read-write mode so normalization can stream in place.
@@ -331,64 +372,122 @@ def _standardize_bin_inplace(x_path: Path, rows: int, feature_dim: int, mean: np
     x.flush()
 
 
-def _write_pooled_zscore_artifacts(
-    stats_path: Path,
-    report_path: Path,
-    feature_names: list[str],
-    mean: np.ndarray,
-    std: np.ndarray,
-    moment_table: pd.DataFrame,
-    rows: int,
-) -> None:
-    """Write pooled zscore parameters and a compact markdown report."""
+def _write_pooled_zscore_artifacts(stats_path: Path, scope: str, feature_names: list[str], mean: np.ndarray, std: np.ndarray, rows: int) -> None:
+    """Write pooled zscore parameters to YAML for reproducibility."""
     # Persist pooled mean/std vectors in YAML for reproducibility.
     import yaml
-
-    # Resolve companion artifact paths once so the markdown report can link them.
-    feature_moments_path = report_path.parent / "feature_moments.csv"
-    overview_png_path = report_path.parent / "pooled_feature_grid.png"
 
     rows_yaml = []
     for j, name in enumerate(list(feature_names)):
         # Store one feature's pooled parameters with stable scalar conversions.
         rows_yaml.append({"feature": str(name), "mean": float(mean[int(j)]), "std": float(std[int(j)])})
-    stats_path.write_text(yaml.safe_dump({"scope": "predict_all_dates", "rows": int(rows), "features": rows_yaml}, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    stats_path.write_text(yaml.safe_dump({"scope": str(scope), "rows": int(rows), "features": rows_yaml}, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
-    # Build a short markdown report summarizing post-zscore distribution quality.
-    max_abs_mean = float(moment_table["mean"].abs().max())
-    std_dev = (moment_table["std"] - 1.0).abs()
-    max_abs_std_shift = float(std_dev.max())
-    max_abs_skew = float(moment_table["skew"].abs().max())
-    max_abs_kurt = float(moment_table["kurtosis"].abs().max())
-    order = moment_table["kurtosis"].abs().sort_values(ascending=False).index.tolist()
-    top_rows = moment_table.loc[order[:5], ["feature", "mean", "std", "skew", "kurtosis", "count"]].reset_index(drop=True)
 
-    # Render the compact report body in Chinese for local review.
-    lines = [
-        "# Data Clean pooled zscore 报告",
-        "",
-        f"- Scope: `predict_all_dates`, rows={int(rows)}",
-        f"- Max abs mean: {max_abs_mean:.6f}",
-        f"- Max abs std shift from 1: {max_abs_std_shift:.6f}",
-        f"- Max abs skew: {max_abs_skew:.6f}",
-        f"- Max abs kurtosis: {max_abs_kurt:.6f}",
-        f"- 参数文件: `{stats_path.as_posix()}`",
-        f"- 数值表: `{feature_moments_path.as_posix()}`",
-        f"- Pooled 分布图: `{overview_png_path.as_posix()}`",
-        "",
-        "## Kurtosis Top 5",
-        "",
-        "| feature | mean | std | skew | kurtosis | count |",
-        "| --- | ---: | ---: | ---: | ---: | ---: |",
-    ]
-    for row in top_rows.to_dict(orient="records"):
-        # Append one stable markdown table row per feature.
-        lines.append(
-            f"| {row['feature']} | {float(row['mean']):.6f} | {float(row['std']):.6f} | "
-            f"{float(row['skew']):.6f} | {float(row['kurtosis']):.6f} | {int(row['count'])} |"
+def _write_feature_distribution_artifacts_from_bins(
+    x_paths: list[Path], rows_list: list[int], feature_dim: int, feature_names: list[str], out_dir: Path
+) -> pd.DataFrame:
+    """Compute distribution stats from multiple raw float32 matrices and write histogram plots."""
+    # Validate aligned path/row inputs so pooled moments are meaningful.
+    if int(len(x_paths)) != int(len(rows_list)):
+        raise RuntimeError(f"x_paths and rows_list length mismatch: {len(x_paths)} vs {len(rows_list)}")
+
+    # Ensure output directory exists before writing artifacts.
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Predefine histogram bins so we can update counts in a streaming pass.
+    edges = np.linspace(-5.0, 5.0, 81, dtype=np.float64)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    hist_counts = np.zeros((int(feature_dim), int(edges.shape[0] - 1)), dtype=np.int64)
+
+    # Accumulate raw moments (sum, sum2, sum3, sum4) for exact mean/std/skew/kurtosis.
+    count = np.zeros((int(feature_dim),), dtype=np.int64)
+    s1 = np.zeros((int(feature_dim),), dtype=np.float64)
+    s2 = np.zeros((int(feature_dim),), dtype=np.float64)
+    s3 = np.zeros((int(feature_dim),), dtype=np.float64)
+    s4 = np.zeros((int(feature_dim),), dtype=np.float64)
+
+    # Stream over each memmap in chunks to bound peak memory while keeping IO sequential.
+    chunk_rows = 1_000_000
+    for x_path, rows in zip(list(x_paths), list(rows_list)):
+        # Memory-map the raw feature matrix so multi-split datasets do not require RAM materialization.
+        x = np.memmap(Path(x_path), mode="r", dtype=np.float32, shape=(int(rows), int(feature_dim)))
+        for st in range(0, int(rows), int(chunk_rows)):
+            # Slice a contiguous block and upcast to float64 for stable moment accumulation.
+            ed = min(int(rows), int(st + chunk_rows))
+            blk = np.asarray(x[int(st) : int(ed)], dtype=np.float64)
+
+            # Update moments and histograms feature-by-feature to avoid large intermediates.
+            for j in range(int(feature_dim)):
+                # Filter finite values to match the original artifact semantics.
+                v = blk[:, int(j)]
+                v = v[np.isfinite(v)]
+                if int(v.shape[0]) == 0:
+                    continue
+
+                # Update raw-moment accumulators for this feature.
+                n = int(v.shape[0])
+                count[int(j)] += int(n)
+                s1[int(j)] += float(v.sum(dtype=np.float64))
+                s2[int(j)] += float((v * v).sum(dtype=np.float64))
+                s3[int(j)] += float((v * v * v).sum(dtype=np.float64))
+                s4[int(j)] += float((v * v * v * v).sum(dtype=np.float64))
+
+                # Update histogram counts using the fixed edges.
+                idx = np.searchsorted(edges, v, side="right") - 1
+                idx = np.clip(idx, 0, int(edges.shape[0] - 2))
+                hist_counts[int(j)] += np.bincount(idx.astype(np.int64, copy=False), minlength=int(edges.shape[0] - 1)).astype(
+                    np.int64, copy=False
+                )
+
+    # Convert raw moments into mean/std/skew/kurtosis and render plots per feature.
+    rows: list[dict[str, object]] = []
+    for j, name in enumerate(list(feature_names)):
+        # Compute derived moments using aggregated raw sums.
+        n = float(count[int(j)])
+        mean = float(s1[int(j)] / n)
+        m2 = float(s2[int(j)] / n)
+        m3 = float(s3[int(j)] / n)
+        m4 = float(s4[int(j)] / n)
+        mu2 = float(m2 - mean * mean)
+        mu3 = float(m3 - 3.0 * m2 * mean + 2.0 * mean * mean * mean)
+        mu4 = float(m4 - 4.0 * m3 * mean + 6.0 * m2 * mean * mean - 3.0 * mean**4)
+        std = float(np.sqrt(mu2))
+        skew = float(mu3 / (std**3))
+        kurtosis = float(mu4 / (mu2 * mu2) - 3.0)
+
+        # Append per-feature moment summary for downstream report linkage.
+        rows.append(
+            {
+                "feature": str(name),
+                "mean": float(mean),
+                "std": float(std),
+                "skew": float(skew),
+                "kurtosis": float(kurtosis),
+                "count": int(count[int(j)]),
+            }
         )
-    lines.extend(["", "## Pooled 分布图", "", f"![]({overview_png_path.name})"])
-    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        # Plot histogram with an overlaid standard normal curve.
+        fig = plt.figure(figsize=(6, 4))
+        ax = fig.add_subplot(1, 1, 1)
+        dens = hist_counts[int(j)].astype(np.float64) / float(max(int(count[int(j)]), 1))
+        dens = dens / float((edges[1] - edges[0]))
+        ax.bar(centers, dens, width=float(edges[1] - edges[0]), alpha=0.6, color="#4c72b0", align="center")
+        grid = np.linspace(-5.0, 5.0, 400)
+        ax.plot(grid, stats.norm.pdf(grid, loc=0.0, scale=1.0), color="#dd8452", linewidth=2)
+        ax.set_title(f"Feature dist: {name}")
+        ax.set_xlabel("standardized value")
+        ax.set_ylabel("density")
+        fig.tight_layout()
+        fig.savefig(out_dir / f"dist_{name}.png", dpi=160)
+        plt.close(fig)
+
+    table = pd.DataFrame(rows)
+    table.to_csv(out_dir / "feature_moments.csv", index=False)
+    _write_feature_distribution_overview(table, hist_counts, centers, edges, list(feature_names), out_dir / "pooled_feature_grid.png")
+    return table
+
 
 
 def _aggregate_invalid_feature_stats(daily_audits: list[dict[str, object]]) -> pd.DataFrame:
@@ -842,7 +941,7 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
     expected_stock_norm = (
         {"type": "cross_sectional_gaussianize", "rank_clip": 1e-3}
         if bool(config.use_cross_sectional_gaussianize)
-        else {"type": "pooled_zscore", "scope": "predict_all_dates", "params_path": "pooled_zscore.yaml"}
+        else {"type": "pooled_zscore", "scope": str(config.norm_fit_scope), "params_path": "pooled_zscore.yaml"}
     )
 
     if meta_path.exists():
@@ -856,8 +955,113 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             )
         storage = dict(meta["storage"])
         groups = dict(storage["groups"])
+
+        # Ensure all referenced binary groups exist on disk before claiming completion.
+        for group in list(groups.keys()):
+            # Resolve required binary file paths for this group.
+            g = dict(groups[str(group)])
+            for k in ["x", "y", "meta"]:
+                p = npz_dir / str(g[str(k)])
+                if not p.exists():
+                    raise RuntimeError(f"Missing binary artifact for existing meta.yaml: group={group} key={k} path={p}")
+
+        # Ensure audit-daily YAML files exist so report stages can rebuild without re-running prep.
+        for stage in ["train", "val", "test"]:
+            # Require the daily-audit file written during incremental data prep.
+            audit_path = npz_dir / f"audit_daily_{stage}.yaml"
+            if not audit_path.exists():
+                raise RuntimeError(f"Missing audit-daily artifact for existing meta.yaml: {audit_path}")
+
+        # Ensure core data-clean artifacts exist so clean-report rebuild stays lightweight.
         stats_dir = Path(config.out_dir) / "data_clean"
-        moment_table = pd.read_csv(stats_dir / "feature_moments.csv")
+        invalid_stats_path = stats_dir / "invalid_feature_stats.csv"
+        invalid_report_path = stats_dir / "invalid_feature_report.md"
+        if not invalid_stats_path.exists() or not invalid_report_path.exists():
+            raise RuntimeError(f"Missing invalid-value artifacts for existing meta.yaml: {invalid_stats_path} {invalid_report_path}")
+
+        # Ensure pooled zscore params exist when pooled normalization is requested.
+        if str(meta_stock_norm["type"]) == "pooled_zscore":
+            pooled_stats_path = stats_dir / str(meta_stock_norm["params_path"])
+            if not pooled_stats_path.exists():
+                raise RuntimeError(f"Missing pooled zscore params for existing meta.yaml: {pooled_stats_path}")
+
+        # Optionally materialize the predict split from existing train/val/test splits.
+        if bool(config.include_predict_split) and "predict" not in groups:
+            # Concatenate standardized group binaries into a single predict group.
+            import shutil
+
+            train_rows = int(groups["train"]["rows"])
+            val_rows = int(groups["val"]["rows"])
+            test_rows = int(groups["test"]["rows"])
+            pred_rows = int(train_rows + val_rows + test_rows)
+            feature_dim = int(groups["train"]["feature_dim"])
+            if int(feature_dim) != int(len(feature_names)):
+                raise RuntimeError(f"meta feature_dim mismatch: meta={feature_dim} expected={len(feature_names)}")
+
+            # Copy the split binaries sequentially to keep IO streaming.
+            pred_x = npz_dir / "predict_x.f32"
+            pred_y = npz_dir / "predict_y.f32"
+            pred_m = npz_dir / "predict_meta.i64"
+            with open(pred_x, "wb") as out_x, open(pred_y, "wb") as out_y, open(pred_m, "wb") as out_m:
+                for tag in ["train", "val", "test"]:
+                    # Append one split file into the predict group.
+                    g = dict(groups[str(tag)])
+                    with open(npz_dir / str(g["x"]), "rb") as in_x:
+                        shutil.copyfileobj(in_x, out_x, length=16 * 1024 * 1024)
+                    with open(npz_dir / str(g["y"]), "rb") as in_y:
+                        shutil.copyfileobj(in_y, out_y, length=16 * 1024 * 1024)
+                    with open(npz_dir / str(g["meta"]), "rb") as in_meta:
+                        shutil.copyfileobj(in_meta, out_m, length=16 * 1024 * 1024)
+
+            # Extend meta.yaml to include the newly created predict group and audit summary.
+            predict_audit = {
+                "tag": "predict",
+                "workers": int(meta["audit"]["train"]["workers"]),
+                "days": int(meta["audit"]["train"]["days"]) + int(meta["audit"]["val"]["days"]) + int(meta["audit"]["test"]["days"]),
+                "raw_rows": int(meta["audit"]["train"]["raw_rows"]) + int(meta["audit"]["val"]["raw_rows"]) + int(meta["audit"]["test"]["raw_rows"]),
+                "kept_rows": int(meta["audit"]["train"]["kept_rows"]) + int(meta["audit"]["val"]["kept_rows"]) + int(meta["audit"]["test"]["kept_rows"]),
+                "sampled_rows": int(meta["audit"]["train"]["sampled_rows"]) + int(meta["audit"]["val"]["sampled_rows"]) + int(meta["audit"]["test"]["sampled_rows"]),
+                "out_rows": int(pred_rows),
+                "elapsed_seconds": float(meta["audit"]["train"]["elapsed_seconds"])
+                + float(meta["audit"]["val"]["elapsed_seconds"])
+                + float(meta["audit"]["test"]["elapsed_seconds"]),
+            }
+            groups["predict"] = {"rows": int(pred_rows), "feature_dim": int(feature_dim), "x": pred_x.name, "y": pred_y.name, "meta": pred_m.name}
+            meta["storage"]["groups"] = groups
+            meta["audit"]["predict"] = predict_audit
+            meta["audit_rates"]["predict"] = {
+                "kept_rate": float(predict_audit["kept_rows"]) / float(predict_audit["raw_rows"]),
+                "sampled_rate_vs_kept": float(predict_audit["sampled_rows"]) / float(predict_audit["kept_rows"]),
+                "sampled_rate_vs_raw": float(predict_audit["sampled_rows"]) / float(predict_audit["raw_rows"]),
+            }
+            meta["dates"]["predict"] = list(meta["dates"]["train"]) + list(meta["dates"]["val"]) + list(meta["dates"]["test"])
+            meta_path.write_text(yaml.safe_dump(meta, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+        # Ensure distribution artifacts exist; recompute them from existing bins when missing.
+        moment_path = stats_dir / "feature_moments.csv"
+        overview_path = stats_dir / "pooled_feature_grid.png"
+        if moment_path.exists() and overview_path.exists():
+            moment_table = pd.read_csv(moment_path)
+        else:
+            # Recompute pooled distribution artifacts from the configured normalization scope.
+            scope = str(config.norm_fit_scope)
+            if scope == "train_only":
+                moment_paths = [npz_dir / "train_x.f32"]
+                moment_rows = [int(groups["train"]["rows"])]
+            elif scope in ["train_val_test", "predict_all_dates"]:
+                moment_paths = [npz_dir / "train_x.f32", npz_dir / "val_x.f32", npz_dir / "test_x.f32"]
+                moment_rows = [int(groups["train"]["rows"]), int(groups["val"]["rows"]), int(groups["test"]["rows"])]
+            else:
+                raise RuntimeError(f"Unknown norm_fit_scope: {scope}")
+            moment_table = _write_feature_distribution_artifacts_from_bins(
+                list(moment_paths),
+                list(moment_rows),
+                int(len(feature_names)),
+                list(feature_names),
+                stats_dir,
+            )
+
+        # Build a completed progress payload for stable downstream progress logs.
         progress = {
             "stage": "done",
             "index": 0,
@@ -867,19 +1071,23 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
                 "test": float(meta["audit"]["test"]["elapsed_seconds"]),
             },
         }
-        return {
+        groups = dict(meta["storage"]["groups"])
+        out = {
             "done": True,
             "feature_names": meta_feature_names,
             "train_rows": int(groups["train"]["rows"]),
             "val_rows": int(groups["val"]["rows"]),
             "test_rows": int(groups["test"]["rows"]),
-            "predict_rows": int(groups["predict"]["rows"]),
             "moment_table": moment_table,
             "meta_path": meta_path,
             "audit": dict(meta["audit"]),
             "audit_rates": dict(meta["audit_rates"]),
+            "groups": sorted(list(groups.keys())),
             "progress": _progress_metrics(progress, list(meta["dates"]["train"]), list(meta["dates"]["val"]), list(meta["dates"]["test"])),
         }
+        if "predict" in groups:
+            out["predict_rows"] = int(groups["predict"]["rows"])
+        return out
 
     # Resolve trade dates and validate that splits are feasible.
     dates = list_trade_dates(config)
@@ -898,149 +1106,116 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
     workers = int(config.workers)
     ctx = mp.get_context("fork")
     pool = ctx.Pool(processes=int(workers))
-
-    # Load panels, compute features/labels, and sample within each day using multiprocessing map.
-    def _build_for_dates(
-        tag: str,
-        date_list: list[int],
-        *,
-        x_f,
-        y_f,
-        meta_f,
-        predict_x_f,
-        predict_y_f,
-        predict_meta_f,
-    ) -> tuple[int, list[dict[str, object]], dict[str, object]]:
-        """Stream one split into raw binary arrays and return (rows, daily_audits, split_audit)."""
-        # Stream per-day processing inside worker processes while writing arrays sequentially in the main process.
-        t0 = time.time()
-        tasks = [(int(d), config) for d in list(date_list)]
-        it = pool.imap(_build_single_day_table_task, tasks, chunksize=1)
-
-        # Accumulate audits and row counts without materializing the full split in memory.
-        rows = 0
-        audits: list[dict[str, object]] = []
-        for i, (day_df, audit) in enumerate(it, start=1):
-            # Convert the per-day dataframe into arrays and append them to raw binary files.
-            x_day = day_df[feature_names].to_numpy(dtype=np.float32, copy=False)
-            y_day = day_df[["label_ret"]].to_numpy(dtype=np.float32, copy=False)
-            meta_day = day_df[["StockCode", "date_int", "time_int"]].to_numpy(dtype=np.int64, copy=False)
-            x_day.tofile(x_f)
-            y_day.tofile(y_f)
-            meta_day.tofile(meta_f)
-
-            # Append the same arrays into the predict split so long-horizon evaluation reuses the prep pass.
-            x_day.tofile(predict_x_f)
-            y_day.tofile(predict_y_f)
-            meta_day.tofile(predict_meta_f)
-
-            # Track split-level counters for audit aggregation.
-            rows += int(x_day.shape[0])
-            audits.append(dict(audit))
-
-            # Print coarse-grained progress so long multi-year runs are observable in logs.
-            if int(i) == 1 or int(i) % 20 == 0 or int(i) == int(len(date_list)):
-                print(f"[data_prep] tag={tag} day={i}/{len(date_list)} rows={rows}", flush=True)
-        t1 = time.time()
-
-        # Build split-level audit summary for metadata and report rendering.
-        raw_rows = int(sum(int(a["raw_rows"]) for a in audits))
-        kept_rows = int(sum(int(a["kept_rows"]) for a in audits))
-        sampled_rows = int(sum(int(a["sampled_rows"]) for a in audits))
-        split_audit = {
-            "tag": str(tag),
-            "workers": int(workers),
-            "days": int(len(date_list)),
-            "raw_rows": int(raw_rows),
-            "kept_rows": int(kept_rows),
-            "sampled_rows": int(sampled_rows),
-            "out_rows": int(rows),
-            "elapsed_seconds": float(t1 - t0),
-        }
-        return int(rows), audits, split_audit
-
-    # Load or initialize incremental progress tracking so repeated calls can finish multi-year prep.
-    progress_path = npz_dir / "progress.yaml"
-    if progress_path.exists():
-        # Load prior progress to continue appending to the binary arrays.
-        progress = yaml.safe_load(progress_path.read_text(encoding="utf-8"))
-    else:
-        # Initialize progress from scratch so the first invocation truncates any stale partial outputs.
-        progress = {"stage": "train", "index": 0, "elapsed_seconds": {"train": 0.0, "val": 0.0, "test": 0.0}}
-
-    # Decide which split to advance in this invocation and slice a bounded batch of dates.
-    stage = str(progress["stage"])
-    stage_dates = {"train": train_dates, "val": val_dates, "test": test_dates}[stage]
-    start_i = int(progress["index"])
-    days_per_call = 20
-    todo = list(stage_dates[int(start_i) : int(start_i + days_per_call)])
-    if len(todo) == 0:
-        raise RuntimeError(f"progress points past end of stage: stage={stage} index={start_i} total={len(stage_dates)}")
-
-    # Open raw array files in append-or-truncate mode depending on the stage progress.
-    stage_paths = {
-        "train": (npz_dir / "train_x.f32", npz_dir / "train_y.f32", npz_dir / "train_meta.i64"),
-        "val": (npz_dir / "val_x.f32", npz_dir / "val_y.f32", npz_dir / "val_meta.i64"),
-        "test": (npz_dir / "test_x.f32", npz_dir / "test_y.f32", npz_dir / "test_meta.i64"),
-    }
-    x_path, y_path, meta_bin_path = stage_paths[stage]
-    mode = "ab" if int(start_i) > 0 else "wb"
-    predict_x_path = npz_dir / "predict_x.f32"
-    predict_y_path = npz_dir / "predict_y.f32"
-    predict_meta_path = npz_dir / "predict_meta.i64"
-    predict_mode = "ab" if predict_x_path.exists() else "wb"
-
-    # Run one chunk and persist both binary arrays and daily audits.
     try:
-        with open(predict_x_path, predict_mode) as px, open(predict_y_path, predict_mode) as py, open(predict_meta_path, predict_mode) as pm:
+        # Load panels, compute features/labels, and sample within each day using multiprocessing map.
+        def _build_for_dates(
+            tag: str,
+            date_list: list[int],
+            *,
+            x_f,
+            y_f,
+            meta_f,
+        ) -> tuple[int, list[dict[str, object]], dict[str, object]]:
+            """Stream one split into raw binary arrays and return (rows, daily_audits, split_audit)."""
+            # Stream per-day processing inside worker processes while writing arrays sequentially in the main process.
+            t0 = time.time()
+            tasks = [(int(d), config) for d in list(date_list)]
+            it = pool.imap(_build_single_day_table_task, tasks, chunksize=1)
+
+            # Accumulate audits and row counts without materializing the full split in memory.
+            rows = 0
+            audits: list[dict[str, object]] = []
+            for i, (day_df, audit) in enumerate(it, start=1):
+                # Convert the per-day dataframe into arrays and append them to raw binary files.
+                x_day = day_df[feature_names].to_numpy(dtype=np.float32, copy=False)
+                y_day = day_df[["label_ret"]].to_numpy(dtype=np.float32, copy=False)
+                meta_day = day_df[["StockCode", "date_int", "time_int"]].to_numpy(dtype=np.int64, copy=False)
+                x_day.tofile(x_f)
+                y_day.tofile(y_f)
+                meta_day.tofile(meta_f)
+
+                # Track split-level counters for audit aggregation.
+                rows += int(x_day.shape[0])
+                audits.append(dict(audit))
+
+                # Print coarse-grained progress so long multi-year runs are observable in logs.
+                if int(i) == 1 or int(i) % 20 == 0 or int(i) == int(len(date_list)):
+                    print(f"[data_prep] tag={tag} day={i}/{len(date_list)} rows={rows}", flush=True)
+            t1 = time.time()
+
+            # Build split-level audit summary for metadata and report rendering.
+            raw_rows = int(sum(int(a["raw_rows"]) for a in audits))
+            kept_rows = int(sum(int(a["kept_rows"]) for a in audits))
+            sampled_rows = int(sum(int(a["sampled_rows"]) for a in audits))
+            split_audit = {
+                "tag": str(tag),
+                "workers": int(workers),
+                "days": int(len(date_list)),
+                "raw_rows": int(raw_rows),
+                "kept_rows": int(kept_rows),
+                "sampled_rows": int(sampled_rows),
+                "out_rows": int(rows),
+                "elapsed_seconds": float(t1 - t0),
+            }
+            return int(rows), audits, split_audit
+
+        # Load or initialize incremental progress tracking so repeated calls can finish multi-year prep.
+        progress_path = npz_dir / "progress.yaml"
+        if progress_path.exists():
+            # Load prior progress to continue appending to the binary arrays.
+            progress = yaml.safe_load(progress_path.read_text(encoding="utf-8"))
+        else:
+            # Initialize progress from scratch so the first invocation truncates any stale partial outputs.
+            progress = {"stage": "train", "index": 0, "elapsed_seconds": {"train": 0.0, "val": 0.0, "test": 0.0}}
+
+        # Advance through all remaining chunks in one invocation to avoid repeated Pool setup costs.
+        stage_paths = {
+            "train": (npz_dir / "train_x.f32", npz_dir / "train_y.f32", npz_dir / "train_meta.i64"),
+            "val": (npz_dir / "val_x.f32", npz_dir / "val_y.f32", npz_dir / "val_meta.i64"),
+            "test": (npz_dir / "test_x.f32", npz_dir / "test_y.f32", npz_dir / "test_meta.i64"),
+        }
+        while str(progress["stage"]) != "done":
+            # Decide which split to advance and slice a bounded batch of dates for progress persistence.
+            stage = str(progress["stage"])
+            stage_dates = {"train": train_dates, "val": val_dates, "test": test_dates}[stage]
+            start_i = int(progress["index"])
+            step = int(config.days_per_call)
+            step = int(step) if int(step) > 0 else int(len(stage_dates) - int(start_i))
+            todo = list(stage_dates[int(start_i) : int(start_i + step)])
+            if len(todo) == 0:
+                raise RuntimeError(f"progress points past end of stage: stage={stage} index={start_i} total={len(stage_dates)}")
+
+            # Open raw array files in append-or-truncate mode depending on stage progress.
+            x_path, y_path, meta_bin_path = stage_paths[stage]
+            mode = "ab" if int(start_i) > 0 else "wb"
             with open(x_path, mode) as xf, open(y_path, mode) as yf, open(meta_bin_path, mode) as mf:
-                _rows, audits, split_audit = _build_for_dates(
-                    stage,
-                    todo,
-                    x_f=xf,
-                    y_f=yf,
-                    meta_f=mf,
-                    predict_x_f=px,
-                    predict_y_f=py,
-                    predict_meta_f=pm,
-                )
+                _rows, audits, split_audit = _build_for_dates(stage, todo, x_f=xf, y_f=yf, meta_f=mf)
+
+            # Append daily audits into a YAML list so final meta.yaml can embed the full audit table.
+            audit_path = npz_dir / f"audit_daily_{stage}.yaml"
+            if audit_path.exists():
+                daily = list(yaml.safe_load(audit_path.read_text(encoding="utf-8")))
+            else:
+                daily = []
+            daily.extend(list(audits))
+            audit_path.write_text(yaml.safe_dump(daily, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+            # Advance progress and persist it after each chunk so long runs can resume.
+            progress["index"] = int(start_i + len(todo))
+            progress["elapsed_seconds"][stage] = float(progress["elapsed_seconds"][stage]) + float(split_audit["elapsed_seconds"])
+            if int(progress["index"]) >= int(len(stage_dates)):
+                if stage == "train":
+                    progress["stage"] = "val"
+                elif stage == "val":
+                    progress["stage"] = "test"
+                else:
+                    progress["stage"] = "done"
+                progress["index"] = 0
+            progress_path.write_text(yaml.safe_dump(progress, sort_keys=False, allow_unicode=True), encoding="utf-8")
     finally:
+        # Close the worker pool on both success and failure to avoid leaking processes.
         pool.close()
         pool.join()
-
-    # Append daily audits into a YAML list so final meta.yaml can embed the full audit table.
-    audit_path = npz_dir / f"audit_daily_{stage}.yaml"
-    if audit_path.exists():
-        daily = list(yaml.safe_load(audit_path.read_text(encoding="utf-8")))
-    else:
-        daily = []
-    daily.extend(list(audits))
-    audit_path.write_text(yaml.safe_dump(daily, sort_keys=False, allow_unicode=True), encoding="utf-8")
-
-    # Advance progress and persist it before potentially returning early.
-    progress["index"] = int(start_i + len(todo))
-    progress["elapsed_seconds"][stage] = float(progress["elapsed_seconds"][stage]) + float(split_audit["elapsed_seconds"])
-    if int(progress["index"]) >= int(len(stage_dates)):
-        if stage == "train":
-            progress["stage"] = "val"
-        elif stage == "val":
-            progress["stage"] = "test"
-        else:
-            progress["stage"] = "done"
-        progress["index"] = 0
-    progress_path.write_text(yaml.safe_dump(progress, sort_keys=False, allow_unicode=True), encoding="utf-8")
-
-    # Return early when data prep is still incomplete so the outer pipeline can be re-invoked.
-    if str(progress["stage"]) != "done":
-        progress_metrics = _progress_metrics(progress, train_dates, val_dates, test_dates)
-        return {
-            "done": False,
-            "feature_names": feature_names,
-            "meta_path": meta_path,
-            "stage": str(progress["stage"]),
-            "index": int(progress["index"]),
-            "progress": progress_metrics,
-        }
 
     # Load full daily audit tables now that all splits are complete.
     train_daily_audits = list(yaml.safe_load((npz_dir / "audit_daily_train.yaml").read_text(encoding="utf-8")))
@@ -1088,26 +1263,49 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
     invalid_stats_table = _aggregate_invalid_feature_stats(predict_daily_audits)
     _write_invalid_feature_artifacts(invalid_stats_table, stats_dir)
 
-    # Compute pooled zscore parameters on all dates when Gaussianize is disabled.
-    predict_rows = int(predict_audit["out_rows"])
+    # Compute pooled zscore parameters on the requested scope when Gaussianize is disabled.
     pooled_stats_path = stats_dir / "pooled_zscore.yaml"
-    data_clean_report_path = stats_dir / "report.md"
     if bool(config.use_cross_sectional_gaussianize):
         # Reuse the already transformed matrices and inspect pooled all-date feature moments.
-        moment_table = _write_feature_distribution_artifacts_from_bin(npz_dir / "predict_x.f32", int(predict_rows), int(len(feature_names)), list(feature_names), stats_dir)
+        moment_table = _write_feature_distribution_artifacts_from_bins(
+            [npz_dir / "train_x.f32", npz_dir / "val_x.f32", npz_dir / "test_x.f32"],
+            [int(train_audit["out_rows"]), int(val_audit["out_rows"]), int(test_audit["out_rows"])],
+            int(len(feature_names)),
+            list(feature_names),
+            stats_dir,
+        )
     else:
-        # Estimate pooled mean/std from the all-date matrix before any zscore rewrite.
-        mean, std = _compute_norm_stats_from_bin(npz_dir / "predict_x.f32", int(predict_rows), int(len(feature_names)))
+        # Resolve normalization fit scope into explicit binary paths and row counts.
+        scope = str(config.norm_fit_scope)
+        if scope == "train_only":
+            fit_paths = [npz_dir / "train_x.f32"]
+            fit_rows = [int(train_audit["out_rows"])]
+        elif scope == "train_val_test":
+            fit_paths = [npz_dir / "train_x.f32", npz_dir / "val_x.f32", npz_dir / "test_x.f32"]
+            fit_rows = [int(train_audit["out_rows"]), int(val_audit["out_rows"]), int(test_audit["out_rows"])]
+        elif scope == "predict_all_dates":
+            fit_paths = [npz_dir / "train_x.f32", npz_dir / "val_x.f32", npz_dir / "test_x.f32"]
+            fit_rows = [int(train_audit["out_rows"]), int(val_audit["out_rows"]), int(test_audit["out_rows"])]
+        else:
+            raise RuntimeError(f"Unknown norm_fit_scope: {scope}")
+
+        # Estimate pooled mean/std from the requested scope before any zscore rewrite.
+        mean, std = _compute_norm_stats_from_bins(list(fit_paths), list(fit_rows), int(len(feature_names)))
 
         # Rewrite every split with the same pooled zscore parameters.
         _standardize_bin_inplace(npz_dir / "train_x.f32", int(train_audit["out_rows"]), int(len(feature_names)), mean, std)
         _standardize_bin_inplace(npz_dir / "val_x.f32", int(val_audit["out_rows"]), int(len(feature_names)), mean, std)
         _standardize_bin_inplace(npz_dir / "test_x.f32", int(test_audit["out_rows"]), int(len(feature_names)), mean, std)
-        _standardize_bin_inplace(npz_dir / "predict_x.f32", int(predict_rows), int(len(feature_names)), mean, std)
 
-        # Inspect post-zscore pooled feature moments and persist the numerical report.
-        moment_table = _write_feature_distribution_artifacts_from_bin(npz_dir / "predict_x.f32", int(predict_rows), int(len(feature_names)), list(feature_names), stats_dir)
-        _write_pooled_zscore_artifacts(pooled_stats_path, data_clean_report_path, list(feature_names), mean, std, moment_table, int(predict_rows))
+        # Inspect post-zscore pooled feature moments and persist pooled zscore parameters.
+        moment_table = _write_feature_distribution_artifacts_from_bins(
+            list(fit_paths),
+            list(fit_rows),
+            int(len(feature_names)),
+            list(feature_names),
+            stats_dir,
+        )
+        _write_pooled_zscore_artifacts(pooled_stats_path, str(scope), list(feature_names), mean, std, int(sum(int(r) for r in fit_rows)))
 
     # Convert raw/kept/sampled counters into float rates for report consumption.
     def _audit_rates(a: dict[str, object]) -> dict[str, float]:
@@ -1130,9 +1328,34 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             "train": {"rows": int(train_audit["out_rows"]), "feature_dim": int(len(feature_names)), "x": "train_x.f32", "y": "train_y.f32", "meta": "train_meta.i64"},
             "val": {"rows": int(val_audit["out_rows"]), "feature_dim": int(len(feature_names)), "x": "val_x.f32", "y": "val_y.f32", "meta": "val_meta.i64"},
             "test": {"rows": int(test_audit["out_rows"]), "feature_dim": int(len(feature_names)), "x": "test_x.f32", "y": "test_y.f32", "meta": "test_meta.i64"},
-            "predict": {"rows": int(predict_audit["out_rows"]), "feature_dim": int(len(feature_names)), "x": "predict_x.f32", "y": "predict_y.f32", "meta": "predict_meta.i64"},
         },
     }
+
+    # Optionally materialize predict split binaries after normalization to avoid extra per-day writes.
+    if bool(config.include_predict_split):
+        # Concatenate standardized group binaries into a single predict group.
+        import shutil
+
+        pred_x = npz_dir / "predict_x.f32"
+        pred_y = npz_dir / "predict_y.f32"
+        pred_m = npz_dir / "predict_meta.i64"
+        with open(pred_x, "wb") as out_x, open(pred_y, "wb") as out_y, open(pred_m, "wb") as out_m:
+            for tag in ["train", "val", "test"]:
+                # Append one split file into the predict group.
+                g = dict(storage["groups"][str(tag)])
+                with open(npz_dir / str(g["x"]), "rb") as in_x:
+                    shutil.copyfileobj(in_x, out_x, length=16 * 1024 * 1024)
+                with open(npz_dir / str(g["y"]), "rb") as in_y:
+                    shutil.copyfileobj(in_y, out_y, length=16 * 1024 * 1024)
+                with open(npz_dir / str(g["meta"]), "rb") as in_meta:
+                    shutil.copyfileobj(in_meta, out_m, length=16 * 1024 * 1024)
+        storage["groups"]["predict"] = {
+            "rows": int(train_audit["out_rows"]) + int(val_audit["out_rows"]) + int(test_audit["out_rows"]),
+            "feature_dim": int(len(feature_names)),
+            "x": pred_x.name,
+            "y": pred_y.name,
+            "meta": pred_m.name,
+        }
 
     # Persist split metadata and preprocessing audit for reproducibility.
     meta = {
@@ -1143,19 +1366,18 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             "stock_norm": (
                 {"type": "cross_sectional_gaussianize", "rank_clip": 1e-3}
                 if bool(config.use_cross_sectional_gaussianize)
-                else {"type": "pooled_zscore", "scope": "predict_all_dates", "params_path": pooled_stats_path.name}
+                else {"type": "pooled_zscore", "scope": str(config.norm_fit_scope), "params_path": pooled_stats_path.name}
             ),
             "time_features": list(time_features),
         },
-        "dates": {"train": train_dates, "val": val_dates, "test": test_dates, "predict": dates},
+        "dates": {"train": train_dates, "val": val_dates, "test": test_dates},
         "label": {"type": "forward_log_return", "horizon_minutes": int(config.horizon_minutes)},
         "sampling": {"sample_stocks_per_minute": int(config.sample_stocks_per_minute)},
-        "audit": {"train": train_audit, "val": val_audit, "test": test_audit, "predict": predict_audit},
+        "audit": {"train": train_audit, "val": val_audit, "test": test_audit},
         "audit_rates": {
             "train": _audit_rates(train_audit),
             "val": _audit_rates(val_audit),
             "test": _audit_rates(test_audit),
-            "predict": _audit_rates(predict_audit),
         },
         "invalid_values": {
             "stats_path": "data_clean/invalid_feature_stats.csv",
@@ -1168,6 +1390,10 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         },
         "audit_daily": {"train": train_daily_audits, "val": val_daily_audits, "test": test_daily_audits},
     }
+    if bool(config.include_predict_split):
+        meta["dates"]["predict"] = list(dates)
+        meta["audit"]["predict"] = predict_audit
+        meta["audit_rates"]["predict"] = _audit_rates(predict_audit)
     meta_path.write_text(yaml.safe_dump(meta, sort_keys=False, allow_unicode=True), encoding="utf-8")
     progress_path.unlink()
 
@@ -1179,10 +1405,10 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         "train_rows": int(train_audit["out_rows"]),
         "val_rows": int(val_audit["out_rows"]),
         "test_rows": int(test_audit["out_rows"]),
-        "predict_rows": int(predict_audit["out_rows"]),
         "moment_table": moment_table,
         "meta_path": meta_path,
         "audit": meta["audit"],
         "audit_rates": meta["audit_rates"],
+        "groups": sorted(list(storage["groups"].keys())),
         "progress": _progress_metrics(progress, train_dates, val_dates, test_dates),
     }
