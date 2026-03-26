@@ -16,6 +16,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from qmodel.util import merge_date_time_dataframe
+
 
 @dataclass(frozen=True)
 class EvalConfig:
@@ -47,6 +49,9 @@ def _rolling_bins_merge(dst: dict[float, dict[str, float]], src: dict[float, dic
 def _rolling_bins_to_curve(bins: dict[float, dict[str, float]]) -> pd.DataFrame:
     """Convert rolling-bin accumulators into the stable curve dataframe schema."""
     # Convert aggregated moments into the curve table expected by plotting/reporting.
+    if len(bins) == 0:
+        return _empty_group_schema()
+
     rows: list[dict[str, object]] = []
     for rank_bin in sorted(bins.keys()):
         # Convert sums into mean/std while guarding against negative variance from float drift.
@@ -73,6 +78,36 @@ def _rolling_bins_to_curve(bins: dict[float, dict[str, float]]) -> pd.DataFrame:
         )
     out = pd.DataFrame(rows).sort_values("group_center_rank", kind="stable").reset_index(drop=True)
     return out
+
+
+def _write_group_curve_summary(df: pd.DataFrame, out_yaml: Path, curve_name: str) -> None:
+    """Write a compact YAML summary for one rolling IC curve."""
+    # Build a small scalar summary so downstream review does not depend on giant raw tables.
+    summary: dict[str, object] = {"curve": str(curve_name), "rows": int(df.shape[0])}
+
+    # Extract scalar extrema and rank coverage when the curve is non-empty.
+    if int(df.shape[0]) > 0:
+        ranks = df["group_center_rank"].to_numpy(dtype=float)
+        mean_ic = df["mean_ic"].to_numpy(dtype=float)
+        mean_rank_ic = df["mean_rank_ic"].to_numpy(dtype=float)
+        summary["center_rank_min"] = float(np.nanmin(ranks))
+        summary["center_rank_max"] = float(np.nanmax(ranks))
+        summary["count_sum"] = int(df["count"].to_numpy(dtype=int).sum())
+        if bool(np.isfinite(mean_ic).any()):
+            i_max = int(np.nanargmax(mean_ic))
+            i_min = int(np.nanargmin(mean_ic))
+            summary["pearson_ic_max"] = {"value": float(mean_ic[i_max]), "group_center_rank": float(ranks[i_max])}
+            summary["pearson_ic_min"] = {"value": float(mean_ic[i_min]), "group_center_rank": float(ranks[i_min])}
+        if bool(np.isfinite(mean_rank_ic).any()):
+            i_max_rank = int(np.nanargmax(mean_rank_ic))
+            i_min_rank = int(np.nanargmin(mean_rank_ic))
+            summary["rank_ic_max"] = {"value": float(mean_rank_ic[i_max_rank]), "group_center_rank": float(ranks[i_max_rank])}
+            summary["rank_ic_min"] = {"value": float(mean_rank_ic[i_min_rank]), "group_center_rank": float(ranks[i_min_rank])}
+
+    # Persist the compact summary as YAML for local inspection and report linkage.
+    import yaml
+
+    out_yaml.write_text(yaml.safe_dump(summary, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
 
 def _pearson(x: np.ndarray, y: np.ndarray) -> float:
@@ -107,6 +142,946 @@ def load_eval_predictions(shard_path: Path) -> pd.DataFrame:
     if not need.issubset(set(df.columns)):
         raise RuntimeError(f"Missing columns in shard: {sorted(need - set(df.columns))}")
     return df
+
+
+class PredictionChunkReader:
+    """Iterate prediction parquet chunks written by the streaming predict evaluator."""
+
+    def __init__(self, manifest_path: Path) -> None:
+        """Load and validate a predict manifest YAML for chunk iteration."""
+        # Parse YAML and keep a normalized manifest dict for downstream readers.
+        import yaml
+
+        self._manifest_path = Path(manifest_path)
+        self._base_dir = Path(self._manifest_path).parent
+        manifest = yaml.safe_load(self._manifest_path.read_text(encoding="utf-8"))
+        self._manifest = dict(manifest)
+
+    @property
+    def manifest(self) -> dict[str, object]:
+        """Return the raw manifest mapping."""
+        # Return a shallow copy so callers do not mutate internal state.
+        return dict(self._manifest)
+
+    def iter_chunks(self, columns: list[str]) -> list[pd.DataFrame]:
+        """Load every parquet chunk as a dataframe list with a fixed column projection."""
+        # Resolve chunk paths relative to the manifest directory.
+        parts: list[pd.DataFrame] = []
+        for rel in list(self._manifest["chunk_files"]):
+            # Read one chunk with column pruning to reduce IO.
+            path = Path(self._base_dir) / str(rel)
+            parts.append(pd.read_parquet(path, columns=list(columns)))
+        return parts
+
+    def iter_prediction_chunks(self, columns: list[str]):
+        """Yield parquet chunks one-by-one as projected dataframes."""
+        # Stream chunks in the on-disk order recorded by the manifest.
+        for rel in list(self._manifest["chunk_files"]):
+            path = Path(self._base_dir) / str(rel)
+            yield pd.read_parquet(path, columns=list(columns))
+
+    def iter_timestamp_groups(self, columns: list[str]):
+        """Yield full (date,time) groups, handling chunk boundary carry-over."""
+        # Keep a carry dataframe for the last (date,time) in the previous chunk.
+        carry: pd.DataFrame | None = None
+        for chunk in self.iter_prediction_chunks(list(columns)):
+            # Prepend the carry group to the next chunk so it becomes whole.
+            df = chunk if carry is None else pd.concat([carry, chunk], axis=0, ignore_index=True)
+
+            # Save the last group as the new carry to handle chunk boundaries.
+            last_date = int(df.iloc[-1]["date"])
+            last_time = int(df.iloc[-1]["time"])
+            last_mask = (df["date"].astype(int) == int(last_date)) & (df["time"].astype(int) == int(last_time))
+            carry = df.loc[last_mask].copy()
+            ready = df.loc[~last_mask]
+
+            # Yield all full groups in stable appearance order.
+            for (d, t), g in ready.groupby(["date", "time"], sort=False):
+                yield int(d), int(t), g
+
+        # Yield the final carry group after all chunks are consumed.
+        if carry is not None and int(carry.shape[0]) > 0:
+            d = int(carry.iloc[0]["date"])
+            t = int(carry.iloc[0]["time"])
+            yield int(d), int(t), carry
+
+    def iter_date_groups(self, columns: list[str]):
+        """Yield full date groups, handling chunk boundary carry-over."""
+        # Keep a carry dataframe for the last date in the previous chunk.
+        carry: pd.DataFrame | None = None
+        for chunk in self.iter_prediction_chunks(list(columns)):
+            # Prepend the carry day to the next chunk so it becomes whole.
+            df = chunk if carry is None else pd.concat([carry, chunk], axis=0, ignore_index=True)
+
+            # Save the last date as the new carry to handle chunk boundaries.
+            last_date = int(df.iloc[-1]["date"])
+            last_mask = df["date"].astype(int) == int(last_date)
+            carry = df.loc[last_mask].copy()
+            ready = df.loc[~last_mask]
+
+            # Yield all full date groups in stable appearance order.
+            for d, g in ready.groupby(["date"], sort=False):
+                yield int(d), g
+
+        # Yield the final carry group after all chunks are consumed.
+        if carry is not None and int(carry.shape[0]) > 0:
+            d = int(carry.iloc[0]["date"])
+            yield int(d), carry
+
+
+class OnlinePearsonAccumulator:
+    """Accumulate Pearson correlation moments in one pass."""
+
+    def __init__(self) -> None:
+        """Initialize empty raw-moment sums."""
+        # Track sums for exact Pearson computation over finite pairs.
+        self._n = 0
+        self._sum_x = 0.0
+        self._sum_y = 0.0
+        self._sum_x2 = 0.0
+        self._sum_y2 = 0.0
+        self._sum_xy = 0.0
+
+    def update(self, x: np.ndarray, y: np.ndarray) -> None:
+        """Update the accumulator with a vector chunk of samples."""
+        # Filter finite pairs and accumulate float64 sums.
+        m = np.isfinite(x) & np.isfinite(y)
+        x2 = x[m].astype(np.float64, copy=False)
+        y2 = y[m].astype(np.float64, copy=False)
+        n = int(x2.shape[0])
+        if int(n) == 0:
+            return
+        self._n += int(n)
+        self._sum_x += float(x2.sum(dtype=np.float64))
+        self._sum_y += float(y2.sum(dtype=np.float64))
+        self._sum_x2 += float((x2 * x2).sum(dtype=np.float64))
+        self._sum_y2 += float((y2 * y2).sum(dtype=np.float64))
+        self._sum_xy += float((x2 * y2).sum(dtype=np.float64))
+
+    def finalize(self) -> float:
+        """Return the accumulated Pearson correlation as a scalar."""
+        # Compute covariance and variances from raw sums.
+        n = int(self._n)
+        if int(n) < 2:
+            return float("nan")
+        nf = float(n)
+        cov = float(self._sum_xy - (self._sum_x * self._sum_y) / nf)
+        var_x = float(self._sum_x2 - (self._sum_x * self._sum_x) / nf)
+        var_y = float(self._sum_y2 - (self._sum_y * self._sum_y) / nf)
+        if not (np.isfinite(cov) and np.isfinite(var_x) and np.isfinite(var_y)):
+            return float("nan")
+        if float(var_x) <= 0.0 or float(var_y) <= 0.0:
+            return float("nan")
+        return float(cov / float(np.sqrt(var_x * var_y)))
+
+    def count(self) -> int:
+        """Return the number of finite pairs accumulated."""
+        # Expose count to match existing pooled_ic output schema.
+        return int(self._n)
+
+
+class OnlineMoments:
+    """Accumulate mean/std and sign ratio for a scalar stream."""
+
+    def __init__(self) -> None:
+        """Initialize Welford running-moment state."""
+        # Store count/mean/M2 and sign count for stable streaming stats.
+        self._n = 0
+        self._mean = 0.0
+        self._m2 = 0.0
+        self._pos = 0
+
+    def update(self, x: float) -> None:
+        """Update the running moments with one scalar observation."""
+        # Skip non-finite values to match pandas dropna behavior.
+        if not np.isfinite(float(x)):
+            return
+        if float(x) > 0.0:
+            self._pos += 1
+        self._n += 1
+        delta = float(x) - float(self._mean)
+        self._mean += delta / float(self._n)
+        delta2 = float(x) - float(self._mean)
+        self._m2 += delta * delta2
+
+    def finalize(self) -> dict[str, float]:
+        """Return a summary dict with count/mean/std/t_stat/positive_ratio."""
+        # Convert Welford state into the same schema as ic_time_series_summary.
+        n = int(self._n)
+        mean = float(self._mean) if int(n) > 0 else float("nan")
+        std = float(np.sqrt(self._m2 / float(n - 1))) if int(n) > 1 else float("nan")
+        t_stat = float(mean / (std / np.sqrt(float(n)))) if int(n) > 1 and float(std) > 0.0 else float("nan")
+        pos_ratio = float(self._pos) / float(n) if int(n) > 0 else float("nan")
+        return {"count": int(n), "mean": float(mean), "std": float(std), "t_stat": float(t_stat), "positive_ratio": float(pos_ratio)}
+
+
+def pooled_ic_from_manifest(manifest_path: Path) -> dict[str, float]:
+    """Compute pooled Pearson/Rank IC from a predict manifest without materializing a full dataframe."""
+    # Stream once to accumulate Pearson moments and to spill finite pairs for exact Spearman via external sort.
+    import subprocess
+    import tempfile
+
+    reader = PredictionChunkReader(Path(manifest_path))
+    acc = OnlinePearsonAccumulator()
+    with tempfile.TemporaryDirectory(prefix="rank_ic_") as td:
+        tmp_dir = Path(td)
+        pred_value = Path(tmp_dir) / "pred_value.tsv"
+        tgt_value = Path(tmp_dir) / "tgt_value.tsv"
+        pred_sorted = Path(tmp_dir) / "pred_value_sorted.tsv"
+        tgt_sorted = Path(tmp_dir) / "tgt_value_sorted.tsv"
+        pred_rank = Path(tmp_dir) / "pred_rank.tsv"
+        tgt_rank = Path(tmp_dir) / "tgt_rank.tsv"
+        pred_rank_sorted = Path(tmp_dir) / "pred_rank_sorted.tsv"
+        tgt_rank_sorted = Path(tmp_dir) / "tgt_rank_sorted.tsv"
+
+        # Write raw (value,row_id) TSVs for prediction and target while updating pooled Pearson moments.
+        with pred_value.open("w", encoding="utf-8") as fp_pred, tgt_value.open("w", encoding="utf-8") as fp_tgt:
+            for chunk in reader.iter_prediction_chunks(["row_id", "prediction", "target"]):
+                row_id = chunk["row_id"].to_numpy(dtype=np.int64, copy=False)
+                pred = chunk["prediction"].to_numpy(dtype=np.float32, copy=False)
+                tgt = chunk["target"].to_numpy(dtype=np.float32, copy=False)
+                acc.update(pred.astype(np.float64, copy=False), tgt.astype(np.float64, copy=False))
+                m = np.isfinite(pred) & np.isfinite(tgt)
+                if int(m.sum()) == 0:
+                    continue
+                pred_tbl = pd.DataFrame({"value": pred[m], "row_id": row_id[m]})
+                tgt_tbl = pd.DataFrame({"value": tgt[m], "row_id": row_id[m]})
+                pred_tbl.to_csv(fp_pred, sep="\t", header=False, index=False, float_format="%.9g")
+                tgt_tbl.to_csv(fp_tgt, sep="\t", header=False, index=False, float_format="%.9g")
+
+        # External-sort by (value,row_id) so rank assignment is globally correct with stable tie order.
+        subprocess.run(["sort", "-t", "\t", "-k1,1g", "-k2,2n", pred_value.as_posix(), "-o", pred_sorted.as_posix()], check=True)
+        subprocess.run(["sort", "-t", "\t", "-k1,1g", "-k2,2n", tgt_value.as_posix(), "-o", tgt_sorted.as_posix()], check=True)
+
+        # Convert sorted (value,row_id) into (row_id,rank) with pandas-compatible average-tie ranks.
+        _write_average_ranks_from_value_sorted(Path(pred_sorted), Path(pred_rank))
+        _write_average_ranks_from_value_sorted(Path(tgt_sorted), Path(tgt_rank))
+
+        # External-sort the rank tables by row_id for a streaming merge join.
+        subprocess.run(["sort", "-t", "\t", "-k1,1n", pred_rank.as_posix(), "-o", pred_rank_sorted.as_posix()], check=True)
+        subprocess.run(["sort", "-t", "\t", "-k1,1n", tgt_rank.as_posix(), "-o", tgt_rank_sorted.as_posix()], check=True)
+
+        # Merge pred/tgt ranks by row_id and compute Pearson on ranks in one pass.
+        rank_ic = float(_pearson_from_row_id_rank_files(Path(pred_rank_sorted), Path(tgt_rank_sorted)))
+        return {"pearson_ic": float(acc.finalize()), "rank_ic": float(rank_ic), "count": int(acc.count())}
+
+
+def _write_average_ranks_from_value_sorted(value_sorted_path: Path, out_rank_path: Path) -> None:
+    """Assign pandas-style average ranks to a value-sorted TSV stream and write (row_id,rank)."""
+    # Walk the sorted stream, accumulate tie groups, and emit one rank per row_id.
+    pos = 1
+    tie_value: float | None = None
+    tie_row_ids: list[int] = []
+
+    def _flush() -> None:
+        # Write the current tie group with an average rank and advance the position cursor.
+        nonlocal pos, tie_value, tie_row_ids
+        if len(tie_row_ids) == 0:
+            return
+        start = int(pos)
+        end = int(pos) + int(len(tie_row_ids)) - 1
+        avg_rank = 0.5 * float(start + end)
+        for rid in tie_row_ids:
+            out.write(f"{int(rid)}\t{float(avg_rank):.12g}\n")
+        pos = int(pos) + int(len(tie_row_ids))
+        tie_value = None
+        tie_row_ids = []
+
+    with Path(value_sorted_path).open("r", encoding="utf-8") as fp, Path(out_rank_path).open("w", encoding="utf-8") as out:
+        for line in fp:
+            v_str, rid_str = line.rstrip("\n").split("\t")
+            v = float(v_str)
+            rid = int(rid_str)
+            if tie_value is None:
+                tie_value = float(v)
+                tie_row_ids.append(int(rid))
+                continue
+            if float(v) == float(tie_value):
+                tie_row_ids.append(int(rid))
+                continue
+            _flush()
+            tie_value = float(v)
+            tie_row_ids.append(int(rid))
+        _flush()
+
+
+def _pearson_from_row_id_rank_files(pred_rank_sorted: Path, tgt_rank_sorted: Path) -> float:
+    """Compute Pearson correlation from two row_id-sorted rank TSVs."""
+    # Stream-merge the two rank files by row_id and update an online Pearson accumulator.
+    acc = OnlinePearsonAccumulator()
+    buf_pred: list[float] = []
+    buf_tgt: list[float] = []
+    buf_cap = 200000
+
+    def _flush() -> None:
+        # Flush buffered rank pairs into the vectorized accumulator update.
+        nonlocal buf_pred, buf_tgt
+        if len(buf_pred) == 0:
+            return
+        x = np.asarray(buf_pred, dtype=np.float64)
+        y = np.asarray(buf_tgt, dtype=np.float64)
+        acc.update(x, y)
+        buf_pred = []
+        buf_tgt = []
+
+    with Path(pred_rank_sorted).open("r", encoding="utf-8") as fp_pred, Path(tgt_rank_sorted).open("r", encoding="utf-8") as fp_tgt:
+        while True:
+            lp = fp_pred.readline()
+            lt = fp_tgt.readline()
+            if lp == "" and lt == "":
+                break
+            rid_p_str, r_p_str = lp.rstrip("\n").split("\t")
+            rid_t_str, r_t_str = lt.rstrip("\n").split("\t")
+            if int(rid_p_str) != int(rid_t_str):
+                raise RuntimeError(f"row_id mismatch in rank merge: pred={rid_p_str}, tgt={rid_t_str}")
+            buf_pred.append(float(r_p_str))
+            buf_tgt.append(float(r_t_str))
+            if int(len(buf_pred)) >= int(buf_cap):
+                _flush()
+        _flush()
+    return float(acc.finalize())
+
+
+def annual_pooled_ic_from_manifest(manifest_path: Path, out_csv: Path, out_png: Path) -> pd.DataFrame:
+    """Compute annual pooled Pearson IC from a predict manifest and persist CSV/plot."""
+    # Stream once to accumulate per-year Pearson and spill rows for exact per-year Spearman via external sort.
+    import subprocess
+    import tempfile
+
+    reader = PredictionChunkReader(Path(manifest_path))
+    by_year: dict[int, OnlinePearsonAccumulator] = {}
+    with tempfile.TemporaryDirectory(prefix="annual_rank_ic_") as td:
+        tmp_dir = Path(td)
+        pred_value = Path(tmp_dir) / "pred_value.tsv"
+        tgt_value = Path(tmp_dir) / "tgt_value.tsv"
+        pred_sorted = Path(tmp_dir) / "pred_value_sorted.tsv"
+        tgt_sorted = Path(tmp_dir) / "tgt_value_sorted.tsv"
+        pred_rank = Path(tmp_dir) / "pred_rank.tsv"
+        tgt_rank = Path(tmp_dir) / "tgt_rank.tsv"
+        pred_rank_sorted = Path(tmp_dir) / "pred_rank_sorted.tsv"
+        tgt_rank_sorted = Path(tmp_dir) / "tgt_rank_sorted.tsv"
+
+        # Write raw (year,value,row_id) TSVs for prediction and target while updating per-year Pearson moments.
+        with pred_value.open("w", encoding="utf-8") as fp_pred, tgt_value.open("w", encoding="utf-8") as fp_tgt:
+            for chunk in reader.iter_prediction_chunks(["row_id", "date", "prediction", "target"]):
+                row_id = chunk["row_id"].to_numpy(dtype=np.int64, copy=False)
+                dates = chunk["date"].to_numpy(dtype=np.int64, copy=False)
+                years = (2000 + (dates // 10000)).astype(np.int64, copy=False)
+                pred = chunk["prediction"].to_numpy(dtype=np.float32, copy=False)
+                tgt = chunk["target"].to_numpy(dtype=np.float32, copy=False)
+                for y in np.unique(years):
+                    if int(y) not in by_year:
+                        by_year[int(y)] = OnlinePearsonAccumulator()
+                    m_year = years == int(y)
+                    by_year[int(y)].update(pred[m_year].astype(np.float64, copy=False), tgt[m_year].astype(np.float64, copy=False))
+                m = np.isfinite(pred) & np.isfinite(tgt)
+                if int(m.sum()) == 0:
+                    continue
+                pred_tbl = pd.DataFrame({"year": years[m], "value": pred[m], "row_id": row_id[m]})
+                tgt_tbl = pd.DataFrame({"year": years[m], "value": tgt[m], "row_id": row_id[m]})
+                pred_tbl.to_csv(fp_pred, sep="\t", header=False, index=False, float_format="%.9g")
+                tgt_tbl.to_csv(fp_tgt, sep="\t", header=False, index=False, float_format="%.9g")
+
+        # External-sort by (year,value,row_id) so ranks reset per year and ties follow pandas ordering.
+        subprocess.run(["sort", "-t", "\t", "-k1,1n", "-k2,2g", "-k3,3n", pred_value.as_posix(), "-o", pred_sorted.as_posix()], check=True)
+        subprocess.run(["sort", "-t", "\t", "-k1,1n", "-k2,2g", "-k3,3n", tgt_value.as_posix(), "-o", tgt_sorted.as_posix()], check=True)
+
+        # Convert value-sorted tables into (row_id,year,rank) with per-year average-tie ranks.
+        _write_average_ranks_from_year_value_sorted(Path(pred_sorted), Path(pred_rank))
+        _write_average_ranks_from_year_value_sorted(Path(tgt_sorted), Path(tgt_rank))
+
+        # External-sort the rank tables by row_id for a streaming merge join.
+        subprocess.run(["sort", "-t", "\t", "-k1,1n", pred_rank.as_posix(), "-o", pred_rank_sorted.as_posix()], check=True)
+        subprocess.run(["sort", "-t", "\t", "-k1,1n", tgt_rank.as_posix(), "-o", tgt_rank_sorted.as_posix()], check=True)
+
+        # Merge pred/tgt ranks by row_id and compute per-year Pearson on ranks in one pass.
+        year_rank_ic = _annual_pearson_from_row_id_year_rank_files(Path(pred_rank_sorted), Path(tgt_rank_sorted))
+
+    # Convert per-year accumulators into a table consistent with the original schema.
+    rows: list[dict[str, object]] = []
+    for y in sorted(by_year.keys()):
+        acc = by_year[int(y)]
+        rows.append({"year": int(y), "pearson_ic": float(acc.finalize()), "rank_ic": float(year_rank_ic.get(int(y), float("nan"))), "count": int(acc.count())})
+    out = pd.DataFrame(rows).sort_values("year", kind="stable").reset_index(drop=True)
+    out.to_csv(Path(out_csv), index=False)
+
+    # Plot yearly IC bars for Pearson and placeholder Rank IC.
+    fig = plt.figure(figsize=(10, 4))
+    ax = fig.add_subplot(1, 1, 1)
+    xs = out["year"].to_numpy(dtype=int)
+    ax.bar(xs - 0.15, out["pearson_ic"].to_numpy(dtype=float), width=0.3, label="Pearson IC")
+    ax.bar(xs + 0.15, out["rank_ic"].to_numpy(dtype=float), width=0.3, label="Rank IC (Spearman)")
+    ax.axhline(0.0, color="#999999", linewidth=1.0)
+    ax.set_title("Annual pooled IC (prediction vs target)")
+    ax.set_xlabel("year")
+    ax.set_ylabel("IC")
+    ax.set_xticks(xs, [str(int(x)) for x in xs])
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(Path(out_png), dpi=160)
+    plt.close(fig)
+    return out
+
+
+def _write_average_ranks_from_year_value_sorted(value_sorted_path: Path, out_rank_path: Path) -> None:
+    """Assign per-year average ranks to a (year,value,row_id)-sorted TSV and write (row_id,year,rank)."""
+    # Walk the sorted stream, reset at year boundaries, accumulate per-year tie groups, and emit ranks.
+    year: int | None = None
+    pos = 1
+    tie_value: float | None = None
+    tie_row_ids: list[int] = []
+
+    def _flush() -> None:
+        # Write the current per-year tie group with an average rank and advance the position cursor.
+        nonlocal pos, tie_value, tie_row_ids
+        if len(tie_row_ids) == 0:
+            return
+        start = int(pos)
+        end = int(pos) + int(len(tie_row_ids)) - 1
+        avg_rank = 0.5 * float(start + end)
+        for rid in tie_row_ids:
+            out.write(f"{int(rid)}\t{int(year)}\t{float(avg_rank):.12g}\n")
+        pos = int(pos) + int(len(tie_row_ids))
+        tie_value = None
+        tie_row_ids = []
+
+    with Path(value_sorted_path).open("r", encoding="utf-8") as fp, Path(out_rank_path).open("w", encoding="utf-8") as out:
+        for line in fp:
+            y_str, v_str, rid_str = line.rstrip("\n").split("\t")
+            y = int(y_str)
+            v = float(v_str)
+            rid = int(rid_str)
+            if year is None:
+                year = int(y)
+            if int(y) != int(year):
+                _flush()
+                year = int(y)
+                pos = 1
+            if tie_value is None:
+                tie_value = float(v)
+                tie_row_ids.append(int(rid))
+                continue
+            if float(v) == float(tie_value):
+                tie_row_ids.append(int(rid))
+                continue
+            _flush()
+            tie_value = float(v)
+            tie_row_ids.append(int(rid))
+        _flush()
+
+
+def _annual_pearson_from_row_id_year_rank_files(pred_rank_sorted: Path, tgt_rank_sorted: Path) -> dict[int, float]:
+    """Compute per-year Pearson correlation from two row_id-sorted annual rank TSVs."""
+    # Stream-merge the two rank files by row_id and update a per-year Pearson accumulator map.
+    by_year: dict[int, OnlinePearsonAccumulator] = {}
+    buf_pred: dict[int, list[float]] = {}
+    buf_tgt: dict[int, list[float]] = {}
+    buf_cap = 200000
+
+    def _flush_year(y: int) -> None:
+        # Flush one year's buffered rank pairs into the vectorized accumulator update.
+        xs = buf_pred.get(int(y), [])
+        ys = buf_tgt.get(int(y), [])
+        if len(xs) == 0:
+            return
+        if int(y) not in by_year:
+            by_year[int(y)] = OnlinePearsonAccumulator()
+        by_year[int(y)].update(np.asarray(xs, dtype=np.float64), np.asarray(ys, dtype=np.float64))
+        buf_pred[int(y)] = []
+        buf_tgt[int(y)] = []
+
+    with Path(pred_rank_sorted).open("r", encoding="utf-8") as fp_pred, Path(tgt_rank_sorted).open("r", encoding="utf-8") as fp_tgt:
+        while True:
+            lp = fp_pred.readline()
+            lt = fp_tgt.readline()
+            if lp == "" and lt == "":
+                break
+            rid_p_str, y_p_str, r_p_str = lp.rstrip("\n").split("\t")
+            rid_t_str, y_t_str, r_t_str = lt.rstrip("\n").split("\t")
+            if int(rid_p_str) != int(rid_t_str):
+                raise RuntimeError(f"row_id mismatch in annual rank merge: pred={rid_p_str}, tgt={rid_t_str}")
+            if int(y_p_str) != int(y_t_str):
+                raise RuntimeError(f"year mismatch in annual rank merge: pred={y_p_str}, tgt={y_t_str}")
+            y = int(y_p_str)
+            if int(y) not in buf_pred:
+                buf_pred[int(y)] = []
+                buf_tgt[int(y)] = []
+            buf_pred[int(y)].append(float(r_p_str))
+            buf_tgt[int(y)].append(float(r_t_str))
+            if int(len(buf_pred[int(y)])) >= int(buf_cap):
+                _flush_year(int(y))
+        for y in list(buf_pred.keys()):
+            _flush_year(int(y))
+
+    out: dict[int, float] = {}
+    for y in sorted(by_year.keys()):
+        out[int(y)] = float(by_year[int(y)].finalize())
+    return out
+
+
+def ic_time_series_summary_from_manifest(manifest_path: Path, out_yaml: Path) -> dict[str, object]:
+    """Write timestamp-level IC summary metrics from a predict manifest."""
+    # Stream full (date,time) groups and update running summary stats.
+    import yaml
+
+    reader = PredictionChunkReader(Path(manifest_path))
+    pearson_stats = OnlineMoments()
+    rank_stats = OnlineMoments()
+    timestamp_count = 0
+    for _d, _t, g in reader.iter_timestamp_groups(["date", "time", "prediction", "target"]):
+        # Compute cross-sectional ICs for this timestamp and update the summary accumulators.
+        pred = g["prediction"].to_numpy(dtype=np.float64, copy=False)
+        tgt = g["target"].to_numpy(dtype=np.float64, copy=False)
+        ic = _pearson(pred, tgt)
+        ric = _spearman(pred, tgt)
+        pearson_stats.update(float(ic))
+        rank_stats.update(float(ric))
+        timestamp_count += 1
+
+    # Persist YAML summary with the same shape as ic_time_series_summary.
+    summary = {"pearson_ic": pearson_stats.finalize(), "rank_ic": rank_stats.finalize(), "timestamp_count": int(timestamp_count)}
+    Path(out_yaml).write_text(yaml.safe_dump(summary, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return summary
+
+
+def intraday_time_series_ic_from_manifest(manifest_path: Path, out_csv: Path, out_png: Path) -> pd.DataFrame:
+    """Compute intraday mean/std IC curve from a predict manifest."""
+    # Stream per-timestamp IC and aggregate by minute-of-day using online moments.
+    reader = PredictionChunkReader(Path(manifest_path))
+    pearson_by_time: dict[int, OnlineMoments] = {}
+    rank_by_time: dict[int, OnlineMoments] = {}
+    for _d, t, g in reader.iter_timestamp_groups(["date", "time", "prediction", "target"]):
+        # Compute this timestamp's ICs and update the per-time accumulators.
+        pred = g["prediction"].to_numpy(dtype=np.float64, copy=False)
+        tgt = g["target"].to_numpy(dtype=np.float64, copy=False)
+        ic = _pearson(pred, tgt)
+        ric = _spearman(pred, tgt)
+        if int(t) not in pearson_by_time:
+            pearson_by_time[int(t)] = OnlineMoments()
+            rank_by_time[int(t)] = OnlineMoments()
+        pearson_by_time[int(t)].update(float(ic))
+        rank_by_time[int(t)].update(float(ric))
+
+    # Materialize the final curve table and persist it as CSV.
+    rows: list[dict[str, object]] = []
+    for t in sorted(pearson_by_time.keys()):
+        # Convert moment states into mean/std for plotting.
+        p = pearson_by_time[int(t)]
+        r = rank_by_time[int(t)]
+        p_sum = p.finalize()
+        r_sum = r.finalize()
+        rows.append({"time": int(t), "mean_ic": float(p_sum["mean"]), "std_ic": float(p_sum["std"]), "mean_rank_ic": float(r_sum["mean"]), "std_rank_ic": float(r_sum["std"]), "count": int(p_sum["count"])})
+    agg = pd.DataFrame(rows).sort_values("time", kind="stable").reset_index(drop=True)
+    agg.to_csv(Path(out_csv), index=False)
+
+    # Plot the intraday mean IC curve on an HH:MM axis.
+    fig = plt.figure(figsize=(10, 4))
+    ax = fig.add_subplot(1, 1, 1)
+    xs = agg["time"].to_numpy(dtype=int)
+    labels = [f"{int(tt)//10000:02d}:{(int(tt)%10000)//100:02d}" for tt in xs]
+    ax.plot(np.arange(len(labels)), agg["mean_ic"].to_numpy(dtype=float), label="Pearson IC", linewidth=1.8)
+    ax.plot(np.arange(len(labels)), agg["mean_rank_ic"].to_numpy(dtype=float), label="Rank IC (Spearman)", linewidth=1.8)
+    ax.axhline(0.0, color="#999999", linewidth=1.0)
+    ax.set_title("Intraday IC curve (mean across dates)")
+    ax.set_xlabel("time (minute bars; lunch break absent)")
+    ax.set_ylabel("mean IC")
+    tick_pos = np.linspace(0, max(len(labels) - 1, 1), 10).round().astype(int)
+    ax.set_xticks(tick_pos, [labels[i] for i in tick_pos], rotation=0)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(Path(out_png), dpi=160)
+    plt.close(fig)
+    return agg
+
+
+def prediction_rank_turnover_from_manifest(manifest_path: Path, out_csv: Path, out_png: Path, out_yaml: Path) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Compute adjacent-timestamp prediction-rank turnover from a predict manifest."""
+    # Stream timestamp groups and compute adjacent rank corr/turnover within each day.
+    import yaml
+
+    reader = PredictionChunkReader(Path(manifest_path))
+    rows: list[dict[str, object]] = []
+    prev_day: int | None = None
+    prev_time: int | None = None
+    prev_tbl: pd.DataFrame | None = None
+    for d, t, g in reader.iter_timestamp_groups(["date", "time", "code", "prediction"]):
+        # Start a new day by clearing the previous timestamp state.
+        if prev_day is None or int(d) != int(prev_day):
+            prev_day = int(d)
+            prev_time = None
+            prev_tbl = None
+
+        # Build the current timestamp prediction table.
+        curr = g[["code", "prediction"]].dropna(subset=["prediction"]).copy()
+        curr = curr.rename(columns={"code": "StockCode", "prediction": "prediction_curr"})
+        curr["StockCode"] = curr["StockCode"].astype(int)
+
+        # Compute adjacent turnover when a previous timestamp exists.
+        if prev_tbl is not None and prev_time is not None:
+            merged = prev_tbl.merge(curr, on="StockCode", how="inner")
+            if int(merged.shape[0]) >= 2:
+                rp = stats.rankdata(merged["prediction_prev"].to_numpy(dtype=float), method="average").astype(np.float64, copy=False)
+                rc = stats.rankdata(merged["prediction_curr"].to_numpy(dtype=float), method="average").astype(np.float64, copy=False)
+                rank_corr = _pearson(rp, rc)
+                rank_turnover = float(1.0 - rank_corr) if np.isfinite(rank_corr) else float("nan")
+                rows.append({"date": int(d), "prev_time": int(prev_time), "time": int(t), "rank_corr": float(rank_corr), "rank_turnover": float(rank_turnover), "count": int(merged.shape[0])})
+
+        # Store the current timestamp as the new previous state.
+        prev_tbl = curr.rename(columns={"prediction_curr": "prediction_prev"})
+        prev_time = int(t)
+
+    # Aggregate adjacent-turnover rows by minute-of-day for a stable intraday curve.
+    raw = pd.DataFrame(rows).sort_values(["date", "time"], kind="stable").reset_index(drop=True)
+    agg = raw.groupby("time", sort=True).agg(
+        mean_rank_corr=("rank_corr", "mean"),
+        mean_rank_turnover=("rank_turnover", "mean"),
+        std_rank_turnover=("rank_turnover", "std"),
+        count=("rank_turnover", "count"),
+    )
+    agg = agg.reset_index().sort_values("time", kind="stable").reset_index(drop=True)
+    agg.to_csv(Path(out_csv), index=False)
+
+    # Plot the mean adjacent-turnover curve across the trading day.
+    fig = plt.figure(figsize=(10, 4))
+    ax = fig.add_subplot(1, 1, 1)
+    xs = agg["time"].to_numpy(dtype=int)
+    labels = [f"{int(tt)//10000:02d}:{(int(tt)%10000)//100:02d}" for tt in xs]
+    ax.plot(np.arange(len(labels)), agg["mean_rank_turnover"].to_numpy(dtype=float), label="1 - corr(rank_t, rank_t-1)", linewidth=1.8)
+    ax.axhline(0.0, color="#999999", linewidth=1.0)
+    ax.set_title("Prediction rank turnover (adjacent timestamps)")
+    ax.set_xlabel("time")
+    ax.set_ylabel("mean turnover")
+    tick_pos = np.linspace(0, max(len(labels) - 1, 1), 10).round().astype(int)
+    ax.set_xticks(tick_pos, [labels[i] for i in tick_pos], rotation=0)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(Path(out_png), dpi=160)
+    plt.close(fig)
+
+    # Persist a compact YAML summary for report consumption.
+    if int(agg.shape[0]) > 0:
+        best_idx = int(agg["mean_rank_turnover"].idxmin())
+        worst_idx = int(agg["mean_rank_turnover"].idxmax())
+        summary = {
+            "row_count": int(raw.shape[0]),
+            "mean_rank_corr": float(raw["rank_corr"].mean()),
+            "mean_rank_turnover": float(raw["rank_turnover"].mean()),
+            "positive_rank_corr_ratio": float((raw["rank_corr"] > 0.0).mean()),
+            "lowest_turnover_time": int(agg.loc[int(best_idx), "time"]),
+            "lowest_turnover_value": float(agg.loc[int(best_idx), "mean_rank_turnover"]),
+            "highest_turnover_time": int(agg.loc[int(worst_idx), "time"]),
+            "highest_turnover_value": float(agg.loc[int(worst_idx), "mean_rank_turnover"]),
+        }
+    else:
+        summary = {"row_count": int(raw.shape[0]), "mean_rank_corr": float("nan"), "mean_rank_turnover": float("nan"), "positive_rank_corr_ratio": float("nan")}
+    Path(out_yaml).write_text(yaml.safe_dump(summary, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return agg, summary
+
+
+def residual_diagnostics_from_manifest(manifest_path: Path, out_yaml: Path, out_png: Path) -> dict[str, float]:
+    """Compute residual diagnostics from a predict manifest with a bounded reservoir sample."""
+    # Stream prediction/target chunks, accumulate moments, and keep a small sample for plotting.
+    import yaml
+
+    reader = PredictionChunkReader(Path(manifest_path))
+    rng = np.random.default_rng(7)
+    sample_cap = 20000
+    sample_pred: list[float] = []
+    sample_resid: list[float] = []
+    sample_seen = 0
+
+    n = 0
+    sum_r = 0.0
+    sum_r2 = 0.0
+    sum_r3 = 0.0
+    sum_r4 = 0.0
+    sum_p = 0.0
+    sum_p2 = 0.0
+    sum_pr = 0.0
+
+    for chunk in reader.iter_prediction_chunks(["prediction", "target"]):
+        # Build finite residual vectors and update raw power sums.
+        pred = chunk["prediction"].to_numpy(dtype=np.float64, copy=False)
+        tgt = chunk["target"].to_numpy(dtype=np.float64, copy=False)
+        m = np.isfinite(pred) & np.isfinite(tgt)
+        p = pred[m]
+        r = (tgt[m] - pred[m]).astype(np.float64, copy=False)
+        if int(r.shape[0]) == 0:
+            continue
+
+        n_chunk = int(r.shape[0])
+        n += int(n_chunk)
+        sum_r += float(r.sum(dtype=np.float64))
+        sum_r2 += float((r * r).sum(dtype=np.float64))
+        sum_r3 += float((r * r * r).sum(dtype=np.float64))
+        sum_r4 += float((r * r * r * r).sum(dtype=np.float64))
+        sum_p += float(p.sum(dtype=np.float64))
+        sum_p2 += float((p * p).sum(dtype=np.float64))
+        sum_pr += float((p * r).sum(dtype=np.float64))
+
+        # Update a fixed-size reservoir sample for plot readability.
+        for idx in range(n_chunk):
+            sample_seen += 1
+            if int(len(sample_pred)) < int(sample_cap):
+                sample_pred.append(float(p[idx]))
+                sample_resid.append(float(r[idx]))
+                continue
+            j = int(rng.integers(0, int(sample_seen)))
+            if int(j) < int(sample_cap):
+                sample_pred[int(j)] = float(p[idx])
+                sample_resid[int(j)] = float(r[idx])
+
+    # Derive scalar residual statistics from raw moments.
+    if int(n) < 2:
+        raise RuntimeError("Residual diagnostics require at least 2 finite samples.")
+    nf = float(n)
+    mean_r = float(sum_r / nf)
+    var_r = float(sum_r2 / nf - mean_r * mean_r)
+    std_r = float(np.sqrt(max(var_r, 0.0)))
+    mse = float(sum_r2 / nf)
+    rmse = float(np.sqrt(mse))
+    mae = float("nan")
+
+    # Compute MAE in a second pass to avoid storing residuals.
+    abs_sum = 0.0
+    for chunk in reader.iter_prediction_chunks(["prediction", "target"]):
+        # Recompute residual magnitudes for exact MAE.
+        pred = chunk["prediction"].to_numpy(dtype=np.float64, copy=False)
+        tgt = chunk["target"].to_numpy(dtype=np.float64, copy=False)
+        m = np.isfinite(pred) & np.isfinite(tgt)
+        r = (tgt[m] - pred[m]).astype(np.float64, copy=False)
+        abs_sum += float(np.abs(r).sum(dtype=np.float64))
+    mae = float(abs_sum / nf)
+
+    # Compute skew/kurtosis from central moments.
+    mu2 = float(sum_r2 / nf - mean_r * mean_r)
+    mu3 = float(sum_r3 / nf - 3.0 * mean_r * (sum_r2 / nf) + 2.0 * mean_r * mean_r * mean_r)
+    mu4 = float(sum_r4 / nf - 4.0 * mean_r * (sum_r3 / nf) + 6.0 * mean_r * mean_r * (sum_r2 / nf) - 3.0 * mean_r * mean_r * mean_r * mean_r)
+    skew = float(mu3 / (max(mu2, 1e-18) ** 1.5))
+    kurt = float(mu4 / (max(mu2, 1e-18) ** 2.0) - 3.0)
+
+    # Compute corr(prediction, residual) from raw sums.
+    cov_pr = float(sum_pr / nf - (sum_p / nf) * mean_r)
+    var_p = float(sum_p2 / nf - (sum_p / nf) * (sum_p / nf))
+    corr_pr = float(cov_pr / float(np.sqrt(max(var_p, 0.0) * max(mu2, 0.0)))) if float(var_p) > 0.0 and float(mu2) > 0.0 else float("nan")
+
+    summary = {
+        "count": int(n),
+        "residual_mean": float(mean_r),
+        "residual_std": float(std_r),
+        "residual_skew": float(skew),
+        "residual_kurtosis": float(kurt),
+        "mae": float(mae),
+        "rmse": float(rmse),
+        "corr_prediction_residual": float(corr_pr),
+    }
+    Path(out_yaml).write_text(yaml.safe_dump(summary, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+    # Draw a compact histogram plus prediction-vs-residual scatter panel from the sample.
+    fig = plt.figure(figsize=(10, 4))
+    ax1 = fig.add_subplot(1, 2, 1)
+    ax2 = fig.add_subplot(1, 2, 2)
+    resid_sample = np.asarray(sample_resid, dtype=float)
+    pred_sample = np.asarray(sample_pred, dtype=float)
+    ax1.hist(resid_sample, bins=80, density=True, alpha=0.6, color="#4c72b0")
+    grid = np.linspace(float(np.quantile(resid_sample, 0.001)), float(np.quantile(resid_sample, 0.999)), 400)
+    ax1.plot(grid, stats.norm.pdf(grid, loc=float(resid_sample.mean()), scale=float(max(resid_sample.std(ddof=0), 1e-12))), color="#dd8452", linewidth=2.0)
+    ax1.set_title("Residual distribution (sampled)")
+    ax1.set_xlabel("target - prediction")
+    ax1.set_ylabel("density")
+    ax2.scatter(pred_sample, resid_sample, s=4, alpha=0.15, color="#4c72b0")
+    ax2.axhline(0.0, color="#999999", linewidth=1.0)
+    ax2.set_title("Residual vs prediction (sampled)")
+    ax2.set_xlabel("prediction")
+    ax2.set_ylabel("target - prediction")
+    fig.tight_layout()
+    fig.savefig(Path(out_png), dpi=160)
+    plt.close(fig)
+    return {str(k): float(v) for k, v in summary.items()}
+
+
+def score_ret_rank_plot_from_manifest(manifest_path: Path, out_png: Path) -> pd.DataFrame:
+    """Plot prediction-rank deciles vs mean target and win-rate from a predict manifest."""
+    # Stream timestamps, compute per-timestamp deciles, and accumulate decile-level sums.
+    reader = PredictionChunkReader(Path(manifest_path))
+    sum_target = np.zeros((10,), dtype=np.float64)
+    win_count = np.zeros((10,), dtype=np.int64)
+    count = np.zeros((10,), dtype=np.int64)
+    for _d, _t, g in reader.iter_timestamp_groups(["date", "time", "prediction", "target"]):
+        # Compute decile bins within this timestamp and update global accumulators.
+        tmp = g[["prediction", "target"]].dropna(subset=["prediction", "target"]).copy()
+        if int(tmp.shape[0]) == 0:
+            continue
+        pred = tmp["prediction"].to_numpy(dtype=np.float64, copy=False)
+        tgt = tmp["target"].to_numpy(dtype=np.float64, copy=False)
+        ranks = stats.rankdata(pred, method="average").astype(np.float64, copy=False)
+        pct = ranks / float(pred.shape[0])
+        dec = np.minimum((pct * 10.0).astype(np.int64), 9)
+        for k in range(10):
+            m = dec == int(k)
+            if not bool(m.any()):
+                continue
+            vals = tgt[m]
+            sum_target[int(k)] += float(vals.sum(dtype=np.float64))
+            win_count[int(k)] += int((vals > 0.0).sum())
+            count[int(k)] += int(vals.shape[0])
+
+    # Convert decile accumulators into a small dataframe for plotting.
+    rows: list[dict[str, object]] = []
+    for k in range(10):
+        c = int(count[int(k)])
+        mean_t = float(sum_target[int(k)] / float(c)) if int(c) > 0 else float("nan")
+        win = float(win_count[int(k)] / float(c)) if int(c) > 0 else float("nan")
+        rows.append({"decile": int(k), "mean_target": float(mean_t), "win_rate": float(win), "count": int(c)})
+    agg = pd.DataFrame(rows)
+
+    # Plot mean return and win-rate on dual axes.
+    fig = plt.figure(figsize=(8, 4))
+    ax1 = fig.add_subplot(1, 1, 1)
+    ax2 = ax1.twinx()
+    xs = agg["decile"].to_numpy(dtype=int)
+    ax1.plot(xs, agg["mean_target"].to_numpy(dtype=float), color="#4c72b0", linewidth=2.0, label="mean target")
+    ax2.plot(xs, agg["win_rate"].to_numpy(dtype=float), color="#dd8452", linewidth=2.0, label="win rate")
+    ax1.set_xlabel("prediction rank decile (0=low, 9=high)")
+    ax1.set_ylabel("mean target")
+    ax2.set_ylabel("win rate (target>0)")
+    ax1.set_title("Prediction vs target: rank curve")
+    fig.tight_layout()
+    fig.savefig(Path(out_png), dpi=160)
+    plt.close(fig)
+    return agg
+
+
+def rolling_group_ic_from_manifest(manifest_path: Path, config: EvalConfig, label_col: str, out_csv: Path, out_png: Path, out_yaml: Path) -> pd.DataFrame:
+    """Compute rolling-group IC curve from a predict manifest via per-date chunk aggregation."""
+    # Stream date groups, attach labels per day, and merge rolling-bin accumulators.
+    reader = PredictionChunkReader(Path(manifest_path))
+    bins: dict[float, dict[str, float]] = {}
+    for d, day in reader.iter_date_groups(["date", "time", "code", "prediction", "target"]):
+        # Add StockCode/DateTime columns for label merge on this day only.
+        day2 = day.copy()
+        day2["StockCode"] = day2["code"].astype(int)
+        day2["DateTime"] = merge_date_time_dataframe(day2, "date", "time")
+
+        # Attach price and volatility labels from stock1m for this single day.
+        labeled = attach_labels(day2, config)
+
+        # Accumulate rolling-window IC bins for this day and merge into the global bins.
+        day_bins = _rolling_group_ic_bins(labeled, str(label_col), int(config.window_size), int(config.step_size))
+        _rolling_bins_merge(bins, day_bins)
+
+    # Convert merged bins into the final curve table and persist artifacts.
+    agg = _rolling_bins_to_curve(bins)
+    agg.to_csv(Path(out_csv), index=False)
+    if int(agg.shape[0]) == 0:
+        warnings.warn("Empty rolling IC curve from manifest.", RuntimeWarning)
+        _plot_empty_group_curve(f"{str(label_col)} rolling IC", Path(out_png))
+    else:
+        _plot_group_curve(agg, f"{str(label_col)} rolling IC", Path(out_png))
+    _write_group_curve_summary(agg, Path(out_yaml), f"{str(label_col)}_rolling_ic")
+    return agg
+
+
+@dataclass(frozen=True)
+class PredictReportArtifacts:
+    """Bundle the predict-side streaming report outputs computed from a manifest."""
+
+    pooled: dict[str, float]
+    ic_summary: dict[str, object]
+    ic_summary_yaml: Path
+    annual_tbl: pd.DataFrame
+    annual_csv: Path
+    annual_png: Path
+    intraday_csv: Path
+    intraday_png: Path
+    rank_png: Path
+    turnover_csv: Path
+    turnover_png: Path
+    turnover_yaml: Path
+    turnover_summary: dict[str, object]
+    residual_yaml: Path
+    residual_png: Path
+    residual_summary: dict[str, object]
+    vol_curve: pd.DataFrame
+    vol_csv: Path
+    vol_png: Path
+    vol_yaml: Path
+    price_curve: pd.DataFrame
+    price_csv: Path
+    price_png: Path
+    price_yaml: Path
+
+
+def compute_predict_report_from_manifest(manifest_path: Path, eval_cfg: EvalConfig, out_root: Path) -> PredictReportArtifacts:
+    """Compute the predict-side report artifacts by streaming parquet chunks from a manifest."""
+    # Resolve all output paths under the report root to keep pipeline wiring minimal.
+    out_root = Path(out_root)
+    ic_summary_yaml = Path(out_root) / "predict_ic_time_series_summary.yaml"
+    annual_csv = Path(out_root) / "annual_ic.csv"
+    annual_png = Path(out_root) / "annual_ic.png"
+    intraday_csv = Path(out_root) / "predict_intraday_ic.csv"
+    intraday_png = Path(out_root) / "predict_intraday_ic.png"
+    rank_png = Path(out_root) / "predict_pred_vs_target_rank.png"
+    turnover_csv = Path(out_root) / "predict_prediction_rank_turnover.csv"
+    turnover_png = Path(out_root) / "predict_prediction_rank_turnover.png"
+    turnover_yaml = Path(out_root) / "predict_prediction_rank_turnover.yaml"
+    residual_yaml = Path(out_root) / "predict_residual_diagnostics.yaml"
+    residual_png = Path(out_root) / "predict_residual_diagnostics.png"
+    vol_csv = Path(out_root) / "predict_vol_rolling_ic.csv"
+    vol_png = Path(out_root) / "predict_vol_rolling_ic.png"
+    vol_yaml = Path(out_root) / "predict_vol_rolling_ic.yaml"
+    price_csv = Path(out_root) / "predict_price_rolling_ic.csv"
+    price_png = Path(out_root) / "predict_price_rolling_ic.png"
+    price_yaml = Path(out_root) / "predict_price_rolling_ic.yaml"
+
+    # Compute pooled Pearson IC using an online accumulator over parquet chunks.
+    pooled = pooled_ic_from_manifest(Path(manifest_path))
+
+    # Compute timestamp-level IC summaries by streaming full (date,time) groups.
+    ic_summary = ic_time_series_summary_from_manifest(Path(manifest_path), Path(ic_summary_yaml))
+
+    # Compute annual pooled Pearson IC by streaming and bucketing rows by year.
+    annual_tbl = annual_pooled_ic_from_manifest(Path(manifest_path), Path(annual_csv), Path(annual_png))
+
+    # Compute intraday IC curve by streaming timestamp groups and aggregating by minute-of-day.
+    intraday_time_series_ic_from_manifest(Path(manifest_path), Path(intraday_csv), Path(intraday_png))
+
+    # Compute predict-side diagnostics that depend on per-timestamp ranks or residuals.
+    score_ret_rank_plot_from_manifest(Path(manifest_path), Path(rank_png))
+    _turnover_tbl, turnover_summary = prediction_rank_turnover_from_manifest(Path(manifest_path), Path(turnover_csv), Path(turnover_png), Path(turnover_yaml))
+    residual_summary = residual_diagnostics_from_manifest(Path(manifest_path), Path(residual_yaml), Path(residual_png))
+
+    # Compute rolling-group IC curves by streaming one date at a time and attaching labels per day.
+    vol_curve = rolling_group_ic_from_manifest(Path(manifest_path), eval_cfg, "volatility_label", Path(vol_csv), Path(vol_png), Path(vol_yaml))
+    price_curve = rolling_group_ic_from_manifest(Path(manifest_path), eval_cfg, "price_label", Path(price_csv), Path(price_png), Path(price_yaml))
+
+    # Return a compact artifact bundle so the pipeline can render report.md without extra IO.
+    return PredictReportArtifacts(
+        pooled=dict(pooled),
+        ic_summary=dict(ic_summary),
+        ic_summary_yaml=Path(ic_summary_yaml),
+        annual_tbl=annual_tbl,
+        annual_csv=Path(annual_csv),
+        annual_png=Path(annual_png),
+        intraday_csv=Path(intraday_csv),
+        intraday_png=Path(intraday_png),
+        rank_png=Path(rank_png),
+        turnover_csv=Path(turnover_csv),
+        turnover_png=Path(turnover_png),
+        turnover_yaml=Path(turnover_yaml),
+        turnover_summary=dict(turnover_summary),
+        residual_yaml=Path(residual_yaml),
+        residual_png=Path(residual_png),
+        residual_summary=dict(residual_summary),
+        vol_curve=vol_curve,
+        vol_csv=Path(vol_csv),
+        vol_png=Path(vol_png),
+        vol_yaml=Path(vol_yaml),
+        price_curve=price_curve,
+        price_csv=Path(price_csv),
+        price_png=Path(price_png),
+        price_yaml=Path(price_yaml),
+    )
 
 
 def pooled_ic(df: pd.DataFrame) -> dict[str, float]:
@@ -466,9 +1441,9 @@ def rolling_group_ic_parallel(pred_df: pd.DataFrame, config: EvalConfig, label_c
 
     # Concatenate per-date labeled rows and compute one pooled rolling curve.
     if len(parts) == 0:
-        return pd.DataFrame([])
+        return _empty_group_schema()
     labeled = pd.concat(parts, axis=0).reset_index(drop=True)
-    out = _rolling_group_ic_rows(labeled, str(label_col), int(config.window_size), int(config.step_size))
+    out = _rolling_group_ic(labeled, str(label_col), int(config.window_size), int(config.step_size))
     return out
 
 
@@ -512,9 +1487,10 @@ def _rolling_group_ic(
     window_size: int,
     step_size: int,
 ) -> pd.DataFrame:
-    """Compute raw rolling-window IC over cross-sections sorted by a label."""
-    # Compute raw rolling rows directly without any cross-window bin aggregation.
-    return _rolling_group_ic_rows(df, label_col, int(window_size), int(step_size))
+    """Compute aggregated rolling-window IC over cross-sections sorted by a label."""
+    # Aggregate rolling windows into compact rank bins instead of materializing every window row.
+    bins = _rolling_group_ic_bins(df, label_col, int(window_size), int(step_size))
+    return _rolling_bins_to_curve(bins)
 
 
 def _rolling_group_ic_rows(
@@ -738,7 +1714,7 @@ def _plot_group_curve(df: pd.DataFrame, title: str, out_png: Path) -> None:
 def _empty_group_schema() -> pd.DataFrame:
     """Return an empty rolling-group IC dataframe with a stable schema."""
     # Define a stable column order so downstream report rendering is predictable.
-    cols = ["window_start", "window_end", "group_center_rank", "label_left", "label_center", "label_right", "mean_ic", "std_ic", "mean_rank_ic", "std_rank_ic", "count"]
+    cols = ["group_center_rank", "mean_ic", "std_ic", "mean_rank_ic", "std_rank_ic", "count"]
     out = pd.DataFrame({c: pd.Series([], dtype=float) for c in cols})
     out["count"] = out["count"].astype(int)
     return out
@@ -761,16 +1737,19 @@ def volatility_rolling_ic(pred_df: pd.DataFrame, config: EvalConfig, out_csv: Pa
     """Compute volatility rolling-window IC and persist CSV/plot."""
     # Compute rolling-window IC assuming labels are already attached.
     agg = _rolling_group_ic(pred_df, "volatility_label", int(config.window_size), int(config.step_size))
+    out_yaml = Path(out_csv).with_suffix(".yaml")
     if agg.shape[0] == 0:
         warnings.warn("Empty volatility rolling IC: valid stock count < window_size.", RuntimeWarning)
         agg = _empty_group_schema()
         agg.to_csv(out_csv, index=False)
         _plot_empty_group_curve("Volatility rolling IC", out_png)
+        _write_group_curve_summary(agg, out_yaml, "volatility")
         return agg
 
     # Persist the aggregated curve and emit the plot.
     agg.to_csv(out_csv, index=False)
     _plot_group_curve(agg, "Volatility rolling IC", out_png)
+    _write_group_curve_summary(agg, out_yaml, "volatility")
     return agg
 
 
@@ -778,16 +1757,19 @@ def volatility_rolling_ic_parallel(pred_df: pd.DataFrame, config: EvalConfig, ou
     """Compute volatility rolling-window IC via per-date multiprocessing and persist CSV/plot."""
     # Compute aggregated rolling-window IC using per-date label joins in worker processes.
     agg = rolling_group_ic_parallel(pred_df, config, "volatility_label", int(workers))
+    out_yaml = Path(out_csv).with_suffix(".yaml")
     if agg.shape[0] == 0:
         warnings.warn("Empty volatility rolling IC: valid stock count < window_size.", RuntimeWarning)
         agg = _empty_group_schema()
         agg.to_csv(out_csv, index=False)
         _plot_empty_group_curve("Volatility rolling IC", out_png)
+        _write_group_curve_summary(agg, out_yaml, "volatility")
         return agg
 
     # Persist the aggregated curve and emit the plot.
     agg.to_csv(out_csv, index=False)
     _plot_group_curve(agg, "Volatility rolling IC", out_png)
+    _write_group_curve_summary(agg, out_yaml, "volatility")
     return agg
 
 
@@ -795,16 +1777,19 @@ def price_rolling_ic(pred_df: pd.DataFrame, config: EvalConfig, out_csv: Path, o
     """Compute price rolling-window IC and persist CSV/plot."""
     # Compute rolling-window IC assuming labels are already attached.
     agg = _rolling_group_ic(pred_df, "price_label", int(config.window_size), int(config.step_size))
+    out_yaml = Path(out_csv).with_suffix(".yaml")
     if agg.shape[0] == 0:
         warnings.warn("Empty price rolling IC: valid stock count < window_size.", RuntimeWarning)
         agg = _empty_group_schema()
         agg.to_csv(out_csv, index=False)
         _plot_empty_group_curve("Price rolling IC", out_png)
+        _write_group_curve_summary(agg, out_yaml, "price")
         return agg
 
     # Persist the aggregated curve and emit the plot.
     agg.to_csv(out_csv, index=False)
     _plot_group_curve(agg, "Price rolling IC", out_png)
+    _write_group_curve_summary(agg, out_yaml, "price")
     return agg
 
 
@@ -812,16 +1797,19 @@ def price_rolling_ic_parallel(pred_df: pd.DataFrame, config: EvalConfig, out_csv
     """Compute price rolling-window IC via per-date multiprocessing and persist CSV/plot."""
     # Compute aggregated rolling-window IC using per-date label joins in worker processes.
     agg = rolling_group_ic_parallel(pred_df, config, "price_label", int(workers))
+    out_yaml = Path(out_csv).with_suffix(".yaml")
     if agg.shape[0] == 0:
         warnings.warn("Empty price rolling IC: valid stock count < window_size.", RuntimeWarning)
         agg = _empty_group_schema()
         agg.to_csv(out_csv, index=False)
         _plot_empty_group_curve("Price rolling IC", out_png)
+        _write_group_curve_summary(agg, out_yaml, "price")
         return agg
 
     # Persist the aggregated curve and emit the plot.
     agg.to_csv(out_csv, index=False)
     _plot_group_curve(agg, "Price rolling IC", out_png)
+    _write_group_curve_summary(agg, out_yaml, "price")
     return agg
 
 
