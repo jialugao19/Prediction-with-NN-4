@@ -44,6 +44,10 @@ class MlpRegressor(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the MLP forward pass and return a (N, 1) prediction."""
+        # Flatten sequence inputs into one feature vector per sample.
+        if x.dim() > 2:
+            x = x.reshape(int(x.shape[0]), -1)
+
         # Apply the sequential network on the input batch.
         out = self.net(x)
         return out

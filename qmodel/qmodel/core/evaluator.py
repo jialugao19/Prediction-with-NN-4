@@ -24,6 +24,7 @@ from qmodel.components.amp_scaler import MyScaler
 from qmodel.models import build_model
 
 from qmodel.config import QConfig
+from qmodel.core.predict_chunks import PredictChunkWriter
 
 
 class Inferencer(AsyncInference):
@@ -201,6 +202,86 @@ class Evaluator:
         return res_df
 
 
+    def _run_predict_inference_to_manifest(self, *, it: int, n_iter: int, iter_dir: Path) -> Path:
+        """Run predict inference and stream outputs to parquet chunks with a manifest."""
+        # Require a single-rank predict path so row_id is globally monotonic.
+        if self.ddp_enabled:
+            raise RuntimeError("Streaming predict chunks require non-DDP execution.")
+
+        # Build model/inferencer/dataloader for the predict group and checkpoint.
+        config = self.config
+        device = self.config.device
+        amp_scaler = MyScaler(config.use_amp, config.amp_dtype)
+        model = build_model(config.model_class, config.model).to(device=device, dtype=config.eval_dtype)
+        do_profile = config.profiler.profile_section == "eval"
+        profiler = MyProfiler(real_run=do_profile, config=config.profiler)
+        dataloader = setup_eval_dataloader(self.config, self.group, shuffle=False)
+
+        # Load model weights from checkpoint and create a chunk writer.
+        ckpt = Path(self.config.root_dir) / "ckpt" / f"iter_{it}.pt"
+        logger.info(f"Evaluating checkpoint: {ckpt}, iter {it}, group={self.group}, rank={self.rank}/{self.world_size}")
+        self.checkpointer.load(ckpt, model, None, None, None)
+        chunk_row_count = int(self.config.evaluator.predict_chunk_row_count)
+        writer = PredictChunkWriter(iter_dir=Path(iter_dir), it=int(it), chunk_row_count=int(chunk_row_count))
+
+        # Define an inferencer that writes each batch into the chunk writer.
+        class _PredictInferencer(AsyncInference):
+            def __init__(self, **kwargs):
+                """Initialize the inferencer with an external chunk writer."""
+                # Store writer so post-step can flush batches to disk.
+                self._writer = kwargs.pop("writer")
+                super().__init__(**kwargs)
+
+            def _pre_step(self, curr_it: int):
+                """Run no-op per-step hooks for predict mode."""
+                # Keep this hook explicit to match AsyncInference protocol.
+                return None
+
+            def _post_step(self, res, buffer, target, other_meta, curr_it):
+                """Write one batch into parquet chunk buffers."""
+                # Append the batch into the streaming writer immediately.
+                self._writer.append(buffer, target, other_meta)
+
+        inferencer = _PredictInferencer(
+            model=model,
+            dataloader=dataloader,
+            device=device,
+            amp_scaler=amp_scaler,
+            profiler=profiler,
+            timer_window_size=int(self.config.log_every),
+            writer=writer,
+        )
+
+        # Determine evaluation length with a strict min cap.
+        if n_iter == 0:
+            n_iter = len(dataloader)
+        n_iter = min(int(n_iter), len(dataloader))
+
+        # Run inference; post-step writes chunks asynchronously and flushes before return.
+        _ = inferencer.run(n_iter=n_iter, use_tqdm=self.enable_logging and self.rank == 0)
+        logger.info("finish running inference")
+        manifest_path = writer.close()
+        logger.info("finish streaming predict chunks")
+
+        # Emit a perf-focused console summary line for predict as well.
+        if self.rank == 0 or self.console_log_all_ranks:
+            means = inferencer.timer.means()
+            nvml = self._nvml.snapshot()
+            torch_mem = torch_cuda_mem_snapshot(device)
+            line = format_eval_perf_line(
+                it=int(it),
+                group=str(self.group),
+                data_ms=float(means.data_ms),
+                model_ms=float(means.model_ms),
+                rank=int(self.rank),
+                nvml=nvml,
+                torch_mem=torch_mem,
+            )
+            logger.info(line)
+
+        return Path(manifest_path)
+
+
     def _finish_pending_metrics(self, *, block: bool) -> dict[str, float]:
         """Join and log one pending metrics job if it has completed."""
         # Return early when there is no pending metrics job.
@@ -259,12 +340,16 @@ class Evaluator:
         if self.enable_logging and self.rank == 0 and self._pending_metrics_process is not None:
             self._finish_pending_metrics(block=True)
 
-        # Run inference and write a per-rank shard feather.
+        # Resolve the iter output directory early so predict can write its manifest there.
         iter_dir = self._eval_iter_dir(it)
         iter_dir.mkdir(parents=True, exist_ok=True)
-        shard_path = iter_dir / f"rank{self.rank}.feather"
-        res_df = self._run_inference(it=it, n_iter=n_iter)
-        res_df.to_feather(shard_path.as_posix())
+        if self.group == "predict":
+            self._run_predict_inference_to_manifest(it=int(it), n_iter=int(n_iter), iter_dir=Path(iter_dir))
+        else:
+            # Run inference and write a per-rank shard feather.
+            shard_path = iter_dir / f"rank{self.rank}.feather"
+            res_df = self._run_inference(it=int(it), n_iter=int(n_iter))
+            res_df.to_feather(shard_path.as_posix())
 
         # Synchronize ranks so rank0 can safely consume all shard files.
         if self.ddp_enabled:

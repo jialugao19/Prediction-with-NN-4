@@ -14,6 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from qmodel.components.amp_scaler import MyScaler
 from qmodel.components.checkpoint import CheckpointSaver
+from qmodel.core.predict_chunks import PredictChunkWriter
 from qmodel.data.dataloader import setup_eval_dataloader
 from qmodel.distributed import barrier, get_ddp_state
 from qmodel.logger import logger
@@ -142,6 +143,46 @@ class CpuEvaluator:
         res_df["DateTime"] = merge_date_time_dataframe(res_df, "date", "time")
         return res_df
 
+    def _run_predict_inference_to_manifest(self, *, it: int, n_iter: int, iter_dir: Path) -> Path:
+        """Run CPU predict inference and stream outputs to parquet chunks with a manifest."""
+        # Require a single-rank predict path so row_id is globally monotonic.
+        if self.ddp_enabled:
+            raise RuntimeError("Streaming predict chunks require non-DDP execution.")
+
+        # Build model and load checkpoint weights.
+        config = self.config
+        device = torch.device(config.device)
+        if device.type != "cpu":
+            raise RuntimeError(f"CpuEvaluator requires CPU device, got: {device}")
+
+        amp_scaler = MyScaler(config.use_amp, config.amp_dtype)
+        model = build_model(config.model_class, config.model).to(device=device, dtype=config.eval_dtype)
+        ckpt_path = Path(config.root_dir) / "ckpt" / f"iter_{int(it)}.pt"
+        self.checkpointer.load(ckpt_path, model, None, None, amp_scaler)
+        model.eval()
+
+        # Create a chunk writer rooted at the iter directory.
+        chunk_row_count = int(self.config.evaluator.predict_chunk_row_count)
+        writer = PredictChunkWriter(iter_dir=Path(iter_dir), it=int(it), chunk_row_count=int(chunk_row_count))
+
+        # Iterate over batches and append directly into the writer.
+        dataloader = setup_eval_dataloader(config, group=self.group, shuffle=False)
+        with torch.no_grad():
+            for step_idx, batch in enumerate(dataloader):
+                # Stop early when n_iter is configured for partial eval.
+                if int(n_iter) > 0 and int(step_idx) >= int(n_iter):
+                    break
+
+                # Run forward pass and stream the CPU outputs into parquet buffers.
+                data, target, meta = batch
+                out = model(data.to(device))
+                writer.append(out.detach().cpu(), target.detach().cpu(), meta.detach().cpu())
+
+        # Close the writer and return the manifest path for downstream report code.
+        manifest_path = writer.close()
+        logger.info("finish streaming predict chunks")
+        return Path(manifest_path)
+
     def _finish_pending_metrics(self, *, block: bool) -> dict[str, float]:
         """Join and log one pending metrics job if it has completed."""
         # Return early when there is no pending job.
@@ -196,12 +237,16 @@ class CpuEvaluator:
         if self.enable_logging and self.rank == 0 and self._pending_metrics_process is not None:
             self._finish_pending_metrics(block=True)
 
-        # Run inference and write per-rank shard feather.
+        # Resolve the iter output directory early so predict can write its manifest there.
         iter_dir = self._eval_iter_dir(int(it))
         iter_dir.mkdir(parents=True, exist_ok=True)
-        shard_path = iter_dir / f"rank{int(self.rank)}.feather"
-        res_df = self._run_inference(it=int(it), n_iter=int(n_iter))
-        res_df.to_feather(shard_path.as_posix())
+        if self.group == "predict":
+            self._run_predict_inference_to_manifest(it=int(it), n_iter=int(n_iter), iter_dir=Path(iter_dir))
+        else:
+            # Run inference and write per-rank shard feather.
+            shard_path = iter_dir / f"rank{int(self.rank)}.feather"
+            res_df = self._run_inference(it=int(it), n_iter=int(n_iter))
+            res_df.to_feather(shard_path.as_posix())
 
         # Synchronize ranks so rank0 can safely consume all shard files.
         if self.ddp_enabled:
