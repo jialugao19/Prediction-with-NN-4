@@ -60,12 +60,14 @@ class Stock1mNpzDataset:
         self._feature_dim = int(feature_dim)
         self._window_size = int(window_size)
         if int(window_size) > 1:
-            valid_path = Path(spec.data_dir) / f"{group}_window{int(window_size)}_valid_end.i32"
-            if valid_path.exists():
-                valid_end = np.fromfile(valid_path, dtype=np.int32)
-            else:
-                valid_end = _build_valid_window_end_indices(meta_arr, int(window_size))
-                valid_end.astype(np.int32, copy=False).tofile(valid_path)
+            valid_end = _load_or_build_valid_end_cache(
+                data_dir=Path(spec.data_dir),
+                group=str(group),
+                window_size=int(window_size),
+                rows=int(rows),
+                meta_bin_path=meta_bin_path,
+                meta_arr=meta_arr,
+            )
             self._valid_end = valid_end
             self._window_offsets = torch.arange(-(int(window_size) - 1), 1, dtype=torch.int64)
         else:
@@ -131,6 +133,53 @@ class Stock1mNpzDataset:
         # Materialize the selected valid end rows as torch int64 indices.
         raw = self._valid_end[indices.cpu().numpy()]
         return torch.as_tensor(raw, dtype=torch.int64)
+
+
+def _valid_end_cache_paths(data_dir: Path, group: str, window_size: int) -> tuple[Path, Path]:
+    """Resolve the data and metadata paths for one valid-end cache."""
+    # Keep both cache files adjacent so invalidation can be checked cheaply.
+    stem = f"{str(group)}_window{int(window_size)}_valid_end"
+    return Path(data_dir) / f"{stem}.i32", Path(data_dir) / f"{stem}.yaml"
+
+
+def _valid_end_cache_contract(group: str, window_size: int, rows: int, meta_bin_path: Path) -> dict[str, object]:
+    """Build the cache contract used to validate one valid-end file."""
+    # Record the source meta file identity so stale caches can be detected.
+    stat = Path(meta_bin_path).stat()
+    return {
+        "group": str(group),
+        "window_size": int(window_size),
+        "rows": int(rows),
+        "meta_size_bytes": int(stat.st_size),
+        "meta_mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def _load_or_build_valid_end_cache(
+    *,
+    data_dir: Path,
+    group: str,
+    window_size: int,
+    rows: int,
+    meta_bin_path: Path,
+    meta_arr: np.ndarray,
+) -> np.ndarray:
+    """Load one valid-end cache when it matches the current meta file, else rebuild it."""
+    # Resolve cache paths and the expected cache contract before touching disk.
+    valid_path, meta_path = _valid_end_cache_paths(Path(data_dir), str(group), int(window_size))
+    expected_contract = _valid_end_cache_contract(str(group), int(window_size), int(rows), Path(meta_bin_path))
+
+    # Reuse the cache only when both files exist and the metadata contract matches exactly.
+    if valid_path.exists() and meta_path.exists():
+        cache_contract = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
+        if dict(cache_contract) == dict(expected_contract):
+            return np.fromfile(valid_path, dtype=np.int32)
+
+    # Rebuild the cache from meta_arr and overwrite both cache files atomically enough for local use.
+    valid_end = _build_valid_window_end_indices(meta_arr, int(window_size))
+    valid_end.astype(np.int32, copy=False).tofile(valid_path)
+    meta_path.write_text(yaml.safe_dump(expected_contract, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return valid_end
 
 
 def _build_valid_window_end_indices(meta_arr: np.ndarray, window_size: int) -> np.ndarray:

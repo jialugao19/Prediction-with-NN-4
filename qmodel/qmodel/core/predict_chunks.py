@@ -50,12 +50,13 @@ class PredictChunksManifest:
 class PredictChunkWriter:
     """Stream prediction rows to disk as parquet chunks and write a manifest at the end."""
 
-    def __init__(self, *, iter_dir: Path, it: int, chunk_row_count: int) -> None:
+    def __init__(self, *, iter_dir: Path, it: int, chunk_row_count: int, group: str) -> None:
         """Initialize a chunk writer rooted at an evaluator iter directory."""
         # Create output directories and initialize counters.
         self._iter_dir = Path(iter_dir)
         self._it = int(it)
         self._chunk_row_count = int(chunk_row_count)
+        self._group = str(group)
         self._chunk_dir = Path(self._iter_dir) / "predict_chunks"
         self._chunk_dir.mkdir(parents=True, exist_ok=True)
 
@@ -150,7 +151,7 @@ class PredictChunkWriter:
             chunk_files=list(self._chunk_files),
             stream_write_seconds=float(self._write_seconds),
             iter=int(self._it),
-            group="predict",
+            group=str(self._group),
             sort_key=["row_id"],
             date_min=int(self._date_min) if self._date_min is not None else 0,
             date_max=int(self._date_max) if self._date_max is not None else 0,

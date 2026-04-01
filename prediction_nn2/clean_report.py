@@ -1,4 +1,4 @@
-"""Render the data-clean markdown report from persisted artifacts."""
+"""Render the data-clean self-contained HTML report from persisted artifacts."""
 
 from __future__ import annotations
 
@@ -7,10 +7,11 @@ from pathlib import Path
 import pandas as pd
 
 from prediction_nn2.data_prep import _write_feature_distribution_artifacts_from_bins
+from prediction_nn2.html_report import build_page, render_figure, render_section, render_table, render_value_rows
 
 
 def render_clean_report_from_meta(meta_path: Path) -> Path:
-    """Render `data_clean/report.md` from an existing `meta.yaml` and data-clean artifacts."""
+    """Render `data_clean/report.html` from an existing `meta.yaml` and data-clean artifacts."""
     # Resolve artifact paths relative to meta.yaml so callers can move run roots freely.
     meta_path = Path(meta_path)
     import yaml
@@ -18,16 +19,15 @@ def render_clean_report_from_meta(meta_path: Path) -> Path:
     meta = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
     out_dir = meta_path.parent.parent
     stats_dir = Path(out_dir) / "data_clean"
-    report_path = Path(stats_dir) / "report.md"
+    report_path = Path(stats_dir) / "report.html"
 
     # Load the required lightweight artifacts produced during data prep.
     invalid_stats_path = Path(stats_dir) / "invalid_feature_stats.csv"
-    invalid_report_path = Path(stats_dir) / "invalid_feature_report.md"
+    invalid_report_path = Path(stats_dir) / "invalid_feature_report.html"
     moment_path = Path(stats_dir) / "feature_moments.csv"
     overview_png = Path(stats_dir) / "pooled_feature_grid.png"
     pooled_zscore_yaml = Path(stats_dir) / "pooled_zscore.yaml"
     invalid_stats = pd.read_csv(invalid_stats_path)
-    invalid_md = invalid_report_path.read_text(encoding="utf-8")
 
     # Rebuild distribution artifacts from existing bins when they are missing.
     if moment_path.exists() and overview_png.exists():
@@ -55,81 +55,83 @@ def render_clean_report_from_meta(meta_path: Path) -> Path:
     max_abs_skew = float(moments["skew"].abs().max())
     max_abs_kurt = float(moments["kurtosis"].abs().max())
 
-    # Render a single markdown report that links to the heavier numerical artifacts.
+    # Build the scalar summary blocks used by the HTML page.
     dates = dict(meta["dates"])
     audit = dict(meta["audit"])
     audit_rates = dict(meta["audit_rates"])
     groups = dict(meta["storage"]["groups"])
     norm = dict(meta["feature_transform"]["stock_norm"])
-    lines: list[str] = []
-    lines.extend(
-        [
-            "# Data Clean Report",
-            "",
-            "## Summary",
-            "",
-            f"- meta: `{meta_path.as_posix()}`",
-            f"- stock_norm: `{norm['type']}` scope=`{norm.get('scope', 'n/a')}`",
-            f"- groups: {', '.join(sorted(list(groups.keys())))}",
-            f"- train_days={len(dates['train'])}, val_days={len(dates['val'])}, test_days={len(dates['test'])}",
-            f"- rows: train={int(groups['train']['rows'])}, val={int(groups['val']['rows'])}, test={int(groups['test']['rows'])}",
-        ]
-    )
+    summary_rows = [
+        ("meta", meta_path.as_posix()),
+        ("stock_norm", f"{norm['type']} / scope={norm.get('scope', 'n/a')}"),
+        ("groups", ", ".join(sorted(list(groups.keys())))),
+        ("train_days", str(len(dates["train"]))),
+        ("val_days", str(len(dates["val"]))),
+        ("test_days", str(len(dates["test"]))),
+        ("train_rows", str(int(groups["train"]["rows"]))),
+        ("val_rows", str(int(groups["val"]["rows"]))),
+        ("test_rows", str(int(groups["test"]["rows"]))),
+    ]
     if "predict" in groups:
         # Record optional predict group stats when it exists.
-        lines.append(f"- rows: predict={int(groups['predict']['rows'])}")
-    lines.extend(
+        summary_rows.append(("predict_rows", str(int(groups["predict"]["rows"]))))
+
+    # Build the audit-rate rows as one vertical block.
+    audit_rows = [
+        ("train", f"kept_rate={float(audit_rates['train']['kept_rate']):.2%}, sampled_rate_vs_raw={float(audit_rates['train']['sampled_rate_vs_raw']):.2%}"),
+        ("val", f"kept_rate={float(audit_rates['val']['kept_rate']):.2%}, sampled_rate_vs_raw={float(audit_rates['val']['sampled_rate_vs_raw']):.2%}"),
+        ("test", f"kept_rate={float(audit_rates['test']['kept_rate']):.2%}, sampled_rate_vs_raw={float(audit_rates['test']['sampled_rate_vs_raw']):.2%}"),
+    ]
+
+    # Convert the invalid-value top table into HTML rows.
+    invalid_table = render_table(
+        ["field", "field_type", "invalid_ratio", "invalid_count", "total_count"],
         [
-            "",
-            "## Audit Rates",
-            "",
-            f"- train kept_rate={float(audit_rates['train']['kept_rate']):.2%}, sampled_rate_vs_raw={float(audit_rates['train']['sampled_rate_vs_raw']):.2%}",
-            f"- val kept_rate={float(audit_rates['val']['kept_rate']):.2%}, sampled_rate_vs_raw={float(audit_rates['val']['sampled_rate_vs_raw']):.2%}",
-            f"- test kept_rate={float(audit_rates['test']['kept_rate']):.2%}, sampled_rate_vs_raw={float(audit_rates['test']['sampled_rate_vs_raw']):.2%}",
-            "",
-            "## Invalid Values (Top 10 by ratio)",
-            "",
-            f"- stats: `{invalid_stats_path.as_posix()}`",
-            f"- report: `{invalid_report_path.as_posix()}`",
-            "",
-            "| field | field_type | invalid_ratio | invalid_count | total_count |",
-            "| --- | --- | ---: | ---: | ---: |",
-        ]
+            [
+                str(row["field"]),
+                str(row["field_type"]),
+                f"{float(row['invalid_ratio']):.4%}",
+                str(int(row["invalid_count"])),
+                str(int(row["total_count"])),
+            ]
+            for row in top_invalid.to_dict(orient="records")
+        ],
     )
-    for row in top_invalid.to_dict(orient="records"):
-        # Append a compact invalid-value table row per field.
-        lines.append(
-            f"| {row['field']} | {row['field_type']} | {float(row['invalid_ratio']):.4%} | {int(row['invalid_count'])} | {int(row['total_count'])} |"
-        )
-    lines.extend(
-        [
-            "",
-            "## Standardized Feature Moments",
-            "",
-            f"- moments: `{moment_path.as_posix()}`",
-            f"- pooled_zscore: `{pooled_zscore_yaml.as_posix()}`" if pooled_zscore_yaml.exists() else "- pooled_zscore: (missing)",
-            f"- Max abs mean: {max_abs_mean:.6f}",
-            f"- Max abs std shift from 1: {max_abs_std_shift:.6f}",
-            f"- Max abs skew: {max_abs_skew:.6f}",
-            f"- Max abs kurtosis: {max_abs_kurt:.6f}",
-            "",
-            "## Pooled Distribution Overview",
-            "",
-            f"- overview: `{overview_png.as_posix()}`",
-            "",
-            f"![]({overview_png.name})",
-            "",
-            "## Notes",
-            "",
-            f"- audit_elapsed_seconds: train={float(audit['train']['elapsed_seconds']):.2f}, val={float(audit['val']['elapsed_seconds']):.2f}, test={float(audit['test']['elapsed_seconds']):.2f}",
-            "",
-            "## Invalid Feature Report (Raw)",
-            "",
-        ]
-    )
-    lines.append(invalid_md.rstrip("\n"))
-    lines.append("")
+
+    # Convert the standardized-moment summary into stacked rows.
+    moment_rows = [
+        ("moments", moment_path.as_posix()),
+        ("pooled_zscore", pooled_zscore_yaml.as_posix() if pooled_zscore_yaml.exists() else "(missing)"),
+        ("max_abs_mean", f"{max_abs_mean:.6f}"),
+        ("max_abs_std_shift", f"{max_abs_std_shift:.6f}"),
+        ("max_abs_skew", f"{max_abs_skew:.6f}"),
+        ("max_abs_kurtosis", f"{max_abs_kurt:.6f}"),
+    ]
+
+    # Build the final HTML document in a single vertical column.
+    sections = [
+        render_section("Summary", render_value_rows(summary_rows)),
+        render_section("Audit Rates", render_value_rows(audit_rows)),
+        render_section(
+            "Invalid Values",
+            render_value_rows([("stats_csv", invalid_stats_path.as_posix()), ("invalid_report_html", invalid_report_path.as_posix())]) + invalid_table,
+        ),
+        render_section("Standardized Feature Moments", render_value_rows(moment_rows)),
+        render_figure("Pooled Distribution Overview", overview_png, "Data clean pooled feature distributions."),
+        render_section(
+            "Notes",
+            render_value_rows(
+                [
+                    (
+                        "audit_elapsed_seconds",
+                        f"train={float(audit['train']['elapsed_seconds']):.2f}, val={float(audit['val']['elapsed_seconds']):.2f}, test={float(audit['test']['elapsed_seconds']):.2f}",
+                    )
+                ]
+            ),
+        ),
+    ]
 
     # Persist the report next to the data-clean artifacts so downstream stages can rebuild cheaply.
-    report_path.write_text("\n".join(lines), encoding="utf-8")
+    html = build_page("Data Clean Report", "Self-contained HTML generated from persisted data-clean artifacts.", sections)
+    report_path.write_text(html, encoding="utf-8")
     return report_path

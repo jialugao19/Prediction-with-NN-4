@@ -220,7 +220,7 @@ class PredictionChunkReader:
             ready = df.loc[~last_mask]
 
             # Yield all full date groups in stable appearance order.
-            for d, g in ready.groupby(["date"], sort=False):
+            for d, g in ready.groupby("date", sort=False):
                 yield int(d), g
 
         # Yield the final carry group after all chunks are consumed.
@@ -364,6 +364,20 @@ def pooled_ic_from_manifest(manifest_path: Path) -> dict[str, float]:
         # Merge pred/tgt ranks by row_id and compute Pearson on ranks in one pass.
         rank_ic = float(_pearson_from_row_id_rank_files(Path(pred_rank_sorted), Path(tgt_rank_sorted)))
         return {"pearson_ic": float(acc.finalize()), "rank_ic": float(rank_ic), "count": int(acc.count())}
+
+
+def pooled_pearson_ic_from_manifest(manifest_path: Path) -> dict[str, float]:
+    """Compute pooled Pearson IC from a manifest without exact rank IC work."""
+    # Stream prediction chunks once and accumulate only Pearson moments.
+    reader = PredictionChunkReader(Path(manifest_path))
+    acc = OnlinePearsonAccumulator()
+    for chunk in reader.iter_prediction_chunks(["prediction", "target"]):
+        pred = chunk["prediction"].to_numpy(dtype=np.float64, copy=False)
+        tgt = chunk["target"].to_numpy(dtype=np.float64, copy=False)
+        acc.update(pred, tgt)
+
+    # Return the minimal schema needed by the train report.
+    return {"pearson_ic": float(acc.finalize()), "count": int(acc.count())}
 
 
 def _write_average_ranks_from_value_sorted(value_sorted_path: Path, out_rank_path: Path) -> None:
@@ -644,6 +658,27 @@ def ic_time_series_summary_from_manifest(manifest_path: Path, out_yaml: Path) ->
     return summary
 
 
+def pearson_ic_time_series_summary_from_manifest(manifest_path: Path, out_yaml: Path) -> dict[str, object]:
+    """Write timestamp-level Pearson IC summary metrics from a manifest."""
+    # Stream full (date,time) groups and update Pearson-only running summary stats.
+    import yaml
+
+    reader = PredictionChunkReader(Path(manifest_path))
+    pearson_stats = OnlineMoments()
+    timestamp_count = 0
+    for _d, _t, g in reader.iter_timestamp_groups(["date", "time", "prediction", "target"]):
+        # Compute one timestamp Pearson IC and update the running summary.
+        pred = g["prediction"].to_numpy(dtype=np.float64, copy=False)
+        tgt = g["target"].to_numpy(dtype=np.float64, copy=False)
+        pearson_stats.update(float(_pearson(pred, tgt)))
+        timestamp_count += 1
+
+    # Persist YAML with the subset schema used by the train report.
+    summary = {"pearson_ic": pearson_stats.finalize(), "timestamp_count": int(timestamp_count)}
+    Path(out_yaml).write_text(yaml.safe_dump(summary, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return summary
+
+
 def intraday_time_series_ic_from_manifest(manifest_path: Path, out_csv: Path, out_png: Path) -> pd.DataFrame:
     """Compute intraday mean/std IC curve from a predict manifest."""
     # Stream per-timestamp IC and aggregate by minute-of-day using online moments.
@@ -683,6 +718,63 @@ def intraday_time_series_ic_from_manifest(manifest_path: Path, out_csv: Path, ou
     ax.plot(np.arange(len(labels)), agg["mean_rank_ic"].to_numpy(dtype=float), label="Rank IC (Spearman)", linewidth=1.8)
     ax.axhline(0.0, color="#999999", linewidth=1.0)
     ax.set_title("Intraday IC curve (mean across dates)")
+    ax.set_xlabel("time (minute bars; lunch break absent)")
+    ax.set_ylabel("mean IC")
+    tick_pos = np.linspace(0, max(len(labels) - 1, 1), 10).round().astype(int)
+    ax.set_xticks(tick_pos, [labels[i] for i in tick_pos], rotation=0)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(Path(out_png), dpi=160)
+    plt.close(fig)
+    return agg
+
+
+def _intraday_pearson_curve_from_manifest(manifest_path: Path) -> pd.DataFrame:
+    """Compute one intraday Pearson IC curve from a manifest."""
+    # Stream timestamp groups and aggregate Pearson IC by minute-of-day.
+    reader = PredictionChunkReader(Path(manifest_path))
+    pearson_by_time: dict[int, OnlineMoments] = {}
+    for _d, t, g in reader.iter_timestamp_groups(["date", "time", "prediction", "target"]):
+        # Update the minute-of-day accumulator with this timestamp's Pearson IC.
+        pred = g["prediction"].to_numpy(dtype=np.float64, copy=False)
+        tgt = g["target"].to_numpy(dtype=np.float64, copy=False)
+        if int(t) not in pearson_by_time:
+            pearson_by_time[int(t)] = OnlineMoments()
+        pearson_by_time[int(t)].update(float(_pearson(pred, tgt)))
+
+    # Materialize the final curve table with stable column names.
+    rows: list[dict[str, object]] = []
+    for t in sorted(pearson_by_time.keys()):
+        stats = pearson_by_time[int(t)].finalize()
+        rows.append({"time": int(t), "mean_ic": float(stats["mean"]), "std_ic": float(stats["std"]), "count": int(stats["count"])})
+    return pd.DataFrame(rows).sort_values("time", kind="stable").reset_index(drop=True)
+
+
+def intraday_time_series_ic_train_test_from_manifest(train_manifest_path: Path, test_manifest_path: Path, out_csv: Path, out_png: Path) -> pd.DataFrame:
+    """Compute intraday minute-of-day Pearson IC curves for train and test from manifests."""
+    # Build the train intraday Pearson curve.
+    train_agg = _intraday_pearson_curve_from_manifest(Path(train_manifest_path)).rename(
+        columns={"mean_ic": "mean_ic_train", "std_ic": "std_ic_train", "count": "count_train"}
+    )
+
+    # Build the test intraday Pearson curve.
+    test_agg = _intraday_pearson_curve_from_manifest(Path(test_manifest_path)).rename(
+        columns={"mean_ic": "mean_ic_test", "std_ic": "std_ic_test", "count": "count_test"}
+    )
+
+    # Merge the aligned minute-of-day curves so we can plot them together.
+    agg = train_agg.merge(test_agg, on="time", how="inner")
+    agg.to_csv(Path(out_csv), index=False)
+
+    # Plot the train/test Pearson IC curves on one shared intraday axis.
+    fig = plt.figure(figsize=(10, 4))
+    ax = fig.add_subplot(1, 1, 1)
+    xs = agg["time"].to_numpy(dtype=int)
+    labels = [f"{int(tt)//10000:02d}:{(int(tt)%10000)//100:02d}" for tt in xs]
+    ax.plot(np.arange(len(labels)), agg["mean_ic_train"].to_numpy(dtype=float), label="Train Pearson IC", linewidth=1.8)
+    ax.plot(np.arange(len(labels)), agg["mean_ic_test"].to_numpy(dtype=float), label="Test Pearson IC", linewidth=1.8)
+    ax.axhline(0.0, color="#999999", linewidth=1.0)
+    ax.set_title("Intraday IC curve (Pearson; mean across dates)")
     ax.set_xlabel("time (minute bars; lunch break absent)")
     ax.set_ylabel("mean IC")
     tick_pos = np.linspace(0, max(len(labels) - 1, 1), 10).round().astype(int)
@@ -1055,7 +1147,7 @@ def compute_predict_report_from_manifest(manifest_path: Path, eval_cfg: EvalConf
     vol_curve = rolling_group_ic_from_manifest(Path(manifest_path), eval_cfg, "volatility_label", Path(vol_csv), Path(vol_png), Path(vol_yaml))
     price_curve = rolling_group_ic_from_manifest(Path(manifest_path), eval_cfg, "price_label", Path(price_csv), Path(price_png), Path(price_yaml))
 
-    # Return a compact artifact bundle so the pipeline can render report.md without extra IO.
+    # Return a compact artifact bundle so the pipeline can render report.html without extra IO.
     return PredictReportArtifacts(
         pooled=dict(pooled),
         ic_summary=dict(ic_summary),
@@ -1172,6 +1264,50 @@ def intraday_time_series_ic(df: pd.DataFrame, out_csv: Path, out_png: Path) -> p
     ax.plot(np.arange(len(labels)), agg["mean_rank_ic"].to_numpy(dtype=float), label="Rank IC (Spearman)", linewidth=1.8)
     ax.axhline(0.0, color="#999999", linewidth=1.0)
     ax.set_title("Intraday IC curve (mean across dates)")
+    ax.set_xlabel("time (minute bars; lunch break absent)")
+    ax.set_ylabel("mean IC")
+    tick_pos = np.linspace(0, max(len(labels) - 1, 1), 10).round().astype(int)
+    ax.set_xticks(tick_pos, [labels[i] for i in tick_pos], rotation=0)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=160)
+    plt.close(fig)
+    return agg
+
+
+def intraday_time_series_ic_train_test(train_df: pd.DataFrame, test_df: pd.DataFrame, out_csv: Path, out_png: Path) -> pd.DataFrame:
+    """Compute intraday minute-of-day Pearson IC curves for train and test on one axis."""
+    # Compute the per-minute Pearson IC series for train and aggregate by minute-of-day.
+    train_cs = cross_sectional_ic_series(train_df).rename(columns={"count": "n"})
+    train_agg = train_cs.groupby("time", sort=True).agg(
+        mean_ic_train=("ic", "mean"),
+        std_ic_train=("ic", "std"),
+        count_train=("ic", "count"),
+    )
+    train_agg = train_agg.reset_index().sort_values("time", kind="stable").reset_index(drop=True)
+
+    # Compute the per-minute Pearson IC series for test and aggregate by minute-of-day.
+    test_cs = cross_sectional_ic_series(test_df).rename(columns={"count": "n"})
+    test_agg = test_cs.groupby("time", sort=True).agg(
+        mean_ic_test=("ic", "mean"),
+        std_ic_test=("ic", "std"),
+        count_test=("ic", "count"),
+    )
+    test_agg = test_agg.reset_index().sort_values("time", kind="stable").reset_index(drop=True)
+
+    # Merge the aligned minute-of-day curves so we can plot them together.
+    agg = train_agg.merge(test_agg, on="time", how="inner")
+    agg.to_csv(out_csv, index=False)
+
+    # Plot the intraday mean Pearson IC curves on an HH:MM axis.
+    fig = plt.figure(figsize=(10, 4))
+    ax = fig.add_subplot(1, 1, 1)
+    xs = agg["time"].to_numpy(dtype=int)
+    labels = [f"{int(t)//10000:02d}:{(int(t)%10000)//100:02d}" for t in xs]
+    ax.plot(np.arange(len(labels)), agg["mean_ic_train"].to_numpy(dtype=float), label="Train Pearson IC", linewidth=1.8)
+    ax.plot(np.arange(len(labels)), agg["mean_ic_test"].to_numpy(dtype=float), label="Test Pearson IC", linewidth=1.8)
+    ax.axhline(0.0, color="#999999", linewidth=1.0)
+    ax.set_title("Intraday IC curve (Pearson; mean across dates)")
     ax.set_xlabel("time (minute bars; lunch break absent)")
     ax.set_ylabel("mean IC")
     tick_pos = np.linspace(0, max(len(labels) - 1, 1), 10).round().astype(int)

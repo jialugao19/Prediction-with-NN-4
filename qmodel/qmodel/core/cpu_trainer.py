@@ -60,23 +60,26 @@ class CpuTrainer:
         self.dataloader, self.sampler = setup_train_dataloader(config, group="train", shuffle=True)
         self._it = iter(self.dataloader)
 
-        # Prepare directories and TensorBoard writer.
+        # Prepare directories before checkpoint and writer setup.
         os.makedirs(config.root_dir, exist_ok=True)
         os.makedirs(config.tensorboard_dir, exist_ok=True)
-        if self.is_main_process:
-            tb_metrics_dir = os.path.join(config.root_dir, "tb")
-            os.makedirs(tb_metrics_dir, exist_ok=True)
-            self.writer = SummaryWriter(log_dir=tb_metrics_dir)
-        else:
-            self.writer = None
-
-        # Build a CPU evaluator for validation during training.
-        self.evaluator = CpuEvaluator(config, group="val", writer=self.writer, enable_logging=self.is_main_process)
 
         # Prepare checkpoint saver and resume logic.
         self.checkpointer = CheckpointSaver(config.root_dir, config, device=device)
         self.start_iter = 0
         self._load_from_checkpoint()
+
+        # Open the TensorBoard writer after resume state is known.
+        if self.is_main_process:
+            tb_metrics_dir = os.path.join(config.root_dir, "tb")
+            os.makedirs(tb_metrics_dir, exist_ok=True)
+            purge_step = None if int(self.start_iter) == 0 else int(self.start_iter)
+            self.writer = SummaryWriter(log_dir=tb_metrics_dir, purge_step=purge_step)
+        else:
+            self.writer = None
+
+        # Build a CPU evaluator for validation during training.
+        self.evaluator = CpuEvaluator(config, group="val", writer=self.writer, enable_logging=self.is_main_process)
 
         # Prepare a rolling timer for train_timer_metrics compatibility.
         self.timer = RollingTimer(int(config.log_every))

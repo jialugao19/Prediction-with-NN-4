@@ -39,7 +39,7 @@ class CpuEvaluator:
     ) -> None:
         """Initialize evaluator state and optional TensorBoard writer."""
         # Validate group and store core knobs.
-        if str(group) not in ["test", "val", "predict"]:
+        if str(group) not in ["train", "test", "val", "predict"]:
             raise RuntimeError(f"Invalid group: {group}")
         self.config = config
         self.group = str(group)
@@ -163,7 +163,7 @@ class CpuEvaluator:
 
         # Create a chunk writer rooted at the iter directory.
         chunk_row_count = int(self.config.evaluator.predict_chunk_row_count)
-        writer = PredictChunkWriter(iter_dir=Path(iter_dir), it=int(it), chunk_row_count=int(chunk_row_count))
+        writer = PredictChunkWriter(iter_dir=Path(iter_dir), it=int(it), chunk_row_count=int(chunk_row_count), group=str(self.group))
 
         # Iterate over batches and append directly into the writer.
         dataloader = setup_eval_dataloader(config, group=self.group, shuffle=False)
