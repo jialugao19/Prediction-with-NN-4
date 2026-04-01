@@ -75,19 +75,22 @@ class Trainer(AsyncTrainer):
         os.makedirs(config.root_dir, exist_ok=True)
         os.makedirs(config.tensorboard_dir, exist_ok=True)
 
-        if self.is_main_process:
-            tb_metrics_dir = os.path.join(config.root_dir, "tb")
-            os.makedirs(tb_metrics_dir, exist_ok=True)
-            self.writer = SummaryWriter(log_dir=tb_metrics_dir)
-        else:
-            self.writer = None
-        self.evaluator = Evaluator(config, group="val", writer=self.writer, enable_logging=self.is_main_process)
-
+        # Prepare checkpoint state before opening TensorBoard so resumed runs can purge stale steps.
         self.checkpointer = CheckpointSaver(config.root_dir, config, device)
         self.sampler = sampler
         self.start_iter = 0
 
         self.load_from_checkpoint()
+
+        # Open the TensorBoard writer after resume state is known.
+        if self.is_main_process:
+            tb_metrics_dir = os.path.join(config.root_dir, "tb")
+            os.makedirs(tb_metrics_dir, exist_ok=True)
+            purge_step = None if int(self.start_iter) == 0 else int(self.start_iter)
+            self.writer = SummaryWriter(log_dir=tb_metrics_dir, purge_step=purge_step)
+        else:
+            self.writer = None
+        self.evaluator = Evaluator(config, group="val", writer=self.writer, enable_logging=self.is_main_process)
 
     def load_from_checkpoint(self):
         from qmodel.util import find_checkpoint_path

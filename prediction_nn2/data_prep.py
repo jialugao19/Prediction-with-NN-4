@@ -16,6 +16,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from prediction_nn2.html_report import build_page, render_section, render_table, render_value_rows
+
 
 _STOCK_FEATURES = [
     "ret_1m",
@@ -71,6 +73,41 @@ def list_trade_dates(config: DataPrepConfig) -> list[int]:
     # Sort and return full date list; split policy should decide how to consume them.
     dates = sorted(set(dates))
     return dates
+
+
+def _resolve_split_dates(config: DataPrepConfig) -> tuple[list[int], list[int], list[int], list[int]]:
+    """Resolve available trade dates and split them into train/val/test lists."""
+    # List the available trade dates and validate the requested split length.
+    dates = list_trade_dates(config)
+    n_train = int(config.train_days)
+    n_val = int(config.val_days)
+    n_test = int(config.test_days)
+    need = n_train + n_val + n_test
+    if len(dates) < need:
+        raise RuntimeError(f"Not enough trade dates: got={len(dates)} need={need}")
+
+    # Slice the available trade-date list into contiguous train/val/test segments.
+    train_dates = dates[:n_train]
+    val_dates = dates[n_train : n_train + n_val]
+    test_dates = dates[n_train + n_val : n_train + n_val + n_test]
+    return dates, train_dates, val_dates, test_dates
+
+
+def _prep_config_contract(config: DataPrepConfig) -> dict[str, object]:
+    """Return the output-defining preprocessing contract stored in meta.yaml."""
+    # Keep only fields that change the base train/val/test dataset contents.
+    return {
+        "start_trade_date": int(config.start_trade_date),
+        "end_trade_date": int(config.end_trade_date),
+        "train_days": int(config.train_days),
+        "val_days": int(config.val_days),
+        "test_days": int(config.test_days),
+        "seed": int(config.seed),
+        "horizon_minutes": int(config.horizon_minutes),
+        "sample_stocks_per_minute": int(config.sample_stocks_per_minute),
+        "use_cross_sectional_gaussianize": bool(config.use_cross_sectional_gaussianize),
+        "norm_fit_scope": str(config.norm_fit_scope),
+    }
 
 
 def _read_stock1m_day(trade_date: int, config: DataPrepConfig) -> pd.DataFrame:
@@ -595,39 +632,56 @@ def _aggregate_invalid_feature_stats(daily_audits: list[dict[str, object]]) -> p
 
 
 def _write_invalid_feature_artifacts(invalid_table: pd.DataFrame, out_dir: Path) -> None:
-    """Write invalid-value statistics to CSV and markdown report."""
+    """Write invalid-value statistics to CSV and self-contained HTML report."""
     # Ensure the data-clean output directory exists before writing files.
     out_dir.mkdir(parents=True, exist_ok=True)
     csv_path = out_dir / "invalid_feature_stats.csv"
-    md_path = out_dir / "invalid_feature_report.md"
+    html_path = out_dir / "invalid_feature_report.html"
     invalid_table.to_csv(csv_path, index=False)
 
     # Summarize the most problematic fields for fast inspection.
     top_invalid = invalid_table.sort_values(["invalid_ratio", "field"], ascending=[False, True], kind="stable").reset_index(drop=True)
     top_nan = invalid_table.sort_values(["nan_ratio", "field"], ascending=[False, True], kind="stable").reset_index(drop=True)
     top_inf = invalid_table.sort_values(["inf_ratio", "field"], ascending=[False, True], kind="stable").reset_index(drop=True)
-    lines = [
-        "# Data Clean NaN/inf 报告",
-        "",
-        f"- 数值表: `{csv_path.as_posix()}`",
-        f"- 字段数: {int(invalid_table.shape[0])}",
-        f"- Max invalid ratio: {float(top_invalid.iloc[0]['invalid_ratio']):.6f} (`{str(top_invalid.iloc[0]['field'])}`)",
-        f"- Max NaN ratio: {float(top_nan.iloc[0]['nan_ratio']):.6f} (`{str(top_nan.iloc[0]['field'])}`)",
-        f"- Max inf ratio: {float(top_inf.iloc[0]['inf_ratio']):.6f} (`{str(top_inf.iloc[0]['field'])}`)",
-        "",
-        "## Invalid Ratio Top 8",
-        "",
-        "| field | type | nan_ratio | inf_ratio | invalid_ratio | mean_finite | std_finite | skew_finite | kurtosis_finite |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+
+    # Build the scalar summary block for the invalid-value report.
+    summary_rows = [
+        ("stats_csv", csv_path.as_posix()),
+        ("field_count", str(int(invalid_table.shape[0]))),
+        ("max_invalid_ratio", f"{float(top_invalid.iloc[0]['invalid_ratio']):.6f} ({str(top_invalid.iloc[0]['field'])})"),
+        ("max_nan_ratio", f"{float(top_nan.iloc[0]['nan_ratio']):.6f} ({str(top_nan.iloc[0]['field'])})"),
+        ("max_inf_ratio", f"{float(top_inf.iloc[0]['inf_ratio']):.6f} ({str(top_inf.iloc[0]['field'])})"),
     ]
-    for row in top_invalid.head(8).to_dict(orient="records"):
-        # Append one markdown row per high-invalid field.
-        lines.append(
-            f"| {row['field']} | {row['field_type']} | {float(row['nan_ratio']):.6f} | {float(row['inf_ratio']):.6f} | "
-            f"{float(row['invalid_ratio']):.6f} | {float(row['mean_finite']):.6f} | {float(row['std_finite']):.6f} | "
-            f"{float(row['skew_finite']):.6f} | {float(row['kurtosis_finite']):.6f} |"
-        )
-    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    # Build the top-invalid HTML table in one vertical section.
+    top_table = render_table(
+        ["field", "type", "nan_ratio", "inf_ratio", "invalid_ratio", "mean_finite", "std_finite", "skew_finite", "kurtosis_finite"],
+        [
+            [
+                str(row["field"]),
+                str(row["field_type"]),
+                f"{float(row['nan_ratio']):.6f}",
+                f"{float(row['inf_ratio']):.6f}",
+                f"{float(row['invalid_ratio']):.6f}",
+                f"{float(row['mean_finite']):.6f}",
+                f"{float(row['std_finite']):.6f}",
+                f"{float(row['skew_finite']):.6f}",
+                f"{float(row['kurtosis_finite']):.6f}",
+            ]
+            for row in top_invalid.head(8).to_dict(orient="records")
+        ],
+    )
+
+    # Render the self-contained HTML document.
+    html = build_page(
+        "Data Clean NaN/inf Report",
+        "Self-contained HTML generated from pooled invalid-value statistics.",
+        [
+            render_section("Summary", render_value_rows(summary_rows)),
+            render_section("Invalid Ratio Top 8", top_table),
+        ],
+    )
+    html_path.write_text(html, encoding="utf-8")
 
 
 def _write_feature_distribution_artifacts(x: np.ndarray, feature_names: list[str], out_dir: Path) -> pd.DataFrame:
@@ -936,13 +990,19 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
     meta_path = npz_dir / "meta.yaml"
     npz_dir.mkdir(parents=True, exist_ok=True)
     import yaml
+
     time_features = list(_TIME_FEATURES)
     feature_names = list(_stock_feature_output_names(config)) + list(time_features)
+    dates, train_dates, val_dates, test_dates = _resolve_split_dates(config)
     expected_stock_norm = (
         {"type": "cross_sectional_gaussianize", "rank_clip": 1e-3}
         if bool(config.use_cross_sectional_gaussianize)
         else {"type": "pooled_zscore", "scope": str(config.norm_fit_scope), "params_path": "pooled_zscore.yaml"}
     )
+    expected_label = {"type": "forward_log_return", "horizon_minutes": int(config.horizon_minutes)}
+    expected_sampling = {"sample_stocks_per_minute": int(config.sample_stocks_per_minute)}
+    expected_dates = {"train": list(train_dates), "val": list(val_dates), "test": list(test_dates)}
+    expected_prep_config = _prep_config_contract(config)
 
     if meta_path.exists():
         # Load the persisted metadata so repeated invocations can resume at training without rebuilding.
@@ -953,6 +1013,22 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             raise RuntimeError(
                 f"Existing meta.yaml does not match current preprocessing config: expected_features={feature_names} expected_stock_norm={expected_stock_norm}"
             )
+
+        # Validate split dates, label, and sampling so old artifacts cannot be silently reused.
+        meta_dates = dict(meta["dates"])
+        if list(meta_dates["train"]) != list(expected_dates["train"]) or list(meta_dates["val"]) != list(expected_dates["val"]) or list(meta_dates["test"]) != list(expected_dates["test"]):
+            raise RuntimeError(f"Existing meta.yaml does not match current split dates: expected_dates={expected_dates}")
+        if dict(meta["label"]) != dict(expected_label):
+            raise RuntimeError(f"Existing meta.yaml does not match current label config: expected_label={expected_label}")
+        if dict(meta["sampling"]) != dict(expected_sampling):
+            raise RuntimeError(f"Existing meta.yaml does not match current sampling config: expected_sampling={expected_sampling}")
+
+        # Validate the stored preprocessing contract when it is available.
+        meta_prep_config = dict(meta.get("prep_config", {}))
+        if len(meta_prep_config) > 0 and dict(meta_prep_config) != dict(expected_prep_config):
+            raise RuntimeError(f"Existing meta.yaml does not match current prep_config: expected_prep_config={expected_prep_config}")
+        if len(meta_prep_config) == 0 and int(config.sample_stocks_per_minute) > 0:
+            raise RuntimeError("Existing meta.yaml is missing prep_config; cannot validate sampled data seed.")
         storage = dict(meta["storage"])
         groups = dict(storage["groups"])
 
@@ -975,7 +1051,7 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         # Ensure core data-clean artifacts exist so clean-report rebuild stays lightweight.
         stats_dir = Path(config.out_dir) / "data_clean"
         invalid_stats_path = stats_dir / "invalid_feature_stats.csv"
-        invalid_report_path = stats_dir / "invalid_feature_report.md"
+        invalid_report_path = stats_dir / "invalid_feature_report.html"
         if not invalid_stats_path.exists() or not invalid_report_path.exists():
             raise RuntimeError(f"Missing invalid-value artifacts for existing meta.yaml: {invalid_stats_path} {invalid_report_path}")
 
@@ -1088,18 +1164,6 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         if "predict" in groups:
             out["predict_rows"] = int(groups["predict"]["rows"])
         return out
-
-    # Resolve trade dates and validate that splits are feasible.
-    dates = list_trade_dates(config)
-    n_train = int(config.train_days)
-    n_val = int(config.val_days)
-    n_test = int(config.test_days)
-    need = n_train + n_val + n_test
-    if len(dates) < need:
-        raise RuntimeError(f"Not enough trade dates: got={len(dates)} need={need}")
-    train_dates = dates[:n_train]
-    val_dates = dates[n_train : n_train + n_val]
-    test_dates = dates[n_train + n_val : n_train + n_val + n_test]
 
     # Define the stable feature ordering early so array materialization is consistent.
     # Create a shared worker pool once so per-day processing runs in parallel.
@@ -1359,6 +1423,7 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
 
     # Persist split metadata and preprocessing audit for reproducibility.
     meta = {
+        "prep_config": expected_prep_config,
         "feature_names": list(feature_names),
         "storage": storage,
         "feature_transform": {
@@ -1381,10 +1446,10 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         },
         "invalid_values": {
             "stats_path": "data_clean/invalid_feature_stats.csv",
-            "report_path": "data_clean/invalid_feature_report.md",
+            "report_path": "data_clean/invalid_feature_report.html",
         },
         "data_clean_artifacts": {
-            "report_path": "data_clean/report.md",
+            "report_path": "data_clean/report.html",
             "feature_moments_path": "data_clean/feature_moments.csv",
             "pooled_distribution_overview_path": "data_clean/pooled_feature_grid.png",
         },

@@ -1,4 +1,4 @@
-"""Define a small MLP model used by the qmodel training loop."""
+"""Define the sequence model used by the qmodel training loop."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-
 
 @dataclass(frozen=True)
 class MlpConfig:
@@ -51,3 +50,58 @@ class MlpRegressor(nn.Module):
         # Apply the sequential network on the input batch.
         out = self.net(x)
         return out
+
+
+@dataclass(frozen=True)
+class GruMlpConfig:
+    """Hold GRU+MLP hyperparameters for the prediction model."""
+
+    input_size: int
+    hidden_size: int
+    num_layers: int
+    bidirectional: bool
+    rnn_dropout: float
+    mlp_hidden_dims: list[int]
+    mlp_dropout: float
+    dtype: torch.dtype
+
+
+class GruMlpRegressor(nn.Module):
+    """Encode a (T,F) sequence with GRU and regress with a small MLP."""
+
+    def __init__(self, config: GruMlpConfig) -> None:
+        """Build a GRU encoder plus an MLP head from the provided configuration."""
+        super().__init__()
+
+        # Build the GRU encoder that processes (B,T,F) inputs.
+        self.rnn = nn.GRU(
+            input_size=int(config.input_size),
+            hidden_size=int(config.hidden_size),
+            num_layers=int(config.num_layers),
+            bidirectional=bool(config.bidirectional),
+            dropout=float(config.rnn_dropout),
+            batch_first=True,
+        )
+
+        # Build the MLP head that maps last_hidden into a scalar prediction.
+        mlp_width = 512
+        layers: list[nn.Module] = []
+        prev = int(config.hidden_size) * (2 if bool(config.bidirectional) else 1)
+        for _h in list(config.mlp_hidden_dims):
+            # Add linear + activation + dropout as one semantic block.
+            layers.append(nn.Linear(int(prev), int(mlp_width)))
+            layers.append(nn.ReLU(inplace=True))
+            layers.append(nn.Dropout(float(config.mlp_dropout)))
+            prev = int(mlp_width)
+        layers.append(nn.Linear(int(prev), 1))
+        self.mlp = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run GRU then MLP and return a (B, 1) prediction."""
+        # Encode the sequence with GRU and take last-layer last_hidden.
+        _out, h_n = self.rnn(x)
+        last_hidden = h_n[-1]
+
+        # Apply the MLP head on the encoded representation.
+        pred = self.mlp(last_hidden)
+        return pred

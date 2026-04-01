@@ -1,4 +1,4 @@
-"""Rebuild `predict_report.md` from an existing predict manifest without rerunning training."""
+"""Rebuild `predict_report.html` from an existing predict manifest without rerunning training."""
 
 from prediction_nn2.pipeline import _default_config, run_predict_report_postprocess_only
 
@@ -12,4 +12,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

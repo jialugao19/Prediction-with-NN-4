@@ -50,7 +50,7 @@ class Evaluator:
     ):
         """Initialize an evaluator for one dataset group."""
         # Initialize evaluator for a dataset split and optional TensorBoard writer.
-        assert group in ["test", "val", "predict"]
+        assert group in ["train", "test", "val", "predict"]
         self.config = config
         self.group  = group
         self.enable_logging = enable_logging
@@ -222,7 +222,7 @@ class Evaluator:
         logger.info(f"Evaluating checkpoint: {ckpt}, iter {it}, group={self.group}, rank={self.rank}/{self.world_size}")
         self.checkpointer.load(ckpt, model, None, None, None)
         chunk_row_count = int(self.config.evaluator.predict_chunk_row_count)
-        writer = PredictChunkWriter(iter_dir=Path(iter_dir), it=int(it), chunk_row_count=int(chunk_row_count))
+        writer = PredictChunkWriter(iter_dir=Path(iter_dir), it=int(it), chunk_row_count=int(chunk_row_count), group=str(self.group))
 
         # Define an inferencer that writes each batch into the chunk writer.
         class _PredictInferencer(AsyncInference):

@@ -1,4 +1,4 @@
-"""Rebuild `train_report.md` from existing artifacts without rerunning training."""
+"""Rebuild `train_report.html` from existing artifacts without rerunning training."""
 
 from prediction_nn2.pipeline import _default_config, run_train_report_postprocess_only
 
@@ -12,4 +12,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
