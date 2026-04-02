@@ -938,6 +938,19 @@ def _build_single_day_table_task(args: tuple[int, DataPrepConfig]) -> tuple[pd.D
     return _build_single_day_table(int(trade_date), config)
 
 
+def _data_prep_iterator(
+    pool: mp.pool.Pool | None,
+    tasks: list[tuple[int, DataPrepConfig]],
+):
+    """Build the day-result iterator used by data prep."""
+    # Run sequentially when workers=1 so debugging and local repro stay simple.
+    if pool is None:
+        return map(_build_single_day_table_task, list(tasks))
+
+    # Stream one day at a time from worker processes to bound parent memory.
+    return pool.imap(_build_single_day_table_task, list(tasks), chunksize=1)
+
+
 def _progress_metrics(
     progress: dict[str, object],
     train_dates: list[int],
@@ -1166,10 +1179,16 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         return out
 
     # Define the stable feature ordering early so array materialization is consistent.
-    # Create a shared worker pool once so per-day processing runs in parallel.
+    # Select a multiprocessing start method that is safe after importing torch.
     workers = int(config.workers)
-    ctx = mp.get_context("fork")
-    pool = ctx.Pool(processes=int(workers))
+    if int(workers) < 1:
+        raise RuntimeError(f"workers must be positive, got: {workers}")
+    start_method = "spawn"
+    print(f"[data_prep] start_method={start_method} workers={workers}", flush=True)
+
+    # Create a shared worker pool once so per-day processing runs in parallel.
+    ctx = mp.get_context(str(start_method))
+    pool = ctx.Pool(processes=int(workers)) if int(workers) > 1 else None
     try:
         # Load panels, compute features/labels, and sample within each day using multiprocessing map.
         def _build_for_dates(
@@ -1184,7 +1203,7 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             # Stream per-day processing inside worker processes while writing arrays sequentially in the main process.
             t0 = time.time()
             tasks = [(int(d), config) for d in list(date_list)]
-            it = pool.imap(_build_single_day_table_task, tasks, chunksize=1)
+            it = _data_prep_iterator(pool, tasks)
 
             # Accumulate audits and row counts without materializing the full split in memory.
             rows = 0
@@ -1278,8 +1297,9 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             progress_path.write_text(yaml.safe_dump(progress, sort_keys=False, allow_unicode=True), encoding="utf-8")
     finally:
         # Close the worker pool on both success and failure to avoid leaking processes.
-        pool.close()
-        pool.join()
+        if pool is not None:
+            pool.close()
+            pool.join()
 
     # Load full daily audit tables now that all splits are complete.
     train_daily_audits = list(yaml.safe_load((npz_dir / "audit_daily_train.yaml").read_text(encoding="utf-8")))
