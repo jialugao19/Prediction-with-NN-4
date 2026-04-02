@@ -296,6 +296,11 @@ def _build_qmodel_config(cfg: PipelineConfig, feature_dim: int, run_root: Path) 
     use_cuda = bool(torch.cuda.is_available())
     device = torch.device("cuda:0") if use_cuda else torch.device("cpu")
 
+    # Select AMP settings from the resolved device so CUDA runs use fp16 autocast.
+    amp_dtype = torch.float16 if bool(use_cuda) else torch.float32
+    use_amp = "torch" if bool(use_cuda) else "none"
+    eval_dtype = torch.float16 if bool(use_cuda) else torch.float32
+
     # Define dataset callable with explicit spec object to avoid hidden globals.
     npz_dir = Path(run_root) / "artifacts" / "npz"
     dataset_spec = NpzDatasetSpec(data_dir=npz_dir, pin_memory=use_cuda, window_size=int(cfg.input_window_size))
@@ -336,13 +341,13 @@ def _build_qmodel_config(cfg: PipelineConfig, feature_dim: int, run_root: Path) 
         model_class=GruMlpRegressor,
         model=model_cfg,
         seed=int(cfg.seed),
-        amp_dtype=torch.float32,
-        eval_dtype=torch.float32,
+        amp_dtype=amp_dtype,
+        eval_dtype=eval_dtype,
         train_dtype=torch.float32,
         criterion=torch.nn.MSELoss(),
         optimizer_class=torch.optim.AdamW,
         learning_rate=float(cfg.learning_rate),
-        use_amp="none",
+        use_amp=use_amp,
         use_lr_sched="custom",
         grad_clip_norm=None,
         expr_name="prediction-nn-2",
