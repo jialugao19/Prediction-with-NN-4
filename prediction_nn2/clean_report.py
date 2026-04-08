@@ -49,7 +49,7 @@ def render_clean_report_from_meta(meta_path: Path) -> Path:
     # Summarize invalid-value and standardized-moment diagnostics into compact scalars.
     invalid_stats = invalid_stats.copy()
     invalid_stats["invalid_ratio"] = invalid_stats["invalid_count"] / invalid_stats["total_count"]
-    top_invalid = invalid_stats.sort_values(["invalid_ratio", "invalid_count"], ascending=False).head(10).reset_index(drop=True)
+    invalid_sorted = invalid_stats.sort_values(["invalid_ratio", "invalid_count", "field"], ascending=[False, False, True], kind="stable").reset_index(drop=True)
     max_abs_mean = float(moments["mean"].abs().max())
     max_abs_std_shift = float((moments["std"] - 1.0).abs().max())
     max_abs_skew = float(moments["skew"].abs().max())
@@ -94,7 +94,7 @@ def render_clean_report_from_meta(meta_path: Path) -> Path:
                 str(int(row["invalid_count"])),
                 str(int(row["total_count"])),
             ]
-            for row in top_invalid.to_dict(orient="records")
+            for row in invalid_sorted.to_dict(orient="records")
         ],
     )
 

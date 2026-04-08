@@ -537,6 +537,46 @@ def annual_pooled_ic_from_manifest(manifest_path: Path, out_csv: Path, out_png: 
     return out
 
 
+def annual_pooled_pearson_ic_from_manifest(manifest_path: Path, out_csv: Path, out_png: Path) -> pd.DataFrame:
+    """Compute annual pooled Pearson IC from a manifest without exact rank-IC sorting."""
+    # Stream once and update one Pearson accumulator per calendar year.
+    reader = PredictionChunkReader(Path(manifest_path))
+    by_year: dict[int, OnlinePearsonAccumulator] = {}
+    for chunk in reader.iter_prediction_chunks(["date", "prediction", "target"]):
+        # Update yearly Pearson accumulators for this chunk.
+        dates = chunk["date"].to_numpy(dtype=np.int64, copy=False)
+        years = dates // 10000
+        pred = chunk["prediction"].to_numpy(dtype=np.float64, copy=False)
+        tgt = chunk["target"].to_numpy(dtype=np.float64, copy=False)
+        for year in np.unique(years):
+            if int(year) not in by_year:
+                by_year[int(year)] = OnlinePearsonAccumulator()
+            mask = years == int(year)
+            by_year[int(year)].update(pred[mask], tgt[mask])
+
+    # Materialize a compact annual Pearson table and persist it as CSV.
+    rows: list[dict[str, object]] = []
+    for year in sorted(by_year.keys()):
+        acc = by_year[int(year)]
+        rows.append({"year": int(year), "pearson_ic": float(acc.finalize()), "count": int(acc.count())})
+    out = pd.DataFrame(rows).sort_values("year", kind="stable").reset_index(drop=True)
+    out.to_csv(Path(out_csv), index=False)
+
+    # Plot the yearly Pearson IC curve with a zero reference line.
+    fig = plt.figure(figsize=(10, 4))
+    ax = fig.add_subplot(1, 1, 1)
+    ax.plot(out["year"].to_numpy(dtype=int), out["pearson_ic"].to_numpy(dtype=float), marker="o", linewidth=1.8, label="Pearson IC")
+    ax.axhline(0.0, color="#999999", linewidth=1.0)
+    ax.set_title("Annual pooled IC")
+    ax.set_xlabel("year")
+    ax.set_ylabel("pooled IC")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(Path(out_png), dpi=160)
+    plt.close(fig)
+    return out
+
+
 def _write_average_ranks_from_year_value_sorted(value_sorted_path: Path, out_rank_path: Path) -> None:
     """Assign per-year average ranks to a (year,value,row_id)-sorted TSV and write (row_id,year,rank)."""
     # Walk the sorted stream, reset at year boundaries, accumulate per-year tie groups, and emit ranks.
@@ -1075,8 +1115,8 @@ def rolling_group_ic_from_manifest(manifest_path: Path, config: EvalConfig, labe
 
 
 @dataclass(frozen=True)
-class PredictReportArtifacts:
-    """Bundle the predict-side streaming report outputs computed from a manifest."""
+class TestEvaluationReportArtifacts:
+    """Bundle the test-evaluation streaming report outputs computed from a manifest."""
 
     pooled: dict[str, float]
     ic_summary: dict[str, object]
@@ -1104,41 +1144,41 @@ class PredictReportArtifacts:
     price_yaml: Path
 
 
-def compute_predict_report_from_manifest(manifest_path: Path, eval_cfg: EvalConfig, out_root: Path) -> PredictReportArtifacts:
-    """Compute the predict-side report artifacts by streaming parquet chunks from a manifest."""
+def compute_test_evaluation_report_from_manifest(manifest_path: Path, eval_cfg: EvalConfig, out_root: Path) -> TestEvaluationReportArtifacts:
+    """Compute the test-evaluation report artifacts by streaming parquet chunks from a manifest."""
     # Resolve all output paths under the report root to keep pipeline wiring minimal.
     out_root = Path(out_root)
-    ic_summary_yaml = Path(out_root) / "predict_ic_time_series_summary.yaml"
+    ic_summary_yaml = Path(out_root) / "test_ic_time_series_summary.yaml"
     annual_csv = Path(out_root) / "annual_ic.csv"
     annual_png = Path(out_root) / "annual_ic.png"
-    intraday_csv = Path(out_root) / "predict_intraday_ic.csv"
-    intraday_png = Path(out_root) / "predict_intraday_ic.png"
-    rank_png = Path(out_root) / "predict_pred_vs_target_rank.png"
-    turnover_csv = Path(out_root) / "predict_prediction_rank_turnover.csv"
-    turnover_png = Path(out_root) / "predict_prediction_rank_turnover.png"
-    turnover_yaml = Path(out_root) / "predict_prediction_rank_turnover.yaml"
-    residual_yaml = Path(out_root) / "predict_residual_diagnostics.yaml"
-    residual_png = Path(out_root) / "predict_residual_diagnostics.png"
-    vol_csv = Path(out_root) / "predict_vol_rolling_ic.csv"
-    vol_png = Path(out_root) / "predict_vol_rolling_ic.png"
-    vol_yaml = Path(out_root) / "predict_vol_rolling_ic.yaml"
-    price_csv = Path(out_root) / "predict_price_rolling_ic.csv"
-    price_png = Path(out_root) / "predict_price_rolling_ic.png"
-    price_yaml = Path(out_root) / "predict_price_rolling_ic.yaml"
+    intraday_csv = Path(out_root) / "test_intraday_ic.csv"
+    intraday_png = Path(out_root) / "test_intraday_ic.png"
+    rank_png = Path(out_root) / "test_pred_vs_target_rank.png"
+    turnover_csv = Path(out_root) / "test_prediction_rank_turnover.csv"
+    turnover_png = Path(out_root) / "test_prediction_rank_turnover.png"
+    turnover_yaml = Path(out_root) / "test_prediction_rank_turnover.yaml"
+    residual_yaml = Path(out_root) / "test_residual_diagnostics.yaml"
+    residual_png = Path(out_root) / "test_residual_diagnostics.png"
+    vol_csv = Path(out_root) / "test_vol_rolling_ic.csv"
+    vol_png = Path(out_root) / "test_vol_rolling_ic.png"
+    vol_yaml = Path(out_root) / "test_vol_rolling_ic.yaml"
+    price_csv = Path(out_root) / "test_price_rolling_ic.csv"
+    price_png = Path(out_root) / "test_price_rolling_ic.png"
+    price_yaml = Path(out_root) / "test_price_rolling_ic.yaml"
 
-    # Compute pooled Pearson IC using an online accumulator over parquet chunks.
-    pooled = pooled_ic_from_manifest(Path(manifest_path))
+    # Compute pooled Pearson IC using a streaming accumulator.
+    pooled = pooled_pearson_ic_from_manifest(Path(manifest_path))
 
-    # Compute timestamp-level IC summaries by streaming full (date,time) groups.
-    ic_summary = ic_time_series_summary_from_manifest(Path(manifest_path), Path(ic_summary_yaml))
+    # Compute timestamp-level Pearson IC summaries by streaming full (date,time) groups.
+    ic_summary = pearson_ic_time_series_summary_from_manifest(Path(manifest_path), Path(ic_summary_yaml))
 
     # Compute annual pooled Pearson IC by streaming and bucketing rows by year.
-    annual_tbl = annual_pooled_ic_from_manifest(Path(manifest_path), Path(annual_csv), Path(annual_png))
+    annual_tbl = annual_pooled_pearson_ic_from_manifest(Path(manifest_path), Path(annual_csv), Path(annual_png))
 
     # Compute intraday IC curve by streaming timestamp groups and aggregating by minute-of-day.
     intraday_time_series_ic_from_manifest(Path(manifest_path), Path(intraday_csv), Path(intraday_png))
 
-    # Compute predict-side diagnostics that depend on per-timestamp ranks or residuals.
+    # Compute test-side diagnostics that depend on per-timestamp ranks or residuals.
     score_ret_rank_plot_from_manifest(Path(manifest_path), Path(rank_png))
     _turnover_tbl, turnover_summary = prediction_rank_turnover_from_manifest(Path(manifest_path), Path(turnover_csv), Path(turnover_png), Path(turnover_yaml))
     residual_summary = residual_diagnostics_from_manifest(Path(manifest_path), Path(residual_yaml), Path(residual_png))
@@ -1148,7 +1188,7 @@ def compute_predict_report_from_manifest(manifest_path: Path, eval_cfg: EvalConf
     price_curve = rolling_group_ic_from_manifest(Path(manifest_path), eval_cfg, "price_label", Path(price_csv), Path(price_png), Path(price_yaml))
 
     # Return a compact artifact bundle so the pipeline can render report.html without extra IO.
-    return PredictReportArtifacts(
+    return TestEvaluationReportArtifacts(
         pooled=dict(pooled),
         ic_summary=dict(ic_summary),
         ic_summary_yaml=Path(ic_summary_yaml),

@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import yaml
 from torch.utils.tensorboard import SummaryWriter
 
 from qmodel.components.amp_scaler import MyScaler
@@ -73,6 +74,52 @@ class CpuEvaluator:
         self._pending_metrics_path: Path | None = None
         self._pending_metrics_it: int | None = None
         self._pending_metrics_namespace: str | None = None
+        self._label_transform = self._load_label_transform()
+        self._label_mean, self._label_std = self._load_label_zscore_params()
+
+    def _load_label_transform(self) -> dict[str, object]:
+        """Load the persisted label-transform contract from the sibling meta.yaml."""
+        # Resolve the data-prep metadata path relative to the qmodel run directory.
+        meta_path = Path(self.config.root_dir).parent / "artifacts" / "npz" / "meta.yaml"
+        meta = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
+        return dict(meta.get("label_transform", {"type": "none"}))
+
+    def _load_label_zscore_params(self) -> tuple[float, float]:
+        """Load scalar label zscore parameters when label normalization is enabled."""
+        # Return identity parameters when label zscore is disabled.
+        if str(self._label_transform["type"]) != "pooled_zscore":
+            return 0.0, 1.0
+
+        # Read the persisted mean/std pair from the data-clean artifact.
+        stats_path = Path(self.config.root_dir).parent / "artifacts" / "data_clean" / str(self._label_transform["params_path"])
+        stats = yaml.safe_load(stats_path.read_text(encoding="utf-8"))
+        return float(stats["label"]["mean"]), float(stats["label"]["std"])
+
+    def _inverse_label_arrays(self, prediction: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Inverse-transform prediction and target arrays back to raw label scale."""
+        # Return arrays unchanged when label zscore is disabled.
+        if str(self._label_transform["type"]) != "pooled_zscore":
+            return prediction, target
+
+        # Map both arrays back to raw scale using the cached scalar mean/std.
+        mean = np.float32(self._label_mean)
+        std = np.float32(self._label_std)
+        pred_raw = prediction.astype(np.float32, copy=False) * std + mean
+        target_raw = target.astype(np.float32, copy=False) * std + mean
+        return pred_raw.astype(np.float32, copy=False), target_raw.astype(np.float32, copy=False)
+
+    def _inverse_label_tensors(self, prediction: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inverse-transform prediction and target tensors back to raw label scale."""
+        # Return tensors unchanged when label zscore is disabled.
+        if str(self._label_transform["type"]) != "pooled_zscore":
+            return prediction, target
+
+        # Map both tensors back to raw scale using the cached scalar mean/std.
+        mean = torch.as_tensor(float(self._label_mean), dtype=prediction.dtype, device=prediction.device)
+        std = torch.as_tensor(float(self._label_std), dtype=prediction.dtype, device=prediction.device)
+        pred_raw = prediction * std + mean
+        target_raw = target.to(dtype=prediction.dtype) * std + mean
+        return pred_raw, target_raw
 
     def close(self) -> None:
         """Close an owned TensorBoard writer if needed."""
@@ -137,6 +184,10 @@ class CpuEvaluator:
                 "time": meta[:, 2] if meta.shape[1] >= 3 else np.zeros((meta.shape[0],), dtype=np.int64),
             }
         )
+        res_df["prediction"], res_df["target"] = self._inverse_label_arrays(
+            res_df["prediction"].to_numpy(dtype=np.float32, copy=False),
+            res_df["target"].to_numpy(dtype=np.float32, copy=False),
+        )
 
         # Add convenience columns used by downstream analysis.
         res_df["StockCode"] = res_df["code"].astype(int)
@@ -176,7 +227,8 @@ class CpuEvaluator:
                 # Run forward pass and stream the CPU outputs into parquet buffers.
                 data, target, meta = batch
                 out = model(data.to(device))
-                writer.append(out.detach().cpu(), target.detach().cpu(), meta.detach().cpu())
+                pred_raw, target_raw = self._inverse_label_tensors(out.detach().cpu(), target.detach().cpu())
+                writer.append(pred_raw, target_raw, meta.detach().cpu())
 
         # Close the writer and return the manifest path for downstream report code.
         manifest_path = writer.close()

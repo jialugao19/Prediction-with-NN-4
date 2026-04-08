@@ -21,7 +21,7 @@ from prediction_nn2.dataset import NpzDatasetSpec, Stock1mNpzDataset
 from prediction_nn2.clean_report import render_clean_report_from_meta
 from prediction_nn2.eval_ic import (
     EvalConfig,
-    compute_predict_report_from_manifest,
+    compute_test_evaluation_report_from_manifest,
     intraday_time_series_ic_train_test_from_manifest,
     pearson_ic_time_series_summary_from_manifest,
     pooled_pearson_ic_from_manifest,
@@ -51,8 +51,15 @@ class PipelineConfig:
     horizon_minutes: int
     sample_stocks_per_minute: int
     use_cross_sectional_gaussianize: bool
+    data_prep_use_ret_signed_log1p: bool
+    data_prep_use_heavy_tanh: bool
+    data_prep_heavy_tanh_c: float
+    data_prep_add_is_zero_features: bool
+    data_prep_include_session_id: bool
     data_prep_include_predict_split: bool
     data_prep_norm_fit_scope: str
+    data_prep_label_norm: str
+    data_prep_label_norm_fit_scope: str
     data_prep_days_per_call: int
     data_prep_workers: int
     batch_size: int
@@ -72,12 +79,15 @@ class PipelineConfig:
 
 
 def _redirect_to_data_cache(path: Path) -> Path:
-    """Redirect any non-/data-cache path into /data-cache to reduce container disk pressure."""
-    # Preserve the original path shape under /data-cache to keep runs easy to locate.
+    """Redirect output paths into /data-cache/nn to reduce container disk pressure."""
+    # Preserve the original relative path shape under /data-cache/nn so runs are easy to locate.
     p = Path(path)
-    if p.is_absolute() and str(p).startswith("/data-cache/"):
+    if p.is_absolute() and str(p).startswith("/data-cache/nn/"):
         return p
-    return Path("/data-cache") / p.as_posix().lstrip("/")
+    rel = p.as_posix().lstrip("/")
+    if rel.startswith("outputs/"):
+        rel = rel[len("outputs/") :]
+    return Path("/data-cache/nn") / rel
 
 
 def _effective_sample_stocks_per_minute(cfg: PipelineConfig) -> int:
@@ -262,6 +272,22 @@ def _load_stage_manifest(path: Path) -> dict[str, object]:
     import yaml
 
     return dict(yaml.safe_load(Path(path).read_text(encoding="utf-8")))
+
+
+def _load_data_contract_from_meta(meta_path: Path) -> dict[str, object]:
+    """Load the preprocessing contract that should invalidate downstream stages."""
+    # Parse meta.yaml and keep only fields that change training/evaluation semantics.
+    import yaml
+
+    meta = yaml.safe_load(Path(meta_path).read_text(encoding="utf-8"))
+    return {
+        "prep_config": dict(meta["prep_config"]),
+        "feature_transform": dict(meta["feature_transform"]),
+        "label": dict(meta["label"]),
+        "label_transform": dict(meta.get("label_transform", {"type": "none"})),
+        "sampling": dict(meta["sampling"]),
+        "dates": dict(meta["dates"]),
+    }
 
 
 def _write_stage_manifest(path: Path, payload: dict[str, object]) -> None:
@@ -471,8 +497,15 @@ def _prepare_split_inputs(
         horizon_minutes=int(cfg.horizon_minutes),
         sample_stocks_per_minute=int(_effective_sample_stocks_per_minute(cfg)),
         use_cross_sectional_gaussianize=bool(cfg.use_cross_sectional_gaussianize),
+        use_ret_signed_log1p=bool(cfg.data_prep_use_ret_signed_log1p),
+        use_heavy_tanh=bool(cfg.data_prep_use_heavy_tanh),
+        heavy_tanh_c=float(cfg.data_prep_heavy_tanh_c),
+        add_is_zero_features=bool(cfg.data_prep_add_is_zero_features),
+        include_session_id=bool(cfg.data_prep_include_session_id),
         include_predict_split=bool(cfg.data_prep_include_predict_split),
         norm_fit_scope=str(cfg.data_prep_norm_fit_scope),
+        label_norm=str(cfg.data_prep_label_norm),
+        label_norm_fit_scope=str(cfg.data_prep_label_norm_fit_scope),
         days_per_call=int(cfg.data_prep_days_per_call),
         workers=int(cfg.data_prep_workers),
     )
@@ -509,12 +542,12 @@ def _load_existing_train_eval_dir(qconf: SimpleNamespace, best_it: int) -> Path:
     return train_eval_iter_dir
 
 
-def _load_existing_predict_manifest(qconf: SimpleNamespace, best_it: int) -> Path:
-    """Load the existing predict manifest for the selected checkpoint."""
-    # Resolve the expected predict manifest path and require it to exist.
-    manifest_path = Path(qconf.root_dir) / "eval" / f"iter_{int(best_it)}" / "predict_manifest.yaml"
-    if not manifest_path.exists():
-        raise RuntimeError(f"Missing existing predict manifest: {manifest_path}")
+def _load_existing_test_evaluation_manifest(qconf: SimpleNamespace, best_it: int) -> Path:
+    """Load the existing test-evaluation manifest for the selected checkpoint."""
+    # Resolve the expected streamed test manifest path and require it to exist.
+    manifest_path = Path(qconf.root_dir) / "eval_test" / f"iter_{int(best_it)}" / "predict_manifest.yaml"
+    if not Path(manifest_path).exists():
+        raise RuntimeError(f"Missing existing test-evaluation manifest: {manifest_path}")
     return manifest_path
 
 
@@ -767,6 +800,7 @@ def _render_train_report_html(
     ]
     clean_rows = [
         ("stock_norm", f"{str(meta['feature_transform']['stock_norm']['type'])} / scope={str(meta['feature_transform']['stock_norm'].get('scope', 'n/a'))}"),
+        ("label_norm", f"{str(meta.get('label_transform', {'type': 'none'})['type'])} / scope={str(meta.get('label_transform', {'scope': 'n/a'}).get('scope', 'n/a'))}"),
         ("feature_dim", str(int(len(prep["feature_names"])))),
         ("invalid_report_html", (stats_dir / "invalid_feature_report.html").as_posix()),
         ("feature_moments_csv", (stats_dir / "feature_moments.csv").as_posix()),
@@ -799,6 +833,8 @@ def _render_train_report_html(
         ("best_val_mse", f"{float(val_mse):.6e}"),
         ("best_val_ic", f"{float(val_ic):.6f}"),
         ("best_val_rank_ic", f"{float(val_rank_ic):.6f}"),
+        ("train_loss_space", "normalized_label" if str(meta.get("label_transform", {"type": "none"})["type"]) == "pooled_zscore" else "raw_label"),
+        ("eval_metric_space", "raw_forward_log_return"),
         ("train_loss_png", loss_png.as_posix()),
     ]
     ic_rows = [
@@ -941,6 +977,8 @@ def run_data_clean_stage(
         "use_cross_sectional_gaussianize": bool(cfg.use_cross_sectional_gaussianize),
         "include_predict_split": bool(cfg.data_prep_include_predict_split),
         "norm_fit_scope": str(cfg.data_prep_norm_fit_scope),
+        "label_norm": str(cfg.data_prep_label_norm),
+        "label_norm_fit_scope": str(cfg.data_prep_label_norm_fit_scope),
         "days_per_call": int(cfg.data_prep_days_per_call),
         "workers": int(cfg.data_prep_workers),
         "horizon_minutes": int(cfg.horizon_minutes),
@@ -983,16 +1021,19 @@ def run_data_clean_stage(
 def run_clean_report_stage(cfg: PipelineConfig, *, out_root: Path) -> Path:
     """Render the clean report from existing data-clean artifacts."""
     # Build a stage fingerprint so report rebuild can skip when config stays unchanged.
+    meta_path = Path(out_root) / "artifacts" / "npz" / "meta.yaml"
     stage_cfg = {
         "stage": "clean_report",
         "use_cross_sectional_gaussianize": bool(cfg.use_cross_sectional_gaussianize),
         "norm_fit_scope": str(cfg.data_prep_norm_fit_scope),
+        "label_norm": str(cfg.data_prep_label_norm),
+        "label_norm_fit_scope": str(cfg.data_prep_label_norm_fit_scope),
+        "data_contract": _load_data_contract_from_meta(meta_path),
     }
     manifest_path = _stage_manifest_path(Path(out_root), "clean_report")
     fp = _stage_fingerprint(stage_cfg)
 
     # Skip the stage when the manifest and report path already match.
-    meta_path = Path(out_root) / "artifacts" / "npz" / "meta.yaml"
     report_path = Path(out_root) / "artifacts" / "data_clean" / "report.html"
     if manifest_path.exists() and report_path.exists():
         m = _load_stage_manifest(manifest_path)
@@ -1021,6 +1062,7 @@ def run_train_stage(
 ) -> tuple[SimpleNamespace, int, dict[int, dict[str, float]]]:
     """Run NN training (skip if complete) and return (qconf, best_it, val_metrics_by_it)."""
     # Build a stage fingerprint so training can skip cleanly across repeated invocations.
+    meta_path = Path(out_root) / "artifacts" / "npz" / "meta.yaml"
     stage_cfg = {
         "stage": "train",
         "seed": int(cfg.seed),
@@ -1033,6 +1075,7 @@ def run_train_stage(
         "input_window_size": int(cfg.input_window_size),
         "feature_dim": int(feature_dim),
         "train_contract": _train_stage_contract(cfg, int(feature_dim)),
+        "data_contract": _load_data_contract_from_meta(meta_path),
     }
     manifest_path = _stage_manifest_path(Path(out_root), "train")
     fp = _stage_fingerprint(stage_cfg)
@@ -1040,57 +1083,77 @@ def run_train_stage(
     # Always build qmodel config so checkpoint paths resolve consistently.
     qconf = _build_qmodel_config(cfg, feature_dim=int(feature_dim), run_root=Path(out_root))
     final_iter = int(cfg.num_iters) - 1
+    required_last_ckpt = (int(final_iter) // int(cfg.save_every)) * int(cfg.save_every)
 
-    # Skip training when the final checkpoint already exists and the stage manifest matches.
+    # Skip training when the last required checkpoint already exists and the stage manifest matches.
     ckpt_iters_before = _list_checkpoint_iters(Path(out_root))
     last_ckpt = int(max(ckpt_iters_before)) if len(ckpt_iters_before) else -1
-    if manifest_path.exists() and int(last_ckpt) >= int(final_iter):
+    if manifest_path.exists() and int(last_ckpt) >= int(required_last_ckpt):
         m = _load_stage_manifest(manifest_path)
         if str(m.get("fingerprint")) == str(fp):
             best_it = int(m["best_it"])
             val_metrics_by_it = _load_val_metrics_from_disk(Path(out_root), _list_checkpoint_iters(Path(out_root)))[1]
             return qconf, int(best_it), dict(val_metrics_by_it)
 
-    # Advance training chunk-by-chunk until the final checkpoint is materialized.
-    if int(last_ckpt) >= int(final_iter):
-        print(f"[pipeline] train skip already_complete last_ckpt={last_ckpt} final_iter={final_iter}", flush=True)
-    while int(last_ckpt) < int(final_iter):
-        # Decide the next target iteration as the next save boundary, capped at the final iteration.
-        step = int(cfg.save_every)
-        next_target = int(min(int(final_iter), int(last_ckpt + step) if int(last_ckpt) >= 0 else int(step)))
-        chunk_save_every = int(cfg.save_every)
-        if int(next_target) == int(final_iter) and int(final_iter) % int(cfg.save_every) != 0:
-            chunk_save_every = int(max(int(final_iter), 1))
-        qconf.num_iters = int(next_target + 1)
-        qconf.save_every = int(chunk_save_every)
-        qconf.load_from_iter = -1 if int(last_ckpt) >= 0 else None
+    # Skip training when enough checkpoints exist but a prior run did not write the train manifest.
+    if (not manifest_path.exists()) and int(last_ckpt) >= int(required_last_ckpt):
         print(
-            f"[pipeline] train chunk start last_ckpt={last_ckpt} target_iter={next_target} "
-            f"save_every={int(chunk_save_every)} batch_size={int(cfg.batch_size)}",
+            f"[pipeline] train skip: last_ckpt={last_ckpt} required_last_ckpt={required_last_ckpt} final_iter={final_iter}",
             flush=True,
         )
+        ckpt_iters = _list_checkpoint_iters(Path(out_root))
+        best_it, val_metrics_by_it = _select_best_checkpoint_by_val(Path(out_root), qconf, ckpt_iters)
+        _write_stage_manifest(
+            manifest_path,
+            {
+                "stage": "train",
+                "fingerprint": str(fp),
+                "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "final_iter": int(final_iter),
+                "best_it": int(best_it),
+            },
+        )
+        return qconf, int(best_it), dict(val_metrics_by_it)
 
-        # Run one trainer chunk on the selected device.
-        if torch.device(qconf.device).type == "cuda":
-            from qmodel.core.trainer import Trainer
+    # Run training in a single continuous trainer session.
+    # Checkpoints are still saved at cfg.save_every, but we avoid chunk restarts to keep GPU utilization stable.
+    qconf.num_iters = int(cfg.num_iters)
+    qconf.save_every = int(cfg.save_every)
+    qconf.load_from_iter = -1 if int(last_ckpt) >= 0 else None
+    print(
+        f"[pipeline] train start last_ckpt={last_ckpt} required_last_ckpt={required_last_ckpt} final_iter={final_iter} "
+        f"save_every={int(cfg.save_every)} batch_size={int(cfg.batch_size)}",
+        flush=True,
+    )
 
-            trainer = Trainer(qconf)
-            trainer.train()
-        else:
-            from qmodel.core.cpu_trainer import CpuTrainer
+    # Configure the CUDA allocator to reduce fragmentation when the env var is not already set.
+    import os
 
-            trainer = CpuTrainer(qconf)
-            trainer.train()
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-        # Release trainer state between chunks to keep CUDA memory pressure stable.
-        del trainer
-        if torch.device(qconf.device).type == "cuda":
-            torch.cuda.empty_cache()
+    # Run one trainer session on the selected device.
+    if torch.device(qconf.device).type == "cuda":
+        from qmodel.core.trainer import Trainer
 
-        # Refresh checkpoint progress and continue until the final iteration is saved.
-        ckpt_iters_after = _list_checkpoint_iters(Path(out_root))
-        last_ckpt = int(max(ckpt_iters_after)) if len(ckpt_iters_after) else -1
-        print(f"[pipeline] train chunk done last_ckpt={last_ckpt} final_iter={final_iter}", flush=True)
+        trainer = Trainer(qconf)
+        trainer.train()
+    else:
+        from qmodel.core.cpu_trainer import CpuTrainer
+
+        trainer = CpuTrainer(qconf)
+        trainer.train()
+
+    ckpt_iters_after = _list_checkpoint_iters(Path(out_root))
+    last_ckpt = int(max(ckpt_iters_after)) if len(ckpt_iters_after) else -1
+    if int(last_ckpt) < int(required_last_ckpt):
+        raise RuntimeError(
+            f"Training finished but last required checkpoint is missing: last_ckpt={last_ckpt} "
+            f"required_last_ckpt={required_last_ckpt} final_iter={final_iter}"
+        )
+    print(
+        f"[pipeline] train done last_ckpt={last_ckpt} required_last_ckpt={required_last_ckpt} final_iter={final_iter}",
+        flush=True,
+    )
 
     # Evaluate validation metrics for all checkpoints and pick the best one.
     ckpt_iters = _list_checkpoint_iters(Path(out_root))
@@ -1121,7 +1184,11 @@ def run_train_report_stage(
 ) -> Path:
     """Build the train report and return its HTML path."""
     # Build a stage fingerprint so report rebuild can skip when inputs are unchanged.
-    stage_cfg = {"stage": "train_report", "best_it": int(best_it)}
+    stage_cfg = {
+        "stage": "train_report",
+        "best_it": int(best_it),
+        "data_contract": _load_data_contract_from_meta(Path(prep["meta_path"])),
+    }
     manifest_path = _stage_manifest_path(Path(out_root), "train_report")
     fp = _stage_fingerprint(stage_cfg)
     report_path = Path(out_root) / "train_report.html"
@@ -1150,76 +1217,72 @@ def run_train_report_stage(
     return report_path
 
 
-def run_predict_eval_stage(cfg: PipelineConfig, *, out_root: Path, qconf: SimpleNamespace, best_it: int, require_existing_eval: bool) -> Path:
-    """Run predict evaluator (or reuse existing) and return the predict manifest path."""
-    # Build a stage fingerprint so predict evaluator can be rerun deterministically.
-    stage_cfg = {"stage": "predict_eval", "best_it": int(best_it)}
-    manifest_path = _stage_manifest_path(Path(out_root), "predict_eval")
+def run_test_evaluation_stage(cfg: PipelineConfig, *, out_root: Path, qconf: SimpleNamespace, best_it: int, require_existing_eval: bool) -> Path:
+    """Run test-evaluation inference (or reuse existing) and return the manifest path."""
+    # Build a stage fingerprint so test evaluation can be rerun deterministically.
+    stage_cfg = {
+        "stage": "test_evaluation",
+        "best_it": int(best_it),
+        "data_contract": _load_data_contract_from_meta(Path(out_root) / "artifacts" / "npz" / "meta.yaml"),
+    }
+    manifest_path = _stage_manifest_path(Path(out_root), "test_evaluation")
     fp = _stage_fingerprint(stage_cfg)
 
-    # Resolve the expected predict manifest output path.
-    predict_manifest_path = Path(qconf.root_dir) / "eval" / f"iter_{int(best_it)}" / "predict_manifest.yaml"
-    if manifest_path.exists() and predict_manifest_path.exists():
+    # Resolve the expected test manifest output path.
+    test_manifest_path = Path(qconf.root_dir) / "eval_test" / f"iter_{int(best_it)}" / "predict_manifest.yaml"
+    if manifest_path.exists() and Path(test_manifest_path).exists():
         m = _load_stage_manifest(manifest_path)
         if str(m.get("fingerprint")) == str(fp):
-            return predict_manifest_path
+            return test_manifest_path
 
-    # Require an existing manifest for report-only modes.
+    # Reuse an existing test manifest for report-only modes.
     if bool(require_existing_eval):
-        return _load_existing_predict_manifest(qconf, int(best_it))
-
-    # Run the predict evaluator to produce the manifest and chunk artifacts.
-    if torch.device(qconf.device).type == "cuda":
-        from qmodel.core.evaluator import Evaluator
-
-        predictor = Evaluator(qconf, group="predict", writer=None, enable_logging=False)
-        predictor.eval_single(int(best_it), n_iter=0, namespace="predict")
-        predictor.close()
+        test_manifest_path = _load_existing_test_evaluation_manifest(qconf, int(best_it))
     else:
-        from qmodel.core.cpu_evaluator import CpuEvaluator
+        test_manifest_path = Path(test_manifest_path)
 
-        predictor = CpuEvaluator(qconf, group="predict", writer=None, enable_logging=False)
-        predictor.eval_single(int(best_it), n_iter=0, namespace="predict")
-        predictor.close()
+    # Reuse or rebuild the streamed test manifest under eval_test.
+    if not Path(test_manifest_path).exists():
+        test_manifest_path = _run_eval_manifest_once(qconf, "test", int(best_it), "eval_test")
     _write_stage_manifest(
         manifest_path,
         {
-            "stage": "predict_eval",
+            "stage": "test_evaluation",
             "fingerprint": str(fp),
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "predict_manifest_path": str(predict_manifest_path.as_posix()),
+            "test_manifest_path": str(Path(test_manifest_path).as_posix()),
         },
     )
-    return predict_manifest_path
+    return test_manifest_path
 
 
-def run_predict_report_from_manifest(manifest_path: Path, cfg: PipelineConfig, out_root: Path) -> Path:
-    """Compute predict report artifacts from an existing predict manifest."""
-    # Compute the predict report in a dedicated folder so heavy artifacts stay isolated.
+def run_test_evaluation_report_from_manifest(manifest_path: Path, cfg: PipelineConfig, out_root: Path) -> Path:
+    """Compute test-evaluation report artifacts from an existing test manifest."""
+    # Compute the test-evaluation report in a dedicated folder so heavy artifacts stay isolated.
     out_root = Path(out_root)
     manifest_path = Path(manifest_path)
-    report_dir = Path(out_root) / "predict_report"
+    report_dir = Path(out_root) / "test_evaluation_report"
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build evaluator config and compute the full predict report from the manifest.
+    # Build evaluator config and compute the full test-evaluation report from the manifest.
     eval_cfg = EvalConfig(
         stock1m_dir=Path(cfg.stock1m_dir),
         window_size=int(cfg.rolling_window),
         step_size=int(cfg.rolling_step),
         horizon_minutes=int(cfg.horizon_minutes),
     )
-    artifacts = compute_predict_report_from_manifest(Path(manifest_path), eval_cfg, Path(report_dir))
+    artifacts = compute_test_evaluation_report_from_manifest(Path(manifest_path), eval_cfg, Path(report_dir))
 
     # Render one self-contained HTML wrapper around the produced artifacts.
-    html_path = Path(out_root) / "predict_report.html"
-    html = _render_predict_report_html(cfg, manifest_path, artifacts, report_dir)
+    html_path = Path(out_root) / "test_evaluation_report.html"
+    html = _render_test_evaluation_report_html(cfg, manifest_path, artifacts, report_dir)
     html_path.write_text(html, encoding="utf-8")
     return html_path
 
 
-def _render_predict_report_html(cfg: PipelineConfig, manifest_path: Path, artifacts, report_dir: Path) -> str:
-    """Render the predict-report self-contained HTML content."""
-    # Summarize the heavy predict diagnostics into stacked scalar sections.
+def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path, artifacts, report_dir: Path) -> str:
+    """Render the test-evaluation self-contained HTML content."""
+    # Summarize the heavy test diagnostics into stacked scalar sections.
     import yaml
 
     now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1236,12 +1299,11 @@ def _render_predict_report_html(cfg: PipelineConfig, manifest_path: Path, artifa
 
     # Build the table used for annual pooled IC review.
     annual_table = render_table(
-        ["year", "pearson_ic", "rank_ic", "count"],
+        ["year", "pearson_ic", "count"],
         [
             [
                 str(int(row["year"])),
                 f"{float(row['pearson_ic']):.6f}",
-                f"{float(row['rank_ic']):.6f}" if np.isfinite(float(row["rank_ic"])) else "nan",
                 str(int(row["count"])),
             ]
             for row in annual_tbl.to_dict(orient="records")
@@ -1251,14 +1313,13 @@ def _render_predict_report_html(cfg: PipelineConfig, manifest_path: Path, artifa
     # Assemble the final self-contained single-column HTML report.
     sections = [
         render_section(
-            "Predict Overview",
+            "Test Evaluation Overview",
             render_value_rows(
                 [
                     ("generated_at", now),
-                    ("predict_manifest", Path(manifest_path).as_posix()),
+                    ("test_manifest", Path(manifest_path).as_posix()),
                     ("report_dir", Path(report_dir).as_posix()),
                     ("pooled_pearson_ic", f"{float(pooled['pearson_ic']):.6f}"),
-                    ("pooled_rank_ic", f"{float(pooled['rank_ic']):.6f}"),
                     ("count", str(int(pooled["count"]))),
                 ]
             ),
@@ -1270,7 +1331,6 @@ def _render_predict_report_html(cfg: PipelineConfig, manifest_path: Path, artifa
                 [
                     ("ic_summary_yaml", Path(artifacts.ic_summary_yaml).as_posix()),
                     ("pearson_t_stat", f"{float(ic_summary['pearson_ic']['t_stat']):.4f}"),
-                    ("rank_t_stat", f"{float(ic_summary['rank_ic']['t_stat']):.4f}"),
                     ("timestamp_count", str(int(ic_summary["timestamp_count"]))),
                 ]
             )
@@ -1280,53 +1340,59 @@ def _render_predict_report_html(cfg: PipelineConfig, manifest_path: Path, artifa
             f"Annual IC ({year_range})",
             render_value_rows([("annual_csv", Path(artifacts.annual_csv).as_posix())])
             + annual_table
-            + render_embedded_figure("Annual IC", Path(artifacts.annual_png), "Annual pooled IC curve from the predict manifest."),
+            + render_embedded_figure("Annual IC", Path(artifacts.annual_png), "Annual pooled IC curve from the test manifest."),
         ),
         render_section(
             "Intraday IC",
             render_value_rows([("intraday_csv", Path(artifacts.intraday_csv).as_posix())])
-            + render_embedded_figure("Predict Intraday IC", Path(artifacts.intraday_png), "Predict-side intraday IC curve."),
+            + render_embedded_figure("Test Intraday IC", Path(artifacts.intraday_png), "Test-side intraday IC curve."),
         ),
         render_section(
             "Volatility Rolling IC",
             render_value_rows([("volatility_csv", Path(artifacts.vol_csv).as_posix()), ("volatility_yaml", Path(artifacts.vol_yaml).as_posix())])
-            + render_embedded_figure("Predict Volatility Rolling IC", Path(artifacts.vol_png), "Rolling IC grouped by volatility label.")
+            + render_embedded_figure("Test Volatility Rolling IC", Path(artifacts.vol_png), "Rolling IC grouped by volatility label.")
             + render_yaml_block(yaml.safe_load(Path(artifacts.vol_yaml).read_text(encoding="utf-8"))),
         ),
         render_section(
             "Price Rolling IC",
             render_value_rows([("price_csv", Path(artifacts.price_csv).as_posix()), ("price_yaml", Path(artifacts.price_yaml).as_posix())])
-            + render_embedded_figure("Predict Price Rolling IC", Path(artifacts.price_png), "Rolling IC grouped by price label.")
+            + render_embedded_figure("Test Price Rolling IC", Path(artifacts.price_png), "Rolling IC grouped by price label.")
             + render_yaml_block(yaml.safe_load(Path(artifacts.price_yaml).read_text(encoding="utf-8"))),
         ),
         render_section(
             "Rank Diagnostics",
             render_value_rows([("rank_png", Path(artifacts.rank_png).as_posix())])
-            + render_embedded_figure("Predict Rank Diagnostics", Path(artifacts.rank_png), "Prediction rank versus target rank diagnostics."),
+            + render_embedded_figure("Test Rank Diagnostics", Path(artifacts.rank_png), "Prediction rank versus target rank diagnostics."),
         ),
         render_section(
             "Turnover",
             render_value_rows([("turnover_csv", Path(artifacts.turnover_csv).as_posix()), ("turnover_yaml", Path(artifacts.turnover_yaml).as_posix())])
-            + render_embedded_figure("Predict Turnover", Path(artifacts.turnover_png), "Adjacent-timestamp prediction rank turnover.")
+            + render_embedded_figure("Test Turnover", Path(artifacts.turnover_png), "Adjacent-timestamp prediction rank turnover.")
             + render_yaml_block(turnover_summary),
         ),
         render_section(
             "Residual Diagnostics",
             render_value_rows([("residual_yaml", Path(artifacts.residual_yaml).as_posix())])
-            + render_embedded_figure("Predict Residual Diagnostics", Path(artifacts.residual_png), "Residual histogram and scatter diagnostics.")
+            + render_embedded_figure("Test Residual Diagnostics", Path(artifacts.residual_png), "Residual histogram and scatter diagnostics.")
             + render_yaml_block(residual_summary),
         ),
     ]
-    return build_page("Predict Report", "Self-contained HTML report generated from the predict manifest.", sections)
+    return build_page("Test Evaluation Report", "Self-contained HTML report generated from the test manifest.", sections)
 
 
-def run_predict_report_stage(cfg: PipelineConfig, *, out_root: Path, predict_manifest_path: Path) -> Path:
-    """Build the predict report from an existing predict manifest and return its path."""
+def run_test_evaluation_report_stage(cfg: PipelineConfig, *, out_root: Path, test_manifest_path: Path) -> Path:
+    """Build the test-evaluation report from an existing test manifest and return its path."""
     # Build a stage fingerprint so report rebuild can skip when manifest stays the same.
-    stage_cfg = {"stage": "predict_report", "manifest": str(Path(predict_manifest_path).as_posix())}
-    manifest_path = _stage_manifest_path(Path(out_root), "predict_report")
+    manifest_stat = Path(test_manifest_path).stat()
+    stage_cfg = {
+        "stage": "test_evaluation_report",
+        "manifest": str(Path(test_manifest_path).as_posix()),
+        "manifest_size_bytes": int(manifest_stat.st_size),
+        "manifest_mtime_ns": int(manifest_stat.st_mtime_ns),
+    }
+    manifest_path = _stage_manifest_path(Path(out_root), "test_evaluation_report")
     fp = _stage_fingerprint(stage_cfg)
-    report_html = Path(out_root) / "predict_report.html"
+    report_html = Path(out_root) / "test_evaluation_report.html"
 
     # Skip the stage when the manifest and report already match.
     if manifest_path.exists() and report_html.exists():
@@ -1334,11 +1400,11 @@ def run_predict_report_stage(cfg: PipelineConfig, *, out_root: Path, predict_man
         if str(m.get("fingerprint")) == str(fp):
             return report_html
 
-    # Compute predict report purely from the predict manifest.
-    out_path = run_predict_report_from_manifest(Path(predict_manifest_path), cfg, Path(out_root))
+    # Compute test-evaluation report purely from the test manifest.
+    out_path = run_test_evaluation_report_from_manifest(Path(test_manifest_path), cfg, Path(out_root))
     _write_stage_manifest(
         manifest_path,
-        {"stage": "predict_report", "fingerprint": str(fp), "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "report_path": str(out_path.as_posix())},
+        {"stage": "test_evaluation_report", "fingerprint": str(fp), "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "report_path": str(out_path.as_posix())},
     )
     return out_path
 
@@ -1393,8 +1459,8 @@ def _run_single_split_staged(cfg: PipelineConfig, *, out_root: Path, start_trade
         )
         return
 
-    if mode == "predict_full":
-        # Run the full heavy pipeline including predict evaluator and predict report.
+    if mode == "test_full":
+        # Run the full heavy pipeline including test evaluation and the final test report.
         prep, prep_elapsed = run_data_clean_stage(
             cfg,
             out_root=out_root,
@@ -1416,316 +1482,22 @@ def _run_single_split_staged(cfg: PipelineConfig, *, out_root: Path, start_trade
             val_metrics_by_it=dict(val_metrics_by_it),
             require_existing_eval=False,
         )
-        predict_manifest_path = run_predict_eval_stage(cfg, out_root=out_root, qconf=qconf, best_it=int(best_it), require_existing_eval=False)
-        run_predict_report_stage(cfg, out_root=out_root, predict_manifest_path=predict_manifest_path)
+        test_manifest_path = run_test_evaluation_stage(cfg, out_root=out_root, qconf=qconf, best_it=int(best_it), require_existing_eval=False)
+        run_test_evaluation_report_stage(cfg, out_root=out_root, test_manifest_path=test_manifest_path)
         return
 
-    if mode == "predict_report_only":
-        # Rebuild predict report from an existing manifest without rerunning training or data clean.
+    if mode == "test_report_only":
+        # Rebuild the test-evaluation report from an existing manifest without rerunning training or data clean.
         meta_path = Path(out_root) / "artifacts" / "npz" / "meta.yaml"
         prep = _load_prep_summary_from_meta(meta_path)
         qconf = _build_qmodel_config(cfg, feature_dim=len(prep["feature_names"]), run_root=Path(out_root))
         ckpt_iters = _list_checkpoint_iters(Path(out_root))
         best_it, _val_metrics_by_it = _load_val_metrics_from_disk(Path(out_root), ckpt_iters)
-        predict_manifest_path = run_predict_eval_stage(cfg, out_root=out_root, qconf=qconf, best_it=int(best_it), require_existing_eval=True)
-        run_predict_report_stage(cfg, out_root=out_root, predict_manifest_path=predict_manifest_path)
+        test_manifest_path = run_test_evaluation_stage(cfg, out_root=out_root, qconf=qconf, best_it=int(best_it), require_existing_eval=True)
+        run_test_evaluation_report_stage(cfg, out_root=out_root, test_manifest_path=test_manifest_path)
         return
 
     raise RuntimeError(f"Unknown pipeline_mode: {mode}")
-
-
-def _render_report(
-    cfg: PipelineConfig,
-    prep: dict[str, object],
-    pooled: dict[str, float],
-    test_ic_summary: dict[str, object],
-    test_ic_summary_yaml: Path,
-    best_it: int,
-    val_metrics_by_it: dict[int, dict[str, float]],
-    intraday_csv: Path,
-    vol_csv: Path,
-    price_csv: Path,
-    intraday_png: Path,
-    vol_png: Path,
-    price_png: Path,
-    rank_png: Path,
-    loss_png: Path,
-    vol_agg,
-    price_agg,
-    predict_pooled: dict[str, float],
-    annual_tbl,
-    annual_csv: Path,
-    annual_png: Path,
-    predict_ic_summary: dict[str, object],
-    predict_ic_summary_yaml: Path,
-    predict_intraday_csv: Path,
-    predict_intraday_png: Path,
-    predict_vol_csv: Path,
-    predict_vol_png: Path,
-    predict_price_csv: Path,
-    predict_price_png: Path,
-    turnover_csv: Path,
-    turnover_png: Path,
-    turnover_yaml: Path,
-    residual_yaml: Path,
-    residual_png: Path,
-    turnover_summary: dict[str, object],
-    residual_summary: dict[str, object],
-    perf: dict[str, object],
-) -> str:
-    """Render the final combined report content."""
-    # Build a compact report body with conclusion-driven summaries.
-    now = time.strftime("%Y-%m-%d %H:%M:%S")
-    best_metrics = dict(val_metrics_by_it[int(best_it)])
-    val_mse = float(best_metrics["val/objective/mse"])
-    val_ic = float(best_metrics["val/quality/global_ic"])
-    val_rank_ic = float(best_metrics["val/quality/rank_ic"])
-    approx_epoch = _approx_epoch(int(best_it), int(prep["train_rows"]), int(cfg.batch_size))
-    pooled_lines = (
-        f"- Pearson IC: {pooled['pearson_ic']:.6f}\n"
-        f"- Rank IC (Spearman): {pooled['rank_ic']:.6f}\n"
-        f"- Count: {int(pooled['count'])}"
-    )
-    test_ic_lines = (
-        f"- Pearson IC t-stat: {float(test_ic_summary['pearson_ic']['t_stat']):.4f}\n"
-        f"- Pearson IC>0 占比: {float(test_ic_summary['pearson_ic']['positive_ratio']):.2%}\n"
-        f"- Rank IC t-stat: {float(test_ic_summary['rank_ic']['t_stat']):.4f}\n"
-        f"- Rank IC>0 占比: {float(test_ic_summary['rank_ic']['positive_ratio']):.2%}\n"
-        f"- Timestamp Count: {int(test_ic_summary['timestamp_count'])}"
-    )
-    predict_lines = (
-        f"- Pearson IC: {predict_pooled['pearson_ic']:.6f}\n"
-        f"- Rank IC (Spearman): {predict_pooled['rank_ic']:.6f}\n"
-        f"- Count: {int(predict_pooled['count'])}"
-    )
-    predict_ic_lines = (
-        f"- Pearson IC t-stat: {float(predict_ic_summary['pearson_ic']['t_stat']):.4f}\n"
-        f"- Pearson IC>0 占比: {float(predict_ic_summary['pearson_ic']['positive_ratio']):.2%}\n"
-        f"- Rank IC t-stat: {float(predict_ic_summary['rank_ic']['t_stat']):.4f}\n"
-        f"- Rank IC>0 占比: {float(predict_ic_summary['rank_ic']['positive_ratio']):.2%}\n"
-        f"- Timestamp Count: {int(predict_ic_summary['timestamp_count'])}"
-    )
-    split_meta_path = Path(prep["meta_path"])
-    import yaml
-
-    split_meta = yaml.safe_load(split_meta_path.read_text(encoding="utf-8"))
-    audit = dict(split_meta["audit"])
-    audit_rates = dict(split_meta["audit_rates"])
-    dates = dict(split_meta["dates"])
-    invalid_values = dict(split_meta["invalid_values"])
-    data_clean_feature_moments_path = split_meta_path.parent.parent / "data_clean" / "feature_moments.csv"
-    data_clean_report_rel = Path("artifacts") / "data_clean" / "report.html"
-    data_clean_feature_moments_rel = Path("artifacts") / "data_clean" / "feature_moments.csv"
-    data_clean_pooled_png_rel = Path("artifacts") / "data_clean" / "pooled_feature_grid.png"
-    tb_dir = split_meta_path.parent.parent.parent / "run" / "tb"
-    invalid_stats_path = split_meta_path.parent.parent / str(invalid_values["stats_path"])
-    invalid_report_path = split_meta_path.parent.parent / str(invalid_values["report_path"])
-    invalid_tbl = pd.read_csv(invalid_stats_path)
-    moment_tbl = pd.read_csv(data_clean_feature_moments_path)
-
-    def _range_str(xs: list[int]) -> str:
-        # Format a compact inclusive date range string.
-        if len(xs) == 0:
-            return "[]"
-        return f"[{int(xs[0])}, {int(xs[-1])}] ({len(xs)} days)"
-
-    def _missing_str(a: dict[str, object], r: dict[str, object]) -> str:
-        # Convert raw/kept/sampled counters into simple missing rates.
-        raw = int(a["raw_rows"])
-        kept = int(a["kept_rows"])
-        sampled = int(a["sampled_rows"])
-        feat_drop = 1.0 - float(r["kept_rate"])
-        samp_drop = 1.0 - float(r["sampled_rate_vs_kept"])
-        return f"raw={raw}, kept={kept} (drop={feat_drop:.2%}), sampled={sampled} (drop={samp_drop:.2%})"
-
-    def _invalid_row_str(row: dict[str, object]) -> str:
-        # Format one invalid-stat row into a compact report line.
-        return (
-            f"{str(row['field'])} ({str(row['field_type'])}): "
-            f"nan_ratio={float(row['nan_ratio']):.4%}, "
-            f"inf_ratio={float(row['inf_ratio']):.4%}, "
-            f"invalid_ratio={float(row['invalid_ratio']):.4%}, "
-            f"skew={float(row['skew_finite']):.4f}, "
-            f"kurtosis={float(row['kurtosis_finite']):.4f}"
-        )
-
-    # Summarize group curve inflections for volatility and price buckets.
-    vol_desc = "Empty curve (n < window_size)."
-    if hasattr(vol_agg, "shape") and int(vol_agg.shape[0]) > 0:
-        vol_desc = _describe_group_inflection(
-            vol_agg["mean_ic"].to_numpy(dtype=float),
-            vol_agg["group_center_rank"].to_numpy(dtype=float),
-        )
-    price_desc = "Empty curve (n < window_size)."
-    if hasattr(price_agg, "shape") and int(price_agg.shape[0]) > 0:
-        price_desc = _describe_group_inflection(
-            price_agg["mean_ic"].to_numpy(dtype=float),
-            price_agg["group_center_rank"].to_numpy(dtype=float),
-        )
-
-    # Extract the first and last available annual IC rows for a regime comparison summary.
-    annual_idx = annual_tbl.set_index("year")
-    annual_years = annual_tbl["year"].astype(int).tolist()
-    first_year = int(annual_years[0])
-    last_year = int(annual_years[-1])
-    first_year_ic = float(annual_idx.loc[int(first_year), "pearson_ic"])
-    last_year_ic = float(annual_idx.loc[int(last_year), "pearson_ic"])
-    first_year_rank_ic = float(annual_idx.loc[int(first_year), "rank_ic"])
-    last_year_rank_ic = float(annual_idx.loc[int(last_year), "rank_ic"])
-    predict_year_range = f"{int(first_year)}-{int(last_year)}" if int(first_year) != int(last_year) else f"{int(first_year)}"
-
-    # Summarize the most important invalid-value rows for the data-clean section.
-    invalid_top = invalid_tbl.sort_values(["invalid_ratio", "field"], ascending=[False, True], kind="stable").reset_index(drop=True)
-    invalid_lines = "\n".join([f"- {_invalid_row_str(row)}" for row in invalid_top.head(5).to_dict(orient="records")])
-
-    # Summarize the post-clean pooled distribution rows with the largest residual tails.
-    moment_top = moment_tbl.sort_values(["kurtosis", "feature"], ascending=[False, True], key=lambda s: s.abs() if s.name == "kurtosis" else s, kind="stable").reset_index(drop=True)
-    moment_lines = "\n".join(
-        [
-            f"- {str(row['feature'])}: mean={float(row['mean']):.4f}, std={float(row['std']):.4f}, "
-            f"skew={float(row['skew']):.4f}, kurtosis={float(row['kurtosis']):.4f}"
-            for row in moment_top.head(5).to_dict(orient="records")
-        ]
-    )
-
-    # Summarize the predict prediction-rank turnover in one compact paragraph.
-    turnover_lines = (
-        f"- Mean turnover: {float(turnover_summary['mean_rank_turnover']):.6f}\n"
-        f"- Mean rank corr: {float(turnover_summary['mean_rank_corr']):.6f}\n"
-        f"- Positive rank corr 占比: {float(turnover_summary['positive_rank_corr_ratio']):.2%}\n"
-        f"- Lowest turnover time: {int(turnover_summary['lowest_turnover_time'])}, value={float(turnover_summary['lowest_turnover_value']):.6f}\n"
-        f"- Highest turnover time: {int(turnover_summary['highest_turnover_time'])}, value={float(turnover_summary['highest_turnover_value']):.6f}"
-    )
-
-    # Summarize the predict residual distribution in one compact paragraph.
-    residual_lines = (
-        f"- Residual mean: {float(residual_summary['residual_mean']):.6e}\n"
-        f"- Residual std: {float(residual_summary['residual_std']):.6e}\n"
-        f"- Residual skew/kurtosis: {float(residual_summary['residual_skew']):.4f} / {float(residual_summary['residual_kurtosis']):.4f}\n"
-        f"- MAE / RMSE: {float(residual_summary['mae']):.6e} / {float(residual_summary['rmse']):.6e}\n"
-        f"- Corr(prediction, residual): {float(residual_summary['corr_prediction_residual']):.6f}"
-    )
-
-    # Render a structured report body matching the required sections.
-    md = f"""# 神经网络预测与多维度 IC 评估报告
-
-生成时间: {now}
-
-## 结论摘要 (Conclusion)
-
-- 最佳 Checkpoint: iter={best_it} (approx_epoch={approx_epoch:.2f}), Val MSE={val_mse:.6e}, Val IC={val_ic:.6f}, Val RankIC={val_rank_ic:.6f}.
-- Test Pooled IC: Pearson={pooled['pearson_ic']:.6f}, RankIC={pooled['rank_ic']:.6f}, Count={int(pooled['count'])}.
-- Predict Pooled IC ({predict_year_range} 全周期): Pearson={predict_pooled['pearson_ic']:.6f}, RankIC={predict_pooled['rank_ic']:.6f}, Count={int(predict_pooled['count'])}.
-- Annual IC 对比: {first_year} Pearson={first_year_ic:.6f}, RankIC={first_year_rank_ic:.6f}; {last_year} Pearson={last_year_ic:.6f}, RankIC={last_year_rank_ic:.6f}.
-- Volatility 分组拐点: {vol_desc}.
-- Price 分组拐点: {price_desc}.
-
-## 数据集元数据 (Dataset Metadata)
-
-- Split 配置文件: `{split_meta_path.as_posix()}`
-- 日期范围: train={_range_str(list(dates['train']))}, val={_range_str(list(dates['val']))}, test={_range_str(list(dates['test']))}, predict={_range_str(list(dates['predict']))}.
-- 样本量: train={int(prep['train_rows'])}, val={int(prep['val_rows'])}, test={int(prep['test_rows'])}, predict={int(prep['predict_rows'])}.
-- 缺失/采样审计: train={_missing_str(dict(audit['train']), dict(audit_rates['train']))}, val={_missing_str(dict(audit['val']), dict(audit_rates['val']))}, test={_missing_str(dict(audit['test']), dict(audit_rates['test']))}, predict={_missing_str(dict(audit['predict']), dict(audit_rates['predict']))}.
-
-## Data Clean Invalid Audit
-
-- Invalid 数值表: `{invalid_stats_path.as_posix()}`
-- Invalid 报告: `{invalid_report_path.as_posix()}`
-{invalid_lines}
-
-## Data Clean Pooled Distribution
-
-- Data clean 报告: `{data_clean_report_rel.as_posix()}`
-- Feature moments: `{data_clean_feature_moments_rel.as_posix()}`
-- Pooled 分布图: `{data_clean_pooled_png_rel.as_posix()}`
-{moment_lines}
-
-![]({data_clean_pooled_png_rel.as_posix()})
-
-## 模型与训练协议 (Experiment Protocol)
-
-- 训练设备: `{str(perf['train']['device'])}`, DataLoader `pin_memory={bool(perf['train']['pin_memory'])}`, `num_workers={int(perf['train']['num_workers'])}`.
-- 模型结构: `MLP`, hidden layers 使用 `ReLU(inplace=True)`, 输出层为线性回归头, 不额外添加 activation.
-- Optimizer: `AdamW`, base learning rate=`{float(cfg.learning_rate):.6g}`.
-- LR Scheduler: 已启用, `use_lr_sched="custom"`, 采用 `Linear Warmup + Cosine Annealing`; `warmup_iters=200`, `start_factor=0.001`, `end_factor=1.0`, `finish_decay_iter={int(cfg.num_iters)}`, `eta_min=1e-6`.
-- Checkpoint 选择: 仅使用 Validation (`val/objective/mse`) 选取最佳 iter, Test 仅做一次性最终评估.
-- TensorBoard: `{tb_dir.as_posix()}` (loss 标量: `train/objective/loss`).
-
-## 模型性能 (Model Performance)
-
-- 最佳 Checkpoint: iter={best_it}, approx_epoch={approx_epoch:.2f}.
-- Val: MSE={val_mse:.6e}, IC={val_ic:.6f}, RankIC={val_rank_ic:.6f}.
-- Test Pooled:\n{pooled_lines}
-- Test IC 时序诊断:\n{test_ic_lines}
-- Predict Pooled:\n{predict_lines}
-- Predict IC 时序诊断:\n{predict_ic_lines}
-
-## 分组结论 (Group Findings)
-
-- Volatility rolling IC: {vol_desc}.
-- Price rolling IC: {price_desc}.
-
-## 诊断补充 (Diagnostics)
-
-- Test IC 时序摘要: `{test_ic_summary_yaml.as_posix()}`
-- Predict IC 时序摘要: `{predict_ic_summary_yaml.as_posix()}`
-- Prediction rank turnover 数值表: `{turnover_csv.as_posix()}`
-- Prediction rank turnover 摘要: `{turnover_yaml.as_posix()}`
-- Residual diagnostics 摘要: `{residual_yaml.as_posix()}`
-{turnover_lines}
-{residual_lines}
-
-### 公式补充
-
-- IC t-stat: `mean(IC_t) / (std(IC_t) / sqrt(T))`
-- IC>0 占比: `mean(1[IC_t > 0])`
-- 排序换手: `1 - corr(rank_t, rank_t-1)`
-- 残差: `residual = target - prediction`
-
-### 图表补充
-
-#### Prediction Rank Turnover
-
-![]({turnover_png.name})
-
-#### Residual Diagnostics
-
-![]({residual_png.name})
-
-## 性能审计 (Performance Audit)
-
-- data_prep_seconds={float(perf['data_prep']['elapsed_seconds']):.4f}, test_attach_labels_seconds={float(perf['eval']['attach_labels_seconds']):.4f}, test_rolling_ic_seconds={float(perf['eval']['rolling_ic_seconds']):.4f}.
-- predict_row_count={int(perf['eval']['predict_row_count'])}, predict_chunk_count={int(perf['eval']['predict_chunk_count'])}, predict_stream_write_seconds={float(perf['eval']['predict_stream_write_seconds']):.4f}, predict_stream_report_seconds={float(perf['eval']['predict_stream_report_seconds']):.4f}.
-
-## 文件输出 (Artifacts)
-
-- `{intraday_csv.as_posix()}`
-- `{vol_csv.as_posix()}`
-- `{price_csv.as_posix()}`
-- `{annual_csv.as_posix()}`
-
-### 四张核心图表
-
-1. Intraday IC Curve: `{intraday_png.as_posix()}`
-2. Volatility Rolling IC: `{vol_png.as_posix()}`
-3. Price Rolling IC: `{price_png.as_posix()}`
-4. Predict 预测收益率 vs 实际收益率 Rank 曲线: `{rank_png.as_posix()}`
-
-### 核心图表预览
-
-#### Prediction Rank Curve
-
-![]({rank_png.name})
-
-### 训练与长周期诊断
-
-1. Train Loss Curve: `{loss_png.as_posix()}`
-2. Annual Pooled IC: `{annual_png.as_posix()}`
-3. Predict Intraday IC: `{predict_intraday_png.as_posix()}`
-4. Predict Volatility Rolling IC: `{predict_vol_png.as_posix()}`
-5. Predict Price Rolling IC: `{predict_price_png.as_posix()}`
-"""
-    return md
 
 
 def _default_config() -> PipelineConfig:
@@ -1748,8 +1520,15 @@ def _default_config() -> PipelineConfig:
         horizon_minutes=10,
         sample_stocks_per_minute=800,
         use_cross_sectional_gaussianize=False,
+        data_prep_use_ret_signed_log1p=True,
+        data_prep_use_heavy_tanh=True,
+        data_prep_heavy_tanh_c=3.0,
+        data_prep_add_is_zero_features=False,
+        data_prep_include_session_id=False,
         data_prep_include_predict_split=False,
         data_prep_norm_fit_scope="train_only",
+        data_prep_label_norm="pooled_zscore",
+        data_prep_label_norm_fit_scope="train_only",
         data_prep_days_per_call=100,
         data_prep_workers=32,
         batch_size=4096,
@@ -1796,8 +1575,15 @@ def _run_pipeline_with_split_runner(cfg: PipelineConfig, split_runner) -> None:
         horizon_minutes=int(cfg.horizon_minutes),
         sample_stocks_per_minute=int(_effective_sample_stocks_per_minute(cfg)),
         use_cross_sectional_gaussianize=bool(cfg.use_cross_sectional_gaussianize),
+        use_ret_signed_log1p=bool(cfg.data_prep_use_ret_signed_log1p),
+        use_heavy_tanh=bool(cfg.data_prep_use_heavy_tanh),
+        heavy_tanh_c=float(cfg.data_prep_heavy_tanh_c),
+        add_is_zero_features=bool(cfg.data_prep_add_is_zero_features),
+        include_session_id=bool(cfg.data_prep_include_session_id),
         include_predict_split=False,
         norm_fit_scope="train_only",
+        label_norm=str(cfg.data_prep_label_norm),
+        label_norm_fit_scope=str(cfg.data_prep_label_norm_fit_scope),
         days_per_call=100,
         workers=32,
     )
@@ -1902,12 +1688,12 @@ def run_train_report_postprocess_only(cfg: PipelineConfig) -> None:
     _run_pipeline_with_split_runner(replace(cfg, pipeline_mode="train_report_only"), _run_single_split_staged)
 
 
-def run_predict_report_postprocess_only(cfg: PipelineConfig) -> None:
-    """Rebuild predict_report.html from an existing predict manifest without rerunning training."""
-    # Force pipeline_mode to the predict-report-only mode and dispatch through the staged runner.
+def run_test_evaluation_report_postprocess_only(cfg: PipelineConfig) -> None:
+    """Rebuild test_evaluation_report.html from an existing test manifest without rerunning training."""
+    # Force pipeline_mode to the test-report-only mode and dispatch through the staged runner.
     from dataclasses import replace
 
-    _run_pipeline_with_split_runner(replace(cfg, pipeline_mode="predict_report_only"), _run_single_split_staged)
+    _run_pipeline_with_split_runner(replace(cfg, pipeline_mode="test_report_only"), _run_single_split_staged)
 
 
 if __name__ == "__main__":
