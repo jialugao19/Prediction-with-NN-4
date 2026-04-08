@@ -6,6 +6,7 @@ import multiprocessing as mp
 import numpy as np
 import pandas as pd
 from pathlib import Path
+import yaml
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -87,6 +88,52 @@ class Evaluator:
 
         # Initialize NVML reader once so per-checkpoint reads are cheap.
         self._nvml = NvmlReader(self.config.device)
+        self._label_transform = self._load_label_transform()
+        self._label_mean, self._label_std = self._load_label_zscore_params()
+
+    def _load_label_transform(self) -> dict[str, object]:
+        """Load the persisted label-transform contract from the sibling meta.yaml."""
+        # Resolve the data-prep metadata path relative to the qmodel run directory.
+        meta_path = Path(self.config.root_dir).parent / "artifacts" / "npz" / "meta.yaml"
+        meta = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
+        return dict(meta.get("label_transform", {"type": "none"}))
+
+    def _load_label_zscore_params(self) -> tuple[float, float]:
+        """Load scalar label zscore parameters when label normalization is enabled."""
+        # Return identity parameters when label zscore is disabled.
+        if str(self._label_transform["type"]) != "pooled_zscore":
+            return 0.0, 1.0
+
+        # Read the persisted mean/std pair from the data-clean artifact.
+        stats_path = Path(self.config.root_dir).parent / "artifacts" / "data_clean" / str(self._label_transform["params_path"])
+        stats = yaml.safe_load(stats_path.read_text(encoding="utf-8"))
+        return float(stats["label"]["mean"]), float(stats["label"]["std"])
+
+    def _inverse_label_arrays(self, prediction: np.ndarray, target: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Inverse-transform prediction and target arrays back to raw label scale."""
+        # Return arrays unchanged when label zscore is disabled.
+        if str(self._label_transform["type"]) != "pooled_zscore":
+            return prediction, target
+
+        # Load scalar zscore parameters once and map both arrays back to raw scale.
+        mean = np.float32(self._label_mean)
+        std = np.float32(self._label_std)
+        pred_raw = prediction.astype(np.float32, copy=False) * std + mean
+        target_raw = target.astype(np.float32, copy=False) * std + mean
+        return pred_raw.astype(np.float32, copy=False), target_raw.astype(np.float32, copy=False)
+
+    def _inverse_label_tensors(self, prediction: torch.Tensor, target: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Inverse-transform prediction and target tensors back to raw label scale."""
+        # Return tensors unchanged when label zscore is disabled.
+        if str(self._label_transform["type"]) != "pooled_zscore":
+            return prediction, target
+
+        # Load scalar zscore parameters once and map both tensors back to raw scale.
+        mean = torch.as_tensor(float(self._label_mean), dtype=prediction.dtype, device=prediction.device)
+        std = torch.as_tensor(float(self._label_std), dtype=prediction.dtype, device=prediction.device)
+        pred_raw = prediction * std + mean
+        target_raw = target.to(dtype=prediction.dtype) * std + mean
+        return pred_raw, target_raw
 
     def close(self) -> None:
         """Close owned TensorBoard writer if needed."""
@@ -175,6 +222,8 @@ class Evaluator:
             for k in range(arr.shape[1]):
                 res3[cols[col_idx]] = arr[:, k]
                 col_idx += 1
+        if "prediction" in res3 and "target" in res3:
+            res3["prediction"], res3["target"] = self._inverse_label_arrays(res3["prediction"], res3["target"])
         res_df = pd.DataFrame(res3)
         logger.info("finish building dataframe")
 
@@ -240,7 +289,11 @@ class Evaluator:
             def _post_step(self, res, buffer, target, other_meta, curr_it):
                 """Write one batch into parquet chunk buffers."""
                 # Append the batch into the streaming writer immediately.
-                self._writer.append(buffer, target, other_meta)
+                pred_raw, target_raw = self_outer._inverse_label_tensors(buffer, target)
+                self._writer.append(pred_raw, target_raw, other_meta)
+
+        # Capture the outer evaluator so the nested inferencer can reuse label inverse-transform logic.
+        self_outer = self
 
         inferencer = _PredictInferencer(
             model=model,

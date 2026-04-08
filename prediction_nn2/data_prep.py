@@ -22,18 +22,23 @@ from prediction_nn2.html_report import build_page, render_section, render_table,
 _STOCK_FEATURES = [
     "ret_1m",
     "ret_5m",
-    "ret_30m",
-    "ret_60m",
+    "ret_2m",
+    "ret_3m",
+    "ret_10m",
     "hl",
     "oc",
     "log_vol",
     "log_amount",
-    "vol_30m",
-    "vol_60m",
-    "log_vol_30m_mean",
-    "log_amount_30m_mean",
+    "vol_10m",
+    "log_vol_5m_mean",
+    "log_amount_5m_mean",
 ]
-_TIME_FEATURES = ["minute_norm", "session_id", "session_minute_norm"]
+_TIME_FEATURES = ["minute_norm", "session_minute_norm"]
+
+_RET_FEATURES = ["ret_1m", "ret_2m", "ret_3m", "ret_5m", "ret_10m"]
+_HEAVY_TAIL_FEATURES = ["hl", "oc", "vol_10m"]
+_IS_ZERO_SOURCE_FEATURES: list[str] = []
+_FEATURE_WARMUP_MINUTES = 10
 
 
 @dataclass(frozen=True)
@@ -51,8 +56,15 @@ class DataPrepConfig:
     horizon_minutes: int
     sample_stocks_per_minute: int
     use_cross_sectional_gaussianize: bool
+    use_ret_signed_log1p: bool
+    use_heavy_tanh: bool
+    heavy_tanh_c: float
+    add_is_zero_features: bool
+    include_session_id: bool
     include_predict_split: bool
     norm_fit_scope: str
+    label_norm: str
+    label_norm_fit_scope: str
     days_per_call: int
     workers: int
 
@@ -106,7 +118,14 @@ def _prep_config_contract(config: DataPrepConfig) -> dict[str, object]:
         "horizon_minutes": int(config.horizon_minutes),
         "sample_stocks_per_minute": int(config.sample_stocks_per_minute),
         "use_cross_sectional_gaussianize": bool(config.use_cross_sectional_gaussianize),
+        "use_ret_signed_log1p": bool(config.use_ret_signed_log1p),
+        "use_heavy_tanh": bool(config.use_heavy_tanh),
+        "heavy_tanh_c": float(config.heavy_tanh_c),
+        "add_is_zero_features": bool(config.add_is_zero_features),
+        "include_session_id": bool(config.include_session_id),
         "norm_fit_scope": str(config.norm_fit_scope),
+        "label_norm": str(config.label_norm),
+        "label_norm_fit_scope": str(config.label_norm_fit_scope),
     }
 
 
@@ -123,8 +142,16 @@ def _read_stock1m_day(trade_date: int, config: DataPrepConfig) -> pd.DataFrame:
     return df
 
 
-def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[pd.DataFrame, list[dict[str, object]]]:
+def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[pd.DataFrame, list[dict[str, object]], dict[str, object]]:
     """Compute non-rank feature transforms and a forward return label."""
+    # Precompute raw forward-minute availability to audit label invalid sources.
+    h = int(config.horizon_minutes)
+    raw_keys = ["StockCode", "Date", "MinuteIndex"]
+    raw_fwd = df.loc[:, raw_keys].copy()
+    raw_fwd["MinuteIndex"] = raw_fwd["MinuteIndex"].to_numpy(dtype=int) - int(h)
+    raw_fwd["raw_has_fwd_minute"] = 1
+    raw_fwd = raw_fwd.drop_duplicates(list(raw_keys), keep="first").reset_index(drop=True)
+
     # Drop invalid price rows so log/ratio transforms are well-defined.
     df = df.copy()
     close = df["Close"].to_numpy(dtype=float)
@@ -146,8 +173,9 @@ def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[p
     g = df.groupby("StockCode", sort=False)
     df["ret_1m"] = g["log_close"].diff(1)
     df["ret_5m"] = g["log_close"].diff(5)
-    df["ret_30m"] = g["log_close"].diff(30)
-    df["ret_60m"] = g["log_close"].diff(60)
+    df["ret_2m"] = g["log_close"].diff(2)
+    df["ret_3m"] = g["log_close"].diff(3)
+    df["ret_10m"] = g["log_close"].diff(10)
 
     # Compute price-shape and activity features without rank transforms.
     df["hl"] = np.log(df["High"].to_numpy(dtype=float) / df["Low"].to_numpy(dtype=float))
@@ -155,41 +183,75 @@ def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[p
     df["log_vol"] = np.log(df["Vol"].to_numpy(dtype=float) + 1.0)
     df["log_amount"] = np.log(df["Amount"].to_numpy(dtype=float) + 1.0)
     df["minute_norm"] = df["MinuteIndex"].to_numpy(dtype=float) / 240.0
-    df["session_id"] = (df["MinuteIndex"].to_numpy(dtype=int) >= 120).astype(float)
     df["session_minute_norm"] = (df["MinuteIndex"].to_numpy(dtype=int) % 120).astype(float) / 120.0
 
     # Compute longer-window volatility and activity summaries per stock.
-    df["vol_30m"] = g["ret_1m"].rolling(window=30, min_periods=2).std(ddof=0).reset_index(level=0, drop=True)
-    df["vol_60m"] = g["ret_1m"].rolling(window=60, min_periods=2).std(ddof=0).reset_index(level=0, drop=True)
-    df["log_vol_30m_mean"] = g["log_vol"].rolling(window=30, min_periods=1).mean().reset_index(level=0, drop=True)
-    df["log_amount_30m_mean"] = g["log_amount"].rolling(window=30, min_periods=1).mean().reset_index(level=0, drop=True)
+    # Compute sub-10-minute volatility and activity summaries per stock.
+    df["vol_10m"] = g["ret_1m"].rolling(window=10, min_periods=2).std(ddof=0).reset_index(level=0, drop=True)
+    df["log_vol_5m_mean"] = g["log_vol"].rolling(window=5, min_periods=1).mean().reset_index(level=0, drop=True)
+    df["log_amount_5m_mean"] = g["log_amount"].rolling(window=5, min_periods=1).mean().reset_index(level=0, drop=True)
 
-    # Compute forward log return as the supervised label.
-    h = int(config.horizon_minutes)
-    df["label_ret"] = g["log_close"].shift(-h) - df["log_close"]
+    # Optionally attach the session_id feature, which is removed by default per spec.
+    if bool(config.include_session_id):
+        df["session_id"] = (df["MinuteIndex"].to_numpy(dtype=int) >= 120).astype(float)
+
+    # Apply monotonic heavy-tail transforms so NN training is numerically stable.
+    if bool(config.use_ret_signed_log1p):
+        # Compress return tails with a signed log1p map while preserving order and sign.
+        for name in list(_RET_FEATURES):
+            v = df[str(name)].to_numpy(dtype=float, copy=False)
+            df[str(name)] = (np.sign(v) * np.log1p(np.abs(v))).astype(np.float32, copy=False)
+    if bool(config.use_heavy_tanh):
+        # Squash heavy-tail price-shape/vol features with tanh(x/c) and a fixed positive c.
+        c = float(config.heavy_tanh_c)
+        for name in list(_HEAVY_TAIL_FEATURES):
+            v = df[str(name)].to_numpy(dtype=float, copy=False)
+            df[str(name)] = np.tanh(v / c).astype(np.float32, copy=False)
+
+    # Optionally add mass-at-zero indicator features without zscore participation.
+    is_zero_cols: list[str] = []
+    if bool(config.add_is_zero_features):
+        # Create one binary is_zero feature per configured source column.
+        for src in list(_IS_ZERO_SOURCE_FEATURES):
+            out_name = f"{str(src)}_is_zero"
+            is_zero_cols.append(str(out_name))
+            df[str(out_name)] = (df[str(src)].to_numpy(dtype=float, copy=False) == 0.0).astype(np.float32, copy=False)
+
+    # Align forward log_close by joining on (StockCode, Date, MinuteIndex+h) to avoid shift jumps on missing minutes.
+    keys = ["StockCode", "Date", "MinuteIndex"]
+    fwd = df.loc[:, keys + ["log_close"]].copy()
+    fwd["MinuteIndex"] = fwd["MinuteIndex"].to_numpy(dtype=int) - int(h)
+    fwd = fwd.rename(columns={"log_close": "log_close_fwd"})
+    df = df.merge(fwd, on=list(keys), how="left", sort=False, validate="m:1")
+    df["label_ret"] = df["log_close_fwd"] - df["log_close"]
+
+    # Drop the last horizon window minutes explicitly so downstream invalid ratios reflect real data gaps.
+    pre_drop_rows = int(df.shape[0])
+    df = df.loc[df["MinuteIndex"].to_numpy(dtype=int) <= int(239 - h)].reset_index(drop=True)
+    dropped_last_h_rows = int(pre_drop_rows - int(df.shape[0]))
 
     # Prepare the ordered feature/label columns for invalid-value accounting.
-    feat_cols = [
-        "ret_1m",
-        "ret_5m",
-        "ret_30m",
-        "ret_60m",
-        "hl",
-        "oc",
-        "log_vol",
-        "log_amount",
-        "vol_30m",
-        "vol_60m",
-        "log_vol_30m_mean",
-        "log_amount_30m_mean",
-        "minute_norm",
-        "session_id",
-        "session_minute_norm",
-    ]
+    feat_cols = list(_STOCK_FEATURES) + list(is_zero_cols) + list(_TIME_FEATURES)
+    if bool(config.include_session_id):
+        feat_cols = list(_STOCK_FEATURES) + list(is_zero_cols) + ["minute_norm", "session_id", "session_minute_norm"]
 
     # Summarize NaN/inf statistics before dropping invalid rows.
     need = feat_cols + ["label_ret"]
     invalid_feature_stats = _collect_invalid_feature_stats(df, feat_cols, "label_ret")
+
+    # Audit label invalid decomposition after horizon dropping to separate missing minutes from price filtering.
+    label_invalid_mask = ~np.isfinite(df["label_ret"].to_numpy(dtype=float, copy=False))
+    missing_fwd_mask = df["log_close_fwd"].isna().to_numpy(dtype=bool, copy=False)
+    raw_has_fwd_mask = (
+        df.loc[:, raw_keys]
+        .merge(raw_fwd, on=list(raw_keys), how="left", sort=False)["raw_has_fwd_minute"]
+        .fillna(0)
+        .to_numpy(dtype=np.int8, copy=False)
+        == 1
+    )
+    raw_missing_mask = missing_fwd_mask & ~raw_has_fwd_mask
+    filtered_missing_mask = missing_fwd_mask & raw_has_fwd_mask
+    other_invalid_mask = label_invalid_mask & ~missing_fwd_mask
 
     # Keep only rows with finite features and label.
     m = np.ones((df.shape[0],), dtype=bool)
@@ -197,7 +259,21 @@ def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[p
         v = df[c].to_numpy(dtype=float)
         m &= np.isfinite(v)
     df = df.loc[m, ["StockCode", "DateTime", "Date", "MinuteIndex"] + feat_cols + ["label_ret"]].reset_index(drop=True)
-    return df, invalid_feature_stats
+    audit = {
+        "label_alignment": "minute_index_join",
+        "dropped_last_h_rows": int(dropped_last_h_rows),
+        "horizon_minutes": int(h),
+        "label_invalid_rows": int(label_invalid_mask.sum()),
+        "label_invalid_ratio": float(label_invalid_mask.mean()) if int(df.shape[0]) > 0 else float("nan"),
+        "label_invalid_missing_fwd_raw_absent_rows": int(raw_missing_mask.sum()),
+        "label_invalid_missing_fwd_raw_absent_ratio": float(raw_missing_mask.mean()) if int(df.shape[0]) > 0 else float("nan"),
+        "label_invalid_missing_fwd_filtered_rows": int(filtered_missing_mask.sum()),
+        "label_invalid_missing_fwd_filtered_ratio": float(filtered_missing_mask.mean()) if int(df.shape[0]) > 0 else float("nan"),
+        "label_invalid_other_rows": int(other_invalid_mask.sum()),
+        "label_invalid_other_ratio": float(other_invalid_mask.mean()) if int(df.shape[0]) > 0 else float("nan"),
+        "feature_warmup_minutes": int(_FEATURE_WARMUP_MINUTES),
+    }
+    return df, invalid_feature_stats, audit
 
 
 def _collect_invalid_feature_stats(df: pd.DataFrame, feat_cols: list[str], label_col: str) -> list[dict[str, object]]:
@@ -292,6 +368,22 @@ def _stock_feature_output_names(config: DataPrepConfig) -> list[str]:
     return list(_STOCK_FEATURES)
 
 
+def _is_zero_feature_output_names(config: DataPrepConfig) -> list[str]:
+    """Return the persisted is_zero feature column names for the current config."""
+    # Append is_zero indicators only when the optional mass-at-zero features are enabled.
+    if not bool(config.add_is_zero_features):
+        return []
+    return [f"{str(src)}_is_zero" for src in list(_IS_ZERO_SOURCE_FEATURES)]
+
+
+def _time_feature_output_names(config: DataPrepConfig) -> list[str]:
+    """Return the persisted time-feature column names for the current config."""
+    # Include session_id only when explicitly enabled by config.
+    if bool(config.include_session_id):
+        return ["minute_norm", "session_id", "session_minute_norm"]
+    return list(_TIME_FEATURES)
+
+
 def _date_time_int_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Convert DateTime into qmodel-style int date/time columns."""
     # Compute yymmdd date int to match qmodel merge_date_time_dataframe convention.
@@ -320,6 +412,12 @@ def _standardize(x: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray
     """Apply per-feature standardization."""
     # Standardize values into approximately N(0,1)-like marginals.
     return ((x - mean) / std).astype(np.float32, copy=False)
+
+
+def _standardize_label(y: np.ndarray, mean: float, std: float) -> np.ndarray:
+    """Apply scalar standardization to one label array."""
+    # Standardize label values into a stable zero-mean unit-std scale.
+    return ((y - float(mean)) / float(std)).astype(np.float32, copy=False)
 
 
 def _compute_norm_stats_from_bin(x_path: Path, rows: int, feature_dim: int) -> tuple[np.ndarray, np.ndarray]:
@@ -394,6 +492,61 @@ def _compute_norm_stats_from_bins(x_paths: list[Path], rows_list: list[int], fea
     return mean.astype(np.float32), std.astype(np.float32)
 
 
+def _compute_norm_stats_from_bins_excluding_features(
+    x_paths: list[Path],
+    rows_list: list[int],
+    feature_names: list[str],
+    excluded_features: list[str],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute pooled mean/std for zscore while excluding configured features."""
+    # Convert excluded feature names into a stable include mask aligned with feature_names.
+    excluded = set(str(name) for name in list(excluded_features))
+    include_mask = np.asarray([str(name) not in excluded for name in list(feature_names)], dtype=bool)
+
+    # Accumulate first and second moments only for included features.
+    feature_dim = int(len(feature_names))
+    count = np.zeros((int(feature_dim),), dtype=np.int64)
+    s1 = np.zeros((int(feature_dim),), dtype=np.float64)
+    s2 = np.zeros((int(feature_dim),), dtype=np.float64)
+    chunk_rows = 1_000_000
+    for x_path, rows in zip(list(x_paths), list(rows_list)):
+        # Memory-map each matrix so pooled moments can stream without full materialization.
+        x = np.memmap(Path(x_path), mode="r", dtype=np.float32, shape=(int(rows), int(feature_dim)))
+        for st in range(0, int(rows), int(chunk_rows)):
+            # Slice one chunk and upcast once before moment accumulation.
+            ed = min(int(rows), int(st + chunk_rows))
+            blk = np.asarray(x[int(st) : int(ed)], dtype=np.float64)
+
+            # Update pooled sums feature-by-feature to keep the logic explicit.
+            for j in range(int(feature_dim)):
+                # Skip excluded features so their columns remain unchanged by zscore.
+                if not bool(include_mask[int(j)]):
+                    continue
+                v = blk[:, int(j)]
+                v = v[np.isfinite(v)]
+                if int(v.shape[0]) == 0:
+                    continue
+                count[int(j)] += int(v.shape[0])
+                s1[int(j)] += float(v.sum(dtype=np.float64))
+                s2[int(j)] += float((v * v).sum(dtype=np.float64))
+
+    # Convert pooled sums into mean/std vectors and keep excluded columns as identity.
+    mean = np.zeros((int(feature_dim),), dtype=np.float64)
+    std = np.ones((int(feature_dim),), dtype=np.float64)
+    for j in range(int(feature_dim)):
+        # Convert included-feature raw sums into pooled mean/std.
+        if not bool(include_mask[int(j)]):
+            continue
+        if int(count[int(j)]) == 0:
+            raise RuntimeError(f"No finite values available for zscore feature: {feature_names[int(j)]}")
+        mean[int(j)] = float(s1[int(j)] / float(count[int(j)]))
+        var = float(s2[int(j)] / float(count[int(j)]) - mean[int(j)] * mean[int(j)])
+        std[int(j)] = float(np.sqrt(max(var, 0.0)))
+        if float(std[int(j)]) <= 0.0:
+            raise RuntimeError(f"Pooled zscore std contains non-positive values: {feature_names[int(j)]}")
+    return mean.astype(np.float32), std.astype(np.float32)
+
+
 def _standardize_bin_inplace(x_path: Path, rows: int, feature_dim: int, mean: np.ndarray, std: np.ndarray) -> None:
     """Apply pooled zscore to a raw float32 feature matrix on disk in place."""
     # Memory-map the matrix in read-write mode so normalization can stream in place.
@@ -409,7 +562,94 @@ def _standardize_bin_inplace(x_path: Path, rows: int, feature_dim: int, mean: np
     x.flush()
 
 
-def _write_pooled_zscore_artifacts(stats_path: Path, scope: str, feature_names: list[str], mean: np.ndarray, std: np.ndarray, rows: int) -> None:
+def _compute_label_norm_stats_from_bin(y_path: Path, rows: int) -> tuple[float, float]:
+    """Compute pooled mean/std from one raw float32 label column on disk."""
+    # Memory-map the raw label vector so pooled moments can be streamed.
+    y = np.memmap(Path(y_path), mode="r", dtype=np.float32, shape=(int(rows), 1))
+
+    # Accumulate first and second moments in float64 for numerical stability.
+    count = 0
+    s1 = 0.0
+    s2 = 0.0
+    chunk_rows = 1_000_000
+    for st in range(0, int(rows), int(chunk_rows)):
+        # Slice one chunk and keep only finite values.
+        ed = min(int(rows), int(st + chunk_rows))
+        blk = np.asarray(y[int(st) : int(ed), 0], dtype=np.float64)
+        blk = blk[np.isfinite(blk)]
+        if int(blk.shape[0]) == 0:
+            continue
+        count += int(blk.shape[0])
+        s1 += float(blk.sum(dtype=np.float64))
+        s2 += float((blk * blk).sum(dtype=np.float64))
+
+    # Convert pooled sums into scalar mean/std parameters.
+    mean = float(s1 / float(count))
+    var = float(s2 / float(count) - mean * mean)
+    std = float(np.sqrt(max(var, 0.0)))
+    if float(std) <= 0.0:
+        raise RuntimeError("Label zscore std contains non-positive values.")
+    return float(mean), float(std)
+
+
+def _compute_label_norm_stats_from_bins(y_paths: list[Path], rows_list: list[int]) -> tuple[float, float]:
+    """Compute pooled mean/std from multiple raw float32 label columns on disk."""
+    # Validate aligned path/row inputs so accumulated moments are meaningful.
+    if int(len(y_paths)) != int(len(rows_list)):
+        raise RuntimeError(f"y_paths and rows_list length mismatch: {len(y_paths)} vs {len(rows_list)}")
+
+    # Accumulate first and second moments in float64 for numerical stability.
+    count = 0
+    s1 = 0.0
+    s2 = 0.0
+    chunk_rows = 1_000_000
+    for y_path, rows in zip(list(y_paths), list(rows_list)):
+        # Memory-map each label vector so pooled moments can stream without full materialization.
+        y = np.memmap(Path(y_path), mode="r", dtype=np.float32, shape=(int(rows), 1))
+        for st in range(0, int(rows), int(chunk_rows)):
+            # Slice one chunk and keep only finite values.
+            ed = min(int(rows), int(st + chunk_rows))
+            blk = np.asarray(y[int(st) : int(ed), 0], dtype=np.float64)
+            blk = blk[np.isfinite(blk)]
+            if int(blk.shape[0]) == 0:
+                continue
+            count += int(blk.shape[0])
+            s1 += float(blk.sum(dtype=np.float64))
+            s2 += float((blk * blk).sum(dtype=np.float64))
+
+    # Convert pooled sums into scalar mean/std parameters.
+    mean = float(s1 / float(count))
+    var = float(s2 / float(count) - mean * mean)
+    std = float(np.sqrt(max(var, 0.0)))
+    if float(std) <= 0.0:
+        raise RuntimeError("Label zscore std contains non-positive values.")
+    return float(mean), float(std)
+
+
+def _standardize_label_bin_inplace(y_path: Path, rows: int, mean: float, std: float) -> None:
+    """Apply pooled zscore to a raw float32 label column on disk in place."""
+    # Memory-map the label column in read-write mode so normalization can stream in place.
+    y = np.memmap(Path(y_path), mode="r+", dtype=np.float32, shape=(int(rows), 1))
+
+    # Rewrite one chunk at a time to bound peak memory.
+    chunk_rows = 1_000_000
+    for st in range(0, int(rows), int(chunk_rows)):
+        # Standardize one chunk and write it back to disk.
+        ed = min(int(rows), int(st + chunk_rows))
+        blk = np.asarray(y[int(st) : int(ed), 0], dtype=np.float32)
+        y[int(st) : int(ed), 0] = _standardize_label(blk, float(mean), float(std))
+    y.flush()
+
+
+def _write_pooled_zscore_artifacts(
+    stats_path: Path,
+    scope: str,
+    feature_names: list[str],
+    mean: np.ndarray,
+    std: np.ndarray,
+    rows: int,
+    excluded_features: list[str],
+) -> None:
     """Write pooled zscore parameters to YAML for reproducibility."""
     # Persist pooled mean/std vectors in YAML for reproducibility.
     import yaml
@@ -418,7 +658,21 @@ def _write_pooled_zscore_artifacts(stats_path: Path, scope: str, feature_names: 
     for j, name in enumerate(list(feature_names)):
         # Store one feature's pooled parameters with stable scalar conversions.
         rows_yaml.append({"feature": str(name), "mean": float(mean[int(j)]), "std": float(std[int(j)])})
-    stats_path.write_text(yaml.safe_dump({"scope": str(scope), "rows": int(rows), "features": rows_yaml}, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    payload = {"scope": str(scope), "rows": int(rows), "excluded_features": [str(x) for x in list(excluded_features)], "features": rows_yaml}
+    stats_path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+
+def _write_label_zscore_artifacts(stats_path: Path, scope: str, mean: float, std: float, rows: int) -> None:
+    """Write label pooled zscore parameters to YAML for reproducibility."""
+    # Persist scalar label mean/std in YAML for reproducibility.
+    import yaml
+
+    payload = {
+        "scope": str(scope),
+        "rows": int(rows),
+        "label": {"feature": "label_ret", "mean": float(mean), "std": float(std)},
+    }
+    stats_path.write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
 
 def _write_feature_distribution_artifacts_from_bins(
@@ -684,6 +938,116 @@ def _write_invalid_feature_artifacts(invalid_table: pd.DataFrame, out_dir: Path)
     html_path.write_text(html, encoding="utf-8")
 
 
+def _write_label_audit_artifacts(daily_audits: list[dict[str, object]], out_dir: Path) -> pd.DataFrame:
+    """Write label alignment and invalid decomposition audits to CSV."""
+    # Ensure the output directory exists before writing files.
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Flatten one CSV row per trade_date so label invalid sources are easy to inspect.
+    rows: list[dict[str, object]] = []
+    for a in list(daily_audits):
+        # Read the label_audit payload and attach the parent trade_date.
+        la = dict(a.get("label_audit", {}))
+        la["trade_date"] = int(a["trade_date"])
+        rows.append(dict(la))
+    table = pd.DataFrame(rows).sort_values(["trade_date"], kind="stable").reset_index(drop=True)
+    table.to_csv(out_dir / "label_audit.csv", index=False)
+    return table
+
+
+def _write_kept_rows_by_minute_artifacts(npz_dir: Path, trade_dates: list[int], horizon_minutes: int, out_dir: Path) -> pd.DataFrame:
+    """Aggregate per-day minute counts and write kept_rows_by_minute CSV+PNG."""
+    # Ensure the output directory exists before writing files.
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Sum per-day per-minute row counts so minute-level cliffs are visible.
+    minute_dir = Path(npz_dir) / "audit_aux" / "minute_counts"
+    total = np.zeros((240,), dtype=np.int64)
+    for d in list(trade_dates):
+        # Load one day's counts and update the global accumulator.
+        p = minute_dir / f"{int(d)}.npy"
+        total += np.load(p).astype(np.int64, copy=False)
+
+    # Persist the aggregated minute table and a lightweight line plot.
+    n_minutes = int(240 - int(horizon_minutes))
+    table = pd.DataFrame({"MinuteIndex": np.arange(n_minutes, dtype=np.int64), "kept_rows": total[:n_minutes].astype(np.int64, copy=False)})
+    table.to_csv(out_dir / "kept_rows_by_minute.csv", index=False)
+    fig = plt.figure(figsize=(10, 4))
+    ax = fig.add_subplot(1, 1, 1)
+    ax.plot(table["MinuteIndex"].to_numpy(dtype=int), table["kept_rows"].to_numpy(dtype=float), linewidth=1.5)
+    ax.set_title("Kept rows by MinuteIndex")
+    ax.set_xlabel("MinuteIndex")
+    ax.set_ylabel("kept_rows")
+    fig.tight_layout()
+    fig.savefig(out_dir / "kept_rows_by_minute.png", dpi=160)
+    plt.close(fig)
+    return table
+
+
+def _write_drop_top_stocks_artifacts(npz_dir: Path, trade_dates: list[int], out_dir: Path) -> pd.DataFrame:
+    """Aggregate per-day stock minute counts and write drop_top_stocks CSV."""
+    # Ensure the output directory exists before writing files.
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Accumulate kept/expected minute totals by StockCode across all processed days.
+    stock_dir = Path(npz_dir) / "audit_aux" / "stock_counts"
+    kept_by_stock: dict[int, int] = {}
+    expected_by_stock: dict[int, int] = {}
+    for d in list(trade_dates):
+        # Load one day's stock-minute counts and update global dictionaries.
+        p = stock_dir / f"{int(d)}.npz"
+        blob = np.load(p)
+        expected = int(np.asarray(blob["expected_minutes"]).reshape(-1)[0])
+        codes = np.asarray(blob["stock_code"], dtype=np.int64)
+        kept = np.asarray(blob["kept_minutes"], dtype=np.int64)
+        for code, k in zip(list(codes), list(kept)):
+            # Add one day's expected/kept minute counters for this StockCode.
+            c = int(code)
+            kept_by_stock[c] = int(kept_by_stock.get(c, 0)) + int(k)
+            expected_by_stock[c] = int(expected_by_stock.get(c, 0)) + int(expected)
+
+    # Convert aggregated counters into drop ratios and missing-minute totals.
+    rows: list[dict[str, object]] = []
+    for code in sorted(list(expected_by_stock.keys())):
+        # Compute drop ratio on the expected-minute denominator.
+        expected = int(expected_by_stock[int(code)])
+        kept = int(kept_by_stock.get(int(code), 0))
+        missing = int(expected - kept)
+        drop_ratio = float(missing / expected)
+        rows.append({"StockCode": int(code), "drop_ratio": float(drop_ratio), "missing_minutes": int(missing)})
+    table = pd.DataFrame(rows).sort_values(["drop_ratio", "missing_minutes", "StockCode"], ascending=[False, False, True], kind="stable").reset_index(drop=True)
+    table.to_csv(out_dir / "drop_top_stocks.csv", index=False)
+    return table
+
+
+def _write_value_transform_params_artifact(
+    out_dir: Path,
+    *,
+    ret_features: list[str],
+    heavy_tail_features: list[str],
+    is_zero_features: list[str],
+    time_features: list[str],
+    use_ret_signed_log1p: bool,
+    use_heavy_tanh: bool,
+    heavy_tanh_c: float,
+    feature_warmup_minutes: int,
+) -> None:
+    """Write value-transform parameters to YAML so train/apply stays explicit."""
+    # Ensure the output directory exists before writing the YAML payload.
+    out_dir.mkdir(parents=True, exist_ok=True)
+    import yaml
+
+    # Persist the full transform contract so downstream stages can audit settings.
+    payload = {
+        "ret_signed_log1p": {"enabled": bool(use_ret_signed_log1p), "features": [str(x) for x in list(ret_features)]},
+        "heavy_tanh": {"enabled": bool(use_heavy_tanh), "c": float(heavy_tanh_c), "features": [str(x) for x in list(heavy_tail_features)]},
+        "is_zero": {"enabled": int(len(is_zero_features)) > 0, "features": [str(x) for x in list(is_zero_features)], "zscore_excluded": True},
+        "time_features": [str(x) for x in list(time_features)],
+        "feature_warmup_minutes": int(feature_warmup_minutes),
+    }
+    (out_dir / "value_transform.yaml").write_text(yaml.safe_dump(payload, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+
 def _write_feature_distribution_artifacts(x: np.ndarray, feature_names: list[str], out_dir: Path) -> pd.DataFrame:
     """Compute distribution stats and write per-feature histogram plots."""
     # Ensure output directory exists before writing artifacts.
@@ -897,8 +1261,26 @@ def _build_single_day_table(trade_date: int, config: DataPrepConfig) -> tuple[pd
     raw_rows = int(day_raw.shape[0])
 
     # Compute raw features/label and then sample within each minute.
-    day_feat, invalid_feature_stats = _add_features_and_label(day_raw, config)
+    day_feat, invalid_feature_stats, label_audit = _add_features_and_label(day_raw, config)
     kept_rows = int(day_feat.shape[0])
+
+    # Persist per-day missingness auxiliaries so global artifacts can be built without re-reading raw data.
+    npz_dir = Path(config.out_dir) / "npz"
+    aux_dir = npz_dir / "audit_aux"
+    (aux_dir / "minute_counts").mkdir(parents=True, exist_ok=True)
+    (aux_dir / "stock_counts").mkdir(parents=True, exist_ok=True)
+    expected_minutes = int(240 - int(config.horizon_minutes) - int(_FEATURE_WARMUP_MINUTES))
+    minute_counts = np.bincount(day_feat["MinuteIndex"].to_numpy(dtype=np.int64, copy=False), minlength=240).astype(np.int64, copy=False)
+    np.save(aux_dir / "minute_counts" / f"{int(trade_date)}.npy", minute_counts)
+    stock_kept = day_feat.groupby("StockCode", sort=False)["MinuteIndex"].nunique()
+    np.savez_compressed(
+        aux_dir / "stock_counts" / f"{int(trade_date)}.npz",
+        trade_date=np.asarray([int(trade_date)], dtype=np.int32),
+        expected_minutes=np.asarray([int(expected_minutes)], dtype=np.int32),
+        stock_code=stock_kept.index.to_numpy(dtype=np.int64, copy=False),
+        kept_minutes=stock_kept.to_numpy(dtype=np.int32, copy=False),
+    )
+
     day_samp = _sample_per_minute(day_feat, config)
     sampled_rows = int(day_samp.shape[0])
 
@@ -911,10 +1293,13 @@ def _build_single_day_table(trade_date: int, config: DataPrepConfig) -> tuple[pd
     # Attach date/time integer columns and keep only schema columns.
     day_norm = _date_time_int_columns(day_feat_out)
     stock_feature_names = _stock_feature_output_names(config)
+    is_zero_feature_names = _is_zero_feature_output_names(config)
+    time_feature_names = _time_feature_output_names(config)
     keep_cols = (
         ["StockCode", "DateTime", "Date", "MinuteIndex"]
         + list(stock_feature_names)
-        + list(_TIME_FEATURES)
+        + list(is_zero_feature_names)
+        + list(time_feature_names)
         + ["label_ret", "date_int", "time_int"]
     )
     day_out = day_norm.loc[:, keep_cols].reset_index(drop=True)
@@ -927,6 +1312,7 @@ def _build_single_day_table(trade_date: int, config: DataPrepConfig) -> tuple[pd
         "sampled_rows": int(sampled_rows),
         "out_rows": int(day_out.shape[0]),
         "invalid_feature_stats": list(invalid_feature_stats),
+        "label_audit": dict(label_audit),
     }
     return day_out, audit
 
@@ -1004,8 +1390,16 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
     npz_dir.mkdir(parents=True, exist_ok=True)
     import yaml
 
-    time_features = list(_TIME_FEATURES)
-    feature_names = list(_stock_feature_output_names(config)) + list(time_features)
+    # Enforce train-only fit scopes so statistics cannot leak across splits.
+    if str(config.norm_fit_scope) != "train_only":
+        raise RuntimeError(f"norm_fit_scope must be train_only to avoid leakage, got: {config.norm_fit_scope}")
+    if str(config.label_norm_fit_scope) != "train_only":
+        raise RuntimeError(f"label_norm_fit_scope must be train_only to avoid leakage, got: {config.label_norm_fit_scope}")
+
+    # Build the final feature schema once so all binaries and artifacts stay aligned.
+    time_features = _time_feature_output_names(config)
+    is_zero_features = _is_zero_feature_output_names(config)
+    feature_names = list(_stock_feature_output_names(config)) + list(is_zero_features) + list(time_features)
     dates, train_dates, val_dates, test_dates = _resolve_split_dates(config)
     expected_stock_norm = (
         {"type": "cross_sectional_gaussianize", "rank_clip": 1e-3}
@@ -1013,6 +1407,11 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         else {"type": "pooled_zscore", "scope": str(config.norm_fit_scope), "params_path": "pooled_zscore.yaml"}
     )
     expected_label = {"type": "forward_log_return", "horizon_minutes": int(config.horizon_minutes)}
+    expected_label_transform = (
+        {"type": "pooled_zscore", "scope": str(config.label_norm_fit_scope), "params_path": "label_zscore.yaml"}
+        if str(config.label_norm) == "pooled_zscore"
+        else {"type": "none"}
+    )
     expected_sampling = {"sample_stocks_per_minute": int(config.sample_stocks_per_minute)}
     expected_dates = {"train": list(train_dates), "val": list(val_dates), "test": list(test_dates)}
     expected_prep_config = _prep_config_contract(config)
@@ -1022,10 +1421,13 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         meta = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
         meta_feature_names = list(meta["feature_names"])
         meta_stock_norm = dict(meta["feature_transform"]["stock_norm"])
+        meta_label_transform = dict(meta.get("label_transform", {"type": "none"}))
         if list(meta_feature_names) != list(feature_names) or dict(meta_stock_norm) != dict(expected_stock_norm):
             raise RuntimeError(
                 f"Existing meta.yaml does not match current preprocessing config: expected_features={feature_names} expected_stock_norm={expected_stock_norm}"
             )
+        if dict(meta_label_transform) != dict(expected_label_transform):
+            raise RuntimeError(f"Existing meta.yaml does not match current label_transform config: expected_label_transform={expected_label_transform}")
 
         # Validate split dates, label, and sampling so old artifacts cannot be silently reused.
         meta_dates = dict(meta["dates"])
@@ -1068,11 +1470,30 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         if not invalid_stats_path.exists() or not invalid_report_path.exists():
             raise RuntimeError(f"Missing invalid-value artifacts for existing meta.yaml: {invalid_stats_path} {invalid_report_path}")
 
+        # Ensure required audit artifacts exist so missingness and label alignment are observable.
+        label_audit_path = stats_dir / "label_audit.csv"
+        kept_minute_csv = stats_dir / "kept_rows_by_minute.csv"
+        kept_minute_png = stats_dir / "kept_rows_by_minute.png"
+        drop_top_stocks_path = stats_dir / "drop_top_stocks.csv"
+        value_transform_path = stats_dir / "value_transform.yaml"
+        if not label_audit_path.exists():
+            raise RuntimeError(f"Missing label audit artifact for existing meta.yaml: {label_audit_path}")
+        if not kept_minute_csv.exists() or not kept_minute_png.exists():
+            raise RuntimeError(f"Missing kept_rows_by_minute artifacts for existing meta.yaml: {kept_minute_csv} {kept_minute_png}")
+        if not drop_top_stocks_path.exists():
+            raise RuntimeError(f"Missing drop_top_stocks artifact for existing meta.yaml: {drop_top_stocks_path}")
+        if not value_transform_path.exists():
+            raise RuntimeError(f"Missing value transform params artifact for existing meta.yaml: {value_transform_path}")
+
         # Ensure pooled zscore params exist when pooled normalization is requested.
         if str(meta_stock_norm["type"]) == "pooled_zscore":
             pooled_stats_path = stats_dir / str(meta_stock_norm["params_path"])
             if not pooled_stats_path.exists():
                 raise RuntimeError(f"Missing pooled zscore params for existing meta.yaml: {pooled_stats_path}")
+        if str(meta_label_transform["type"]) == "pooled_zscore":
+            label_stats_path = stats_dir / str(meta_label_transform["params_path"])
+            if not label_stats_path.exists():
+                raise RuntimeError(f"Missing label zscore params for existing meta.yaml: {label_stats_path}")
 
         # Optionally materialize the predict split from existing train/val/test splits.
         if bool(config.include_predict_split) and "predict" not in groups:
@@ -1347,8 +1768,26 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
     invalid_stats_table = _aggregate_invalid_feature_stats(predict_daily_audits)
     _write_invalid_feature_artifacts(invalid_stats_table, stats_dir)
 
+    # Write required audit artifacts so missingness and label alignment are observable.
+    predict_dates = list(train_dates) + list(val_dates) + list(test_dates)
+    _write_label_audit_artifacts(predict_daily_audits, stats_dir)
+    _write_kept_rows_by_minute_artifacts(npz_dir, list(predict_dates), int(config.horizon_minutes), stats_dir)
+    _write_drop_top_stocks_artifacts(npz_dir, list(predict_dates), stats_dir)
+    _write_value_transform_params_artifact(
+        stats_dir,
+        ret_features=list(_RET_FEATURES),
+        heavy_tail_features=list(_HEAVY_TAIL_FEATURES),
+        is_zero_features=list(is_zero_features),
+        time_features=list(time_features),
+        use_ret_signed_log1p=bool(config.use_ret_signed_log1p),
+        use_heavy_tanh=bool(config.use_heavy_tanh),
+        heavy_tanh_c=float(config.heavy_tanh_c),
+        feature_warmup_minutes=int(_FEATURE_WARMUP_MINUTES),
+    )
+
     # Compute pooled zscore parameters on the requested scope when Gaussianize is disabled.
     pooled_stats_path = stats_dir / "pooled_zscore.yaml"
+    label_stats_path = stats_dir / "label_zscore.yaml"
     if bool(config.use_cross_sectional_gaussianize):
         # Reuse the already transformed matrices and inspect pooled all-date feature moments.
         moment_table = _write_feature_distribution_artifacts_from_bins(
@@ -1374,7 +1813,13 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             raise RuntimeError(f"Unknown norm_fit_scope: {scope}")
 
         # Estimate pooled mean/std from the requested scope before any zscore rewrite.
-        mean, std = _compute_norm_stats_from_bins(list(fit_paths), list(fit_rows), int(len(feature_names)))
+        excluded_zscore_features = list(is_zero_features)
+        mean, std = _compute_norm_stats_from_bins_excluding_features(
+            list(fit_paths),
+            list(fit_rows),
+            list(feature_names),
+            list(excluded_zscore_features),
+        )
 
         # Rewrite every split with the same pooled zscore parameters.
         _standardize_bin_inplace(npz_dir / "train_x.f32", int(train_audit["out_rows"]), int(len(feature_names)), mean, std)
@@ -1389,7 +1834,45 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             list(feature_names),
             stats_dir,
         )
-        _write_pooled_zscore_artifacts(pooled_stats_path, str(scope), list(feature_names), mean, std, int(sum(int(r) for r in fit_rows)))
+        _write_pooled_zscore_artifacts(
+            pooled_stats_path,
+            str(scope),
+            list(feature_names),
+            mean,
+            std,
+            int(sum(int(r) for r in fit_rows)),
+            list(excluded_zscore_features),
+        )
+
+    # Compute pooled label zscore parameters when the requested label normalization is enabled.
+    if str(config.label_norm) == "none":
+        label_transform = {"type": "none"}
+    elif str(config.label_norm) == "pooled_zscore":
+        # Resolve label normalization fit scope into explicit binary paths and row counts.
+        label_scope = str(config.label_norm_fit_scope)
+        if label_scope == "train_only":
+            label_fit_paths = [npz_dir / "train_y.f32"]
+            label_fit_rows = [int(train_audit["out_rows"])]
+        elif label_scope == "train_val_test":
+            label_fit_paths = [npz_dir / "train_y.f32", npz_dir / "val_y.f32", npz_dir / "test_y.f32"]
+            label_fit_rows = [int(train_audit["out_rows"]), int(val_audit["out_rows"]), int(test_audit["out_rows"])]
+        elif label_scope == "predict_all_dates":
+            label_fit_paths = [npz_dir / "train_y.f32", npz_dir / "val_y.f32", npz_dir / "test_y.f32"]
+            label_fit_rows = [int(train_audit["out_rows"]), int(val_audit["out_rows"]), int(test_audit["out_rows"])]
+        else:
+            raise RuntimeError(f"Unknown label_norm_fit_scope: {label_scope}")
+
+        # Estimate pooled label mean/std from the requested scope before any zscore rewrite.
+        label_mean, label_std = _compute_label_norm_stats_from_bins(list(label_fit_paths), list(label_fit_rows))
+
+        # Rewrite every split label file with the same pooled zscore parameters.
+        _standardize_label_bin_inplace(npz_dir / "train_y.f32", int(train_audit["out_rows"]), float(label_mean), float(label_std))
+        _standardize_label_bin_inplace(npz_dir / "val_y.f32", int(val_audit["out_rows"]), float(label_mean), float(label_std))
+        _standardize_label_bin_inplace(npz_dir / "test_y.f32", int(test_audit["out_rows"]), float(label_mean), float(label_std))
+        _write_label_zscore_artifacts(label_stats_path, str(label_scope), float(label_mean), float(label_std), int(sum(int(r) for r in label_fit_rows)))
+        label_transform = {"type": "pooled_zscore", "scope": str(label_scope), "params_path": label_stats_path.name}
+    else:
+        raise RuntimeError(f"Unknown label_norm: {config.label_norm}")
 
     # Convert raw/kept/sampled counters into float rates for report consumption.
     def _audit_rates(a: dict[str, object]) -> dict[str, float]:
@@ -1448,6 +1931,12 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         "storage": storage,
         "feature_transform": {
             "stock_features": list(_STOCK_FEATURES),
+            "is_zero_features": list(is_zero_features),
+            "value_transforms": {
+                "ret_signed_log1p": {"enabled": bool(config.use_ret_signed_log1p), "features": list(_RET_FEATURES)},
+                "heavy_tanh": {"enabled": bool(config.use_heavy_tanh), "c": float(config.heavy_tanh_c), "features": list(_HEAVY_TAIL_FEATURES)},
+                "feature_warmup_minutes": int(_FEATURE_WARMUP_MINUTES),
+            },
             "stock_norm": (
                 {"type": "cross_sectional_gaussianize", "rank_clip": 1e-3}
                 if bool(config.use_cross_sectional_gaussianize)
@@ -1457,6 +1946,7 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         },
         "dates": {"train": train_dates, "val": val_dates, "test": test_dates},
         "label": {"type": "forward_log_return", "horizon_minutes": int(config.horizon_minutes)},
+        "label_transform": dict(label_transform),
         "sampling": {"sample_stocks_per_minute": int(config.sample_stocks_per_minute)},
         "audit": {"train": train_audit, "val": val_audit, "test": test_audit},
         "audit_rates": {
@@ -1472,6 +1962,11 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             "report_path": "data_clean/report.html",
             "feature_moments_path": "data_clean/feature_moments.csv",
             "pooled_distribution_overview_path": "data_clean/pooled_feature_grid.png",
+            "label_audit_path": "data_clean/label_audit.csv",
+            "kept_rows_by_minute_csv_path": "data_clean/kept_rows_by_minute.csv",
+            "kept_rows_by_minute_png_path": "data_clean/kept_rows_by_minute.png",
+            "drop_top_stocks_path": "data_clean/drop_top_stocks.csv",
+            "value_transform_params_path": "data_clean/value_transform.yaml",
         },
         "audit_daily": {"train": train_daily_audits, "val": val_daily_audits, "test": test_daily_audits},
     }
