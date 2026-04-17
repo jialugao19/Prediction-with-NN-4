@@ -315,6 +315,23 @@ class OnlineMoments:
         return {"count": int(n), "mean": float(mean), "std": float(std), "t_stat": float(t_stat), "positive_ratio": float(pos_ratio)}
 
 
+def _daily_pearson_ic_for_one_date(day_df: pd.DataFrame) -> float:
+    """Compute one day's daily IC as the mean of intraday cross-sectional ICs."""
+    # Compute one cross-sectional Pearson IC for each timestamp in the day.
+    day_ics: list[float] = []
+    for (_date, _time), group in day_df.groupby(["date", "time"], sort=False):
+        pred = group["prediction"].to_numpy(dtype=np.float64, copy=False)
+        tgt = group["target"].to_numpy(dtype=np.float64, copy=False)
+        day_ics.append(float(_pearson(pred, tgt)))
+
+    # Average finite intraday ICs to get one daily IC observation.
+    vals = np.asarray(day_ics, dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if int(vals.shape[0]) == 0:
+        return float("nan")
+    return float(vals.mean(dtype=np.float64))
+
+
 def pooled_ic_from_manifest(manifest_path: Path) -> dict[str, float]:
     """Compute pooled Pearson/Rank IC from a predict manifest without materializing a full dataframe."""
     # Stream once to accumulate Pearson moments and to spill finite pairs for exact Spearman via external sort.
@@ -715,6 +732,33 @@ def pearson_ic_time_series_summary_from_manifest(manifest_path: Path, out_yaml: 
 
     # Persist YAML with the subset schema used by the train report.
     summary = {"pearson_ic": pearson_stats.finalize(), "timestamp_count": int(timestamp_count)}
+    Path(out_yaml).write_text(yaml.safe_dump(summary, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return summary
+
+
+def daily_pearson_ic_summary_from_manifest(manifest_path: Path, out_yaml: Path) -> dict[str, object]:
+    """Write daily-IC summary metrics from a manifest."""
+    # Stream full date groups and update one daily IC observation per date.
+    import yaml
+
+    reader = PredictionChunkReader(Path(manifest_path))
+    daily_stats = OnlineMoments()
+    day_count = 0
+    for _d, day_df in reader.iter_date_groups(["date", "time", "prediction", "target"]):
+        # Compute one daily IC from the day's intraday cross-sectional IC sequence.
+        daily_ic = float(_daily_pearson_ic_for_one_date(day_df))
+        daily_stats.update(float(daily_ic))
+        day_count += 1
+
+    # Convert mean/std into ICIR while keeping the existing summary schema compact.
+    pearson_summary = dict(daily_stats.finalize())
+    std = float(pearson_summary["std"])
+    mean = float(pearson_summary["mean"])
+    icir = float(mean / std) if np.isfinite(mean) and np.isfinite(std) and float(std) > 0.0 else float("nan")
+    pearson_summary["icir"] = float(icir)
+
+    # Persist YAML with the day-level schema used by downstream reports.
+    summary = {"pearson_ic": pearson_summary, "day_count": int(day_count)}
     Path(out_yaml).write_text(yaml.safe_dump(summary, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return summary
 
@@ -1148,7 +1192,7 @@ def compute_test_evaluation_report_from_manifest(manifest_path: Path, eval_cfg: 
     """Compute the test-evaluation report artifacts by streaming parquet chunks from a manifest."""
     # Resolve all output paths under the report root to keep pipeline wiring minimal.
     out_root = Path(out_root)
-    ic_summary_yaml = Path(out_root) / "test_ic_time_series_summary.yaml"
+    ic_summary_yaml = Path(out_root) / "test_daily_ic_summary.yaml"
     annual_csv = Path(out_root) / "annual_ic.csv"
     annual_png = Path(out_root) / "annual_ic.png"
     intraday_csv = Path(out_root) / "test_intraday_ic.csv"
@@ -1169,8 +1213,8 @@ def compute_test_evaluation_report_from_manifest(manifest_path: Path, eval_cfg: 
     # Compute pooled Pearson IC using a streaming accumulator.
     pooled = pooled_pearson_ic_from_manifest(Path(manifest_path))
 
-    # Compute timestamp-level Pearson IC summaries by streaming full (date,time) groups.
-    ic_summary = pearson_ic_time_series_summary_from_manifest(Path(manifest_path), Path(ic_summary_yaml))
+    # Compute day-level Pearson IC summaries from intraday cross-sectional ICs.
+    ic_summary = daily_pearson_ic_summary_from_manifest(Path(manifest_path), Path(ic_summary_yaml))
 
     # Compute annual pooled Pearson IC by streaming and bucketing rows by year.
     annual_tbl = annual_pooled_pearson_ic_from_manifest(Path(manifest_path), Path(annual_csv), Path(annual_png))
