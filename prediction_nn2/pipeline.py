@@ -5,9 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import torch
 import numpy as np
@@ -22,8 +24,8 @@ from prediction_nn2.clean_report import render_clean_report_from_meta
 from prediction_nn2.eval_ic import (
     EvalConfig,
     compute_test_evaluation_report_from_manifest,
+    daily_pearson_ic_summary_from_manifest,
     intraday_time_series_ic_train_test_from_manifest,
-    pearson_ic_time_series_summary_from_manifest,
     pooled_pearson_ic_from_manifest,
     rolling_group_ic_from_manifest,
 )
@@ -78,16 +80,73 @@ class PipelineConfig:
     rolling_step: int
 
 
-def _redirect_to_data_cache(path: Path) -> Path:
-    """Redirect output paths into /data-cache/nn to reduce container disk pressure."""
-    # Preserve the original relative path shape under /data-cache/nn so runs are easy to locate.
-    p = Path(path)
-    if p.is_absolute() and str(p).startswith("/data-cache/nn/"):
-        return p
-    rel = p.as_posix().lstrip("/")
-    if rel.startswith("outputs/"):
-        rel = rel[len("outputs/") :]
-    return Path("/data-cache/nn") / rel
+def _resolve_data_cache_nn_root_dir(configured_root_dir: Path, pipeline_mode: str) -> Path:
+    """Resolve one run root directory under /data-cache/nn using a date tag."""
+    # Use Asia/Shanghai explicitly so directory naming is stable across machines.
+    now = datetime.now(tz=ZoneInfo("Asia/Shanghai"))
+
+    # Treat /data-cache/nn as a parent hint and allocate a dated child directory.
+    nn_parent = Path("/data-cache/nn")
+    cfg = Path(configured_root_dir)
+    if cfg.resolve() == nn_parent.resolve():
+        base_name = now.strftime("%m%d")
+        if str(pipeline_mode) in {"train_report_only", "test_report_only"}:
+            return _select_latest_date_dir(nn_parent, base_name)
+        return _allocate_unique_date_dir(nn_parent, base_name)
+
+    # Allow users to explicitly pass a directory under /data-cache/nn.
+    if cfg.is_absolute() and nn_parent in cfg.parents:
+        return cfg
+
+    # Default behavior: ignore legacy outputs/ paths and place results under /data-cache/nn/<MMDD>.
+    base_name = now.strftime("%m%d")
+    return _allocate_unique_date_dir(nn_parent, base_name)
+
+
+def _allocate_unique_date_dir(parent_dir: Path, base_name: str) -> Path:
+    """Allocate a unique directory name like 0416, 0416-02, 0416-03 under parent_dir."""
+    # Ensure the parent directory exists so we can probe for collisions.
+    parent = Path(parent_dir)
+    parent.mkdir(parents=True, exist_ok=True)
+
+    # Use the base date name if free; otherwise append -02/-03 style suffixes.
+    candidate = parent / str(base_name)
+    if not candidate.exists():
+        candidate.mkdir(parents=True, exist_ok=False)
+        return candidate
+
+    # Scan suffixes deterministically so repeated same-day runs do not overwrite.
+    idx = 2
+    while True:
+        candidate = parent / f"{str(base_name)}-{idx:02d}"
+        if not candidate.exists():
+            candidate.mkdir(parents=True, exist_ok=False)
+            return candidate
+        idx += 1
+
+
+def _select_latest_date_dir(parent_dir: Path, base_name: str) -> Path:
+    """Select the latest existing date directory like 0416-03 under parent_dir."""
+    # Ensure the parent directory exists so scans behave predictably.
+    parent = Path(parent_dir)
+    parent.mkdir(parents=True, exist_ok=True)
+
+    # Collect all existing directories that match the base date name and suffix policy.
+    candidates: list[tuple[int, Path]] = []
+    plain = parent / str(base_name)
+    if plain.is_dir():
+        candidates.append((1, plain))
+    for p in parent.glob(f"{str(base_name)}-[0-9][0-9]"):
+        if not p.is_dir():
+            continue
+        suffix = p.name.split("-")[-1]
+        candidates.append((int(suffix), p))
+
+    # Require at least one candidate so report-only does not silently allocate an empty dir.
+    if len(candidates) == 0:
+        raise RuntimeError(f"No existing output directory found under {parent} for base_name={base_name}")
+    candidates.sort(key=lambda x: x[0])
+    return candidates[-1][1]
 
 
 def _effective_sample_stocks_per_minute(cfg: PipelineConfig) -> int:
@@ -98,20 +157,41 @@ def _effective_sample_stocks_per_minute(cfg: PipelineConfig) -> int:
     return int(cfg.sample_stocks_per_minute)
 
 
-def _lr_scheduler_contract(cfg: PipelineConfig) -> dict[str, object]:
+def _resolved_num_iters(cfg: PipelineConfig, train_rows: int) -> int:
+    """Resolve an effective num_iters that runs for more than one epoch."""
+    # Convert train rows into the minimum final iteration that exceeds one epoch.
+    batches_per_epoch = int(np.ceil(float(train_rows) / float(cfg.batch_size)))
+    min_final_iter = int(batches_per_epoch)
+
+    # Respect the configured lower bound before aligning to checkpoint cadence.
+    configured_final_iter = int(max(int(cfg.num_iters) - 1, int(min_final_iter)))
+
+    # Align the final iteration to save_every so the last checkpoint is materialized.
+    save_every = int(cfg.save_every)
+    resolved_final_iter = int(((configured_final_iter + save_every - 1) // save_every) * save_every)
+    return int(resolved_final_iter + 1)
+
+
+def _lr_scheduler_contract(cfg: PipelineConfig, train_rows: int) -> dict[str, object]:
     """Return the fixed LR-scheduler contract used by qmodel training."""
+    # Resolve the effective training length before wiring the decay schedule.
+    effective_num_iters = int(_resolved_num_iters(cfg, int(train_rows)))
+
     # Keep scheduler settings in one place so config building and fingerprinting stay aligned.
     return {
         "start_warmup_factor": 0.001,
         "end_warmup_factor": 1.0,
         "warmup_iters": 200,
-        "finish_decay_iter": int(cfg.num_iters),
+        "finish_decay_iter": int(effective_num_iters),
         "eta_min": 1e-6,
     }
 
 
-def _train_stage_contract(cfg: PipelineConfig, feature_dim: int) -> dict[str, object]:
+def _train_stage_contract(cfg: PipelineConfig, feature_dim: int, train_rows: int) -> dict[str, object]:
     """Return the effective train-stage contract that must invalidate stale checkpoints."""
+    # Resolve the effective iteration count before recording scheduler choices.
+    effective_num_iters = int(_resolved_num_iters(cfg, int(train_rows)))
+
     # Record the fixed architecture and optimizer choices that are not fully encoded in PipelineConfig.
     return {
         "model_class": "GruMlpRegressor",
@@ -127,7 +207,8 @@ def _train_stage_contract(cfg: PipelineConfig, feature_dim: int) -> dict[str, ob
         "optimizer_class": "AdamW",
         "criterion": "MSELoss",
         "use_lr_sched": "custom",
-        "lr_scheduler": _lr_scheduler_contract(cfg),
+        "num_iters": int(effective_num_iters),
+        "lr_scheduler": _lr_scheduler_contract(cfg, int(train_rows)),
     }
 
 
@@ -202,6 +283,9 @@ def _format_date_range(dates: list[int]) -> str:
 
 def _model_summary(cfg: PipelineConfig, feature_dim: int, train_rows: int) -> tuple[list[tuple[str, str]], GruMlpConfig]:
     """Build scalar rows describing the effective NN model and training setup."""
+    # Resolve the effective training length before computing epoch counts.
+    effective_num_iters = int(_resolved_num_iters(cfg, int(train_rows)))
+
     # Materialize the exact model config used by qmodel training.
     model_cfg = GruMlpConfig(
         input_size=int(feature_dim),
@@ -220,7 +304,7 @@ def _model_summary(cfg: PipelineConfig, feature_dim: int, train_rows: int) -> tu
 
     # Convert row counts into approximate epoch counts for human review.
     batches_per_epoch = float(train_rows) / float(cfg.batch_size)
-    total_epochs = float(cfg.num_iters) / float(batches_per_epoch)
+    total_epochs = float(effective_num_iters) / float(batches_per_epoch)
 
     # Assemble the single-column model summary rows.
     rows = [
@@ -240,7 +324,7 @@ def _model_summary(cfg: PipelineConfig, feature_dim: int, train_rows: int) -> tu
         ("learning_rate", f"{float(cfg.learning_rate):.6g}"),
         ("batch_size", str(int(cfg.batch_size))),
         ("eval_batch_size", str(int(cfg.eval_batch_size))),
-        ("num_iters", str(int(cfg.num_iters))),
+        ("num_iters", str(int(effective_num_iters))),
         ("approx_total_epochs", f"{float(total_epochs):.2f}"),
         ("save_every", str(int(cfg.save_every))),
         ("eval_every", str(int(cfg.eval_every))),
@@ -290,6 +374,15 @@ def _load_data_contract_from_meta(meta_path: Path) -> dict[str, object]:
     }
 
 
+def _load_train_rows_from_meta(meta_path: Path) -> int:
+    """Load the train row count from meta.yaml."""
+    # Parse meta.yaml and read the stored train row count directly.
+    import yaml
+
+    meta = yaml.safe_load(Path(meta_path).read_text(encoding="utf-8"))
+    return int(meta["storage"]["groups"]["train"]["rows"])
+
+
 def _write_stage_manifest(path: Path, payload: dict[str, object]) -> None:
     """Persist one stage manifest as YAML."""
     # Write the manifest with stable key ordering disabled so humans can diff it.
@@ -316,8 +409,11 @@ def _move_eval_dir(run_dir: Path, *, src_name: str, dst_name: str, it: int) -> P
     return dst
 
 
-def _build_qmodel_config(cfg: PipelineConfig, feature_dim: int, run_root: Path) -> SimpleNamespace:
+def _build_qmodel_config(cfg: PipelineConfig, feature_dim: int, run_root: Path, train_rows: int) -> SimpleNamespace:
     """Build a qmodel-compatible flat config namespace for single-GPU training."""
+    # Resolve the effective training length before building trainer config.
+    effective_num_iters = int(_resolved_num_iters(cfg, int(train_rows)))
+
     # Select training device; prefer CUDA when available.
     use_cuda = bool(torch.cuda.is_available())
     device = torch.device("cuda:0") if use_cuda else torch.device("cpu")
@@ -347,11 +443,11 @@ def _build_qmodel_config(cfg: PipelineConfig, feature_dim: int, run_root: Path) 
         mlp_dropout=float(cfg.dropout),
         dtype=torch.float32,
     )
-    lr_scheduler_cfg = _lr_scheduler_contract(cfg)
+    lr_scheduler_cfg = _lr_scheduler_contract(cfg, int(train_rows))
 
     # Build evaluator config namespace to match qmodel evaluator expectations.
     evaluator = SimpleNamespace(
-        eval_checkpoint_iter=[int(cfg.num_iters) - 1],
+        eval_checkpoint_iter=[int(effective_num_iters) - 1],
         eval_all_num_iters=0,
         eval_batch_size=int(cfg.eval_batch_size),
         predict_chunk_row_count=2_000_000,
@@ -379,7 +475,7 @@ def _build_qmodel_config(cfg: PipelineConfig, feature_dim: int, run_root: Path) 
         expr_name="prediction-nn-2",
         batch_size=int(cfg.batch_size),
         num_workers=int(cfg.num_workers),
-        num_iters=int(cfg.num_iters),
+        num_iters=int(effective_num_iters),
         save_every=int(cfg.save_every),
         eval_every=int(cfg.eval_every),
         eval_during=bool(cfg.eval_during),
@@ -429,6 +525,7 @@ def _select_best_checkpoint_by_val(run_root: Path, qconf: SimpleNamespace, check
     from qmodel.core.cpu_evaluator import CpuEvaluator
 
     metrics_by_it: dict[int, dict[str, float]] = {}
+    checkpoint_iters = sorted(set(int(it) for it in list(checkpoint_iters)))[-5:]
     if torch.device(qconf.device).type == "cuda":
         evaluator = Evaluator(qconf, group="val", writer=None, enable_logging=True)
     else:
@@ -631,13 +728,13 @@ def _run_train_report_postprocess(
 
     # Compute train/test pooled Pearson IC and time-series summaries from manifests.
     test_pooled = pooled_pearson_ic_from_manifest(Path(test_manifest_path))
-    test_ic_summary_yaml = Path(out_root) / "ic_time_series_summary_test.yaml"
+    test_ic_summary_yaml = Path(out_root) / "daily_ic_summary_test.yaml"
     t_summary0 = time.time()
-    test_ic_summary = pearson_ic_time_series_summary_from_manifest(Path(test_manifest_path), test_ic_summary_yaml)
+    test_ic_summary = daily_pearson_ic_summary_from_manifest(Path(test_manifest_path), test_ic_summary_yaml)
 
     train_pooled = pooled_pearson_ic_from_manifest(Path(train_manifest_path))
-    train_ic_summary_yaml = Path(out_root) / "ic_time_series_summary_train.yaml"
-    train_ic_summary = pearson_ic_time_series_summary_from_manifest(Path(train_manifest_path), train_ic_summary_yaml)
+    train_ic_summary_yaml = Path(out_root) / "daily_ic_summary_train.yaml"
+    train_ic_summary = daily_pearson_ic_summary_from_manifest(Path(train_manifest_path), train_ic_summary_yaml)
     t_summary1 = time.time()
 
     # Emit train/test intraday Pearson IC diagnostics from streamed manifests.
@@ -837,17 +934,45 @@ def _render_train_report_html(
         ("eval_metric_space", "raw_forward_log_return"),
         ("train_loss_png", loss_png.as_posix()),
     ]
+    # Summarize the training-time LR schedule and initialization policy for reproducibility.
+    lr_sched = _lr_scheduler_contract(cfg, int(prep["train_rows"]))
+    lr_init = float(cfg.learning_rate) * float(lr_sched["start_warmup_factor"])
+    lr_peak = float(cfg.learning_rate) * float(lr_sched["end_warmup_factor"])
+    lr_rows = [
+        ("optim/optimizer", "AdamW"),
+        ("optim/base_lr", f"{float(cfg.learning_rate):.6g}"),
+        ("optim/criterion", "MSELoss"),
+        ("lr_scheduler/type", "LinearWarmup + CosineAnnealing (GraphLRScheduler)"),
+        ("lr_scheduler/use_lr_sched", "custom"),
+        ("lr_scheduler/warmup_iters", str(int(lr_sched["warmup_iters"]))),
+        ("lr_scheduler/start_factor", f"{float(lr_sched['start_warmup_factor']):.6g}"),
+        ("lr_scheduler/end_factor", f"{float(lr_sched['end_warmup_factor']):.6g}"),
+        ("lr_scheduler/finish_decay_iter", str(int(lr_sched["finish_decay_iter"]))),
+        ("lr_scheduler/eta_min", f"{float(lr_sched['eta_min']):.6g}"),
+        ("lr_scheduler/lr_at_iter0", f"{float(lr_init):.6g}"),
+        ("lr_scheduler/lr_after_warmup", f"{float(lr_peak):.6g}"),
+    ]
+    init_rows = [
+        ("param_init/policy", "PyTorch default init (no explicit init in prediction_nn2/model.py)"),
+        ("param_init/torch_seed", "not set (init is not guaranteed reproducible)"),
+        ("param_init/nn.Linear", "kaiming_uniform_(weight), uniform_(bias) (PyTorch default)"),
+        ("param_init/nn.GRU", "uniform_(-1/sqrt(hidden_size), +1/sqrt(hidden_size)) (PyTorch default)"),
+    ]
     ic_rows = [
         ("pooled_ic_train", f"{float(train_pooled['pearson_ic']):.6f}"),
         ("pooled_ic_test", f"{float(test_pooled['pearson_ic']):.6f}"),
         ("pooled_count_train", str(int(train_pooled["count"]))),
         ("pooled_count_test", str(int(test_pooled["count"]))),
-        ("train_t_stat", f"{float(train_ic_summary['pearson_ic']['t_stat']):.4f}"),
-        ("test_t_stat", f"{float(test_ic_summary['pearson_ic']['t_stat']):.4f}"),
-        ("train_positive_ratio", f"{float(train_ic_summary['pearson_ic']['positive_ratio']):.2%}"),
-        ("test_positive_ratio", f"{float(test_ic_summary['pearson_ic']['positive_ratio']):.2%}"),
-        ("train_timestamps", str(int(train_ic_summary["timestamp_count"]))),
-        ("test_timestamps", str(int(test_ic_summary["timestamp_count"]))),
+        ("train_daily_ic_mean", f"{float(train_ic_summary['pearson_ic']['mean']):.6f}"),
+        ("test_daily_ic_mean", f"{float(test_ic_summary['pearson_ic']['mean']):.6f}"),
+        ("train_daily_ic_std", f"{float(train_ic_summary['pearson_ic']['std']):.6f}"),
+        ("test_daily_ic_std", f"{float(test_ic_summary['pearson_ic']['std']):.6f}"),
+        ("train_daily_icir", f"{float(train_ic_summary['pearson_ic']['icir']):.6f}"),
+        ("test_daily_icir", f"{float(test_ic_summary['pearson_ic']['icir']):.6f}"),
+        ("train_daily_t_stat", f"{float(train_ic_summary['pearson_ic']['t_stat']):.4f}"),
+        ("test_daily_t_stat", f"{float(test_ic_summary['pearson_ic']['t_stat']):.4f}"),
+        ("train_day_count", str(int(train_ic_summary["day_count"]))),
+        ("test_day_count", str(int(test_ic_summary["day_count"]))),
     ]
     rolling_rows = [
         ("intraday_csv", intraday_csv.as_posix()),
@@ -869,6 +994,7 @@ def _render_train_report_html(
     sections = [
         render_section("Run Overview", render_value_rows(overview_rows)),
         render_section("NN Model", render_value_rows(model_rows)),
+        render_section("Training Setup", render_value_rows(lr_rows) + render_value_rows(init_rows) + render_yaml_block({"lr_scheduler": lr_sched})),
         render_section("Data Clean Summary", render_value_rows(clean_rows) + invalid_table),
         render_figure("Data Clean Distribution Overview", stats_dir / "pooled_feature_grid.png", "Pooled standardized feature distributions from the data clean stage."),
         render_section("Validation And Checkpoint", render_value_rows(checkpoint_rows) + sweep_table),
@@ -1063,10 +1189,12 @@ def run_train_stage(
     """Run NN training (skip if complete) and return (qconf, best_it, val_metrics_by_it)."""
     # Build a stage fingerprint so training can skip cleanly across repeated invocations.
     meta_path = Path(out_root) / "artifacts" / "npz" / "meta.yaml"
+    train_rows = int(_load_train_rows_from_meta(meta_path))
+    effective_num_iters = int(_resolved_num_iters(cfg, int(train_rows)))
     stage_cfg = {
         "stage": "train",
         "seed": int(cfg.seed),
-        "num_iters": int(cfg.num_iters),
+        "num_iters": int(effective_num_iters),
         "save_every": int(cfg.save_every),
         "batch_size": int(cfg.batch_size),
         "learning_rate": float(cfg.learning_rate),
@@ -1074,15 +1202,15 @@ def run_train_stage(
         "dropout": float(cfg.dropout),
         "input_window_size": int(cfg.input_window_size),
         "feature_dim": int(feature_dim),
-        "train_contract": _train_stage_contract(cfg, int(feature_dim)),
+        "train_contract": _train_stage_contract(cfg, int(feature_dim), int(train_rows)),
         "data_contract": _load_data_contract_from_meta(meta_path),
     }
     manifest_path = _stage_manifest_path(Path(out_root), "train")
     fp = _stage_fingerprint(stage_cfg)
 
     # Always build qmodel config so checkpoint paths resolve consistently.
-    qconf = _build_qmodel_config(cfg, feature_dim=int(feature_dim), run_root=Path(out_root))
-    final_iter = int(cfg.num_iters) - 1
+    qconf = _build_qmodel_config(cfg, feature_dim=int(feature_dim), run_root=Path(out_root), train_rows=int(train_rows))
+    final_iter = int(effective_num_iters) - 1
     required_last_ckpt = (int(final_iter) // int(cfg.save_every)) * int(cfg.save_every)
 
     # Skip training when the last required checkpoint already exists and the stage manifest matches.
@@ -1117,12 +1245,12 @@ def run_train_stage(
 
     # Run training in a single continuous trainer session.
     # Checkpoints are still saved at cfg.save_every, but we avoid chunk restarts to keep GPU utilization stable.
-    qconf.num_iters = int(cfg.num_iters)
+    qconf.num_iters = int(effective_num_iters)
     qconf.save_every = int(cfg.save_every)
     qconf.load_from_iter = -1 if int(last_ckpt) >= 0 else None
     print(
         f"[pipeline] train start last_ckpt={last_ckpt} required_last_ckpt={required_last_ckpt} final_iter={final_iter} "
-        f"save_every={int(cfg.save_every)} batch_size={int(cfg.batch_size)}",
+        f"save_every={int(cfg.save_every)} batch_size={int(cfg.batch_size)} effective_num_iters={int(effective_num_iters)}",
         flush=True,
     )
 
@@ -1186,8 +1314,13 @@ def run_train_report_stage(
     # Build a stage fingerprint so report rebuild can skip when inputs are unchanged.
     stage_cfg = {
         "stage": "train_report",
+        "report_version": 3,
         "best_it": int(best_it),
         "data_contract": _load_data_contract_from_meta(Path(prep["meta_path"])),
+        "lr_scheduler": _lr_scheduler_contract(cfg, int(prep["train_rows"])),
+        "param_init_policy": "pytorch_default_init_no_manual_seed",
+        "ic_summary_mode": "daily_ic_t_stat",
+        "effective_num_iters": int(_resolved_num_iters(cfg, int(prep["train_rows"]))),
     }
     manifest_path = _stage_manifest_path(Path(out_root), "train_report")
     fp = _stage_fingerprint(stage_cfg)
@@ -1326,12 +1459,15 @@ def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path
         ),
         render_section("NN Model", render_value_rows(model_rows)),
         render_section(
-            "IC Time Series Summary",
+            "Daily IC Summary",
             render_value_rows(
                 [
                     ("ic_summary_yaml", Path(artifacts.ic_summary_yaml).as_posix()),
-                    ("pearson_t_stat", f"{float(ic_summary['pearson_ic']['t_stat']):.4f}"),
-                    ("timestamp_count", str(int(ic_summary["timestamp_count"]))),
+                    ("daily_ic_mean", f"{float(ic_summary['pearson_ic']['mean']):.6f}"),
+                    ("daily_ic_std", f"{float(ic_summary['pearson_ic']['std']):.6f}"),
+                    ("daily_icir", f"{float(ic_summary['pearson_ic']['icir']):.6f}"),
+                    ("daily_t_stat", f"{float(ic_summary['pearson_ic']['t_stat']):.4f}"),
+                    ("day_count", str(int(ic_summary["day_count"]))),
                 ]
             )
             + render_yaml_block(ic_summary),
@@ -1386,6 +1522,7 @@ def run_test_evaluation_report_stage(cfg: PipelineConfig, *, out_root: Path, tes
     manifest_stat = Path(test_manifest_path).stat()
     stage_cfg = {
         "stage": "test_evaluation_report",
+        "report_version": 2,
         "manifest": str(Path(test_manifest_path).as_posix()),
         "manifest_size_bytes": int(manifest_stat.st_size),
         "manifest_mtime_ns": int(manifest_stat.st_mtime_ns),
@@ -1444,7 +1581,7 @@ def _run_single_split_staged(cfg: PipelineConfig, *, out_root: Path, start_trade
         # Rebuild train report from disk artifacts without rerunning data prep or training.
         meta_path = Path(out_root) / "artifacts" / "npz" / "meta.yaml"
         prep = _load_prep_summary_from_meta(meta_path)
-        qconf = _build_qmodel_config(cfg, feature_dim=len(prep["feature_names"]), run_root=Path(out_root))
+        qconf = _build_qmodel_config(cfg, feature_dim=len(prep["feature_names"]), run_root=Path(out_root), train_rows=int(prep["train_rows"]))
         ckpt_iters = _list_checkpoint_iters(Path(out_root))
         best_it, val_metrics_by_it = _load_val_metrics_from_disk(Path(out_root), ckpt_iters)
         run_train_report_stage(
@@ -1490,7 +1627,7 @@ def _run_single_split_staged(cfg: PipelineConfig, *, out_root: Path, start_trade
         # Rebuild the test-evaluation report from an existing manifest without rerunning training or data clean.
         meta_path = Path(out_root) / "artifacts" / "npz" / "meta.yaml"
         prep = _load_prep_summary_from_meta(meta_path)
-        qconf = _build_qmodel_config(cfg, feature_dim=len(prep["feature_names"]), run_root=Path(out_root))
+        qconf = _build_qmodel_config(cfg, feature_dim=len(prep["feature_names"]), run_root=Path(out_root), train_rows=int(prep["train_rows"]))
         ckpt_iters = _list_checkpoint_iters(Path(out_root))
         best_it, _val_metrics_by_it = _load_val_metrics_from_disk(Path(out_root), ckpt_iters)
         test_manifest_path = run_test_evaluation_stage(cfg, out_root=out_root, qconf=qconf, best_it=int(best_it), require_existing_eval=True)
@@ -1505,7 +1642,7 @@ def _default_config() -> PipelineConfig:
     # Define a small default experiment that is GPU-feasible while remaining fully general.
     return PipelineConfig(
         pipeline_mode="train_full",
-        root_dir=Path("outputs") / "upgrade_20260328_gru_seq60_h10",
+        root_dir=Path("/data-cache/nn"),
         stock1m_dir=Path("/data/ashare/market/stock1m"),
         start_trade_date=20210104,
         end_trade_date=20241231,
@@ -1533,8 +1670,8 @@ def _default_config() -> PipelineConfig:
         data_prep_workers=32,
         batch_size=4096,
         num_workers=4,
-        num_iters=80000,
-        save_every=5000,
+        num_iters=140001,
+        save_every=35000,
         eval_every=10000,
         eval_during=False,
         eval_during_num_iters=0,
@@ -1543,8 +1680,8 @@ def _default_config() -> PipelineConfig:
         hidden_dims=[512, 512],
         dropout=0.0,
         input_window_size=60,
-        rolling_window=1000,
-        rolling_step=10,
+        rolling_window=2000,
+        rolling_step=50,
     )
 
 
@@ -1559,8 +1696,8 @@ def main() -> None:
 
 def _run_pipeline_with_split_runner(cfg: PipelineConfig, split_runner) -> None:
     """Resolve split policy and dispatch one runner per resolved split."""
-    # Redirect the configured root_dir into /data-cache for all intermediate artifacts.
-    root_dir = _redirect_to_data_cache(Path(cfg.root_dir))
+    # Resolve a dated run root under /data-cache/nn so artifacts are grouped by day.
+    root_dir = _resolve_data_cache_nn_root_dir(Path(cfg.root_dir), pipeline_mode=str(cfg.pipeline_mode))
 
     # List all available trade dates in the configured range.
     probe = DataPrepConfig(
@@ -1667,7 +1804,7 @@ def _run_pipeline_with_split_runner(cfg: PipelineConfig, split_runner) -> None:
 
 
 def run_pipeline(cfg: PipelineConfig) -> None:
-    """Execute the staged pipeline under /data-cache based on cfg.pipeline_mode."""
+    """Execute the staged pipeline under /data-cache/nn based on cfg.pipeline_mode."""
     # Dispatch split execution through the staged runner so predict work is optional.
     _run_pipeline_with_split_runner(cfg, _run_single_split_staged)
 
