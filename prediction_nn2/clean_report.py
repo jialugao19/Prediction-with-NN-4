@@ -72,9 +72,9 @@ def render_clean_report_from_meta(meta_path: Path) -> Path:
         ("val_rows", str(int(groups["val"]["rows"]))),
         ("test_rows", str(int(groups["test"]["rows"]))),
     ]
-    if "predict" in groups:
-        # Record optional predict group stats when it exists.
-        summary_rows.append(("predict_rows", str(int(groups["predict"]["rows"]))))
+    for group_name in ["inference_train", "inference_val", "inference_test"]:
+        if group_name in groups:
+            summary_rows.append((f"{group_name}_rows", str(int(groups[group_name]["rows"]))))
 
     # Build the audit-rate rows as one vertical block.
     audit_rows = [

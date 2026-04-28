@@ -25,7 +25,13 @@ from qmodel.components.amp_scaler import MyScaler
 from qmodel.models import build_model
 
 from qmodel.config import QConfig
-from qmodel.core.predict_chunks import PredictChunkWriter
+from qmodel.core.predict_chunks import InferenceChunkWriter, LivePredictChunkWriter, PredictChunkWriter
+
+
+def _is_prediction_group(group: str) -> bool:
+    """Return whether one dataset group should behave like prediction-only inference."""
+    # Treat both the legacy predict group and formal inference_* groups as prediction-only.
+    return str(group) == "predict" or str(group).startswith("inference_")
 
 
 class Inferencer(AsyncInference):
@@ -51,7 +57,8 @@ class Evaluator:
     ):
         """Initialize an evaluator for one dataset group."""
         # Initialize evaluator for a dataset split and optional TensorBoard writer.
-        assert group in ["train", "test", "val", "predict"]
+        if not isinstance(group, str) or len(group) == 0:
+            raise RuntimeError(f"Invalid evaluator group: {group}")
         self.config = config
         self.group  = group
         self.enable_logging = enable_logging
@@ -68,7 +75,7 @@ class Evaluator:
         self._pending_metrics_namespace: str | None = None
 
         # Disable metrics logging for predict to keep outputs clean.
-        if not enable_logging or group == "predict":
+        if not enable_logging or _is_prediction_group(str(group)):
             self._owns_writer = False
             self.writer = writer
         else:
@@ -334,6 +341,182 @@ class Evaluator:
 
         return Path(manifest_path)
 
+    def _run_live_predict_inference_to_manifest(self, *, it: int, n_iter: int, iter_dir: Path) -> Path:
+        """Run predict inference and stream legacy live-style outputs to parquet chunks."""
+        # Require a single-rank predict path so the legacy live manifest stays globally consistent.
+        if self.ddp_enabled:
+            raise RuntimeError("Streaming live predict chunks require non-DDP execution.")
+
+        # Build model/inferencer/dataloader for the predict group and checkpoint.
+        config = self.config
+        device = self.config.device
+        amp_scaler = MyScaler(config.use_amp, config.amp_dtype)
+        model = build_model(config.model_class, config.model).to(device=device, dtype=config.eval_dtype)
+        do_profile = config.profiler.profile_section == "eval"
+        profiler = MyProfiler(real_run=do_profile, config=config.profiler)
+        dataloader = setup_eval_dataloader(self.config, self.group, shuffle=False)
+
+        # Load model weights from checkpoint and create a legacy live chunk writer.
+        ckpt = Path(self.config.root_dir) / "ckpt" / f"iter_{it}.pt"
+        logger.info(f"Evaluating checkpoint: {ckpt}, iter {it}, group={self.group}, rank={self.rank}/{self.world_size}")
+        self.checkpointer.load(ckpt, model, None, None, None)
+        chunk_row_count = int(self.config.evaluator.predict_chunk_row_count)
+        writer = LivePredictChunkWriter(
+            iter_dir=Path(iter_dir),
+            it=int(it),
+            chunk_row_count=int(chunk_row_count),
+            group=str(self.group),
+        )
+
+        # Define an inferencer that writes each batch into the legacy live chunk writer.
+        class _LivePredictInferencer(AsyncInference):
+            def __init__(self, **kwargs):
+                """Initialize the inferencer with an external legacy live chunk writer."""
+                # Store writer so post-step can flush batches to disk.
+                self._writer = kwargs.pop("writer")
+                super().__init__(**kwargs)
+
+            def _pre_step(self, curr_it: int):
+                """Run no-op per-step hooks for legacy live predict mode."""
+                # Keep this hook explicit to match AsyncInference protocol.
+                return None
+
+            def _post_step(self, res, buffer, target, other_meta, curr_it):
+                """Write one batch into legacy live parquet chunk buffers."""
+                # Append the batch into the streaming writer immediately.
+                pred_raw, _ = self_outer._inverse_label_tensors(buffer, target)
+                self._writer.append(pred_raw, other_meta)
+
+        # Capture the outer evaluator so the nested inferencer can reuse label inverse-transform logic.
+        self_outer = self
+
+        inferencer = _LivePredictInferencer(
+            model=model,
+            dataloader=dataloader,
+            device=device,
+            amp_scaler=amp_scaler,
+            profiler=profiler,
+            timer_window_size=int(self.config.log_every),
+            writer=writer,
+        )
+
+        # Determine evaluation length with a strict min cap.
+        if n_iter == 0:
+            n_iter = len(dataloader)
+        n_iter = min(int(n_iter), len(dataloader))
+
+        # Run inference; post-step writes chunks asynchronously and flushes before return.
+        _ = inferencer.run(n_iter=n_iter, use_tqdm=self.enable_logging and self.rank == 0)
+        logger.info("finish running legacy live inference")
+        manifest_path = writer.close()
+        logger.info("finish streaming legacy live predict chunks")
+
+        # Emit a perf-focused console summary line for predict as well.
+        if self.rank == 0 or self.console_log_all_ranks:
+            means = inferencer.timer.means()
+            nvml = self._nvml.snapshot()
+            torch_mem = torch_cuda_mem_snapshot(device)
+            line = format_eval_perf_line(
+                it=int(it),
+                group=str(self.group),
+                data_ms=float(means.data_ms),
+                model_ms=float(means.model_ms),
+                rank=int(self.rank),
+                nvml=nvml,
+                torch_mem=torch_mem,
+            )
+            logger.info(line)
+
+        return Path(manifest_path)
+
+    def _run_inference_to_manifest(self, *, it: int, n_iter: int, iter_dir: Path) -> Path:
+        """Run predict inference and stream formal inference outputs to parquet chunks with a manifest."""
+        # Require a single-rank inference path so the manifest stays globally consistent.
+        if self.ddp_enabled:
+            raise RuntimeError("Streaming inference chunks require non-DDP execution.")
+
+        # Build model/inferencer/dataloader for the selected inference group and checkpoint.
+        config = self.config
+        device = self.config.device
+        amp_scaler = MyScaler(config.use_amp, config.amp_dtype)
+        model = build_model(config.model_class, config.model).to(device=device, dtype=config.eval_dtype)
+        do_profile = config.profiler.profile_section == "eval"
+        profiler = MyProfiler(real_run=do_profile, config=config.profiler)
+        dataloader = setup_eval_dataloader(self.config, self.group, shuffle=False)
+
+        # Load model weights from checkpoint and create an inference chunk writer.
+        ckpt = Path(self.config.root_dir) / "ckpt" / f"iter_{it}.pt"
+        logger.info(f"Evaluating checkpoint: {ckpt}, iter {it}, group={self.group}, rank={self.rank}/{self.world_size}")
+        self.checkpointer.load(ckpt, model, None, None, None)
+        chunk_row_count = int(self.config.evaluator.predict_chunk_row_count)
+        writer = InferenceChunkWriter(
+            iter_dir=Path(iter_dir),
+            it=int(it),
+            chunk_row_count=int(chunk_row_count),
+            group=str(self.group),
+        )
+
+        # Define an inferencer that writes each batch into the inference chunk writer.
+        class _InferenceInferencer(AsyncInference):
+            def __init__(self, **kwargs):
+                """Initialize the inferencer with an external inference chunk writer."""
+                # Store writer so post-step can flush batches to disk.
+                self._writer = kwargs.pop("writer")
+                super().__init__(**kwargs)
+
+            def _pre_step(self, curr_it: int):
+                """Run no-op per-step hooks for inference mode."""
+                # Keep this hook explicit to match AsyncInference protocol.
+                return None
+
+            def _post_step(self, res, buffer, target, other_meta, curr_it):
+                """Write one batch into inference parquet chunk buffers."""
+                # Append the batch into the streaming writer immediately.
+                pred_raw, _ = self_outer._inverse_label_tensors(buffer, target)
+                self._writer.append(pred_raw, other_meta)
+
+        # Capture the outer evaluator so the nested inferencer can reuse label inverse-transform logic.
+        self_outer = self
+
+        inferencer = _InferenceInferencer(
+            model=model,
+            dataloader=dataloader,
+            device=device,
+            amp_scaler=amp_scaler,
+            profiler=profiler,
+            timer_window_size=int(self.config.log_every),
+            writer=writer,
+        )
+
+        # Determine inference length with a strict min cap.
+        if n_iter == 0:
+            n_iter = len(dataloader)
+        n_iter = min(int(n_iter), len(dataloader))
+
+        # Run inference; post-step writes chunks asynchronously and flushes before return.
+        _ = inferencer.run(n_iter=n_iter, use_tqdm=self.enable_logging and self.rank == 0)
+        logger.info("finish running inference")
+        manifest_path = writer.close()
+        logger.info("finish streaming inference chunks")
+
+        # Emit a perf-focused console summary line for inference as well.
+        if self.rank == 0 or self.console_log_all_ranks:
+            means = inferencer.timer.means()
+            nvml = self._nvml.snapshot()
+            torch_mem = torch_cuda_mem_snapshot(device)
+            line = format_eval_perf_line(
+                it=int(it),
+                group=str(self.group),
+                data_ms=float(means.data_ms),
+                model_ms=float(means.model_ms),
+                rank=int(self.rank),
+                nvml=nvml,
+                torch_mem=torch_mem,
+            )
+            logger.info(line)
+
+        return Path(manifest_path)
+
 
     def _finish_pending_metrics(self, *, block: bool) -> dict[str, float]:
         """Join and log one pending metrics job if it has completed."""
@@ -396,8 +579,11 @@ class Evaluator:
         # Resolve the iter output directory early so predict can write its manifest there.
         iter_dir = self._eval_iter_dir(it)
         iter_dir.mkdir(parents=True, exist_ok=True)
-        if self.group == "predict":
-            self._run_predict_inference_to_manifest(it=int(it), n_iter=int(n_iter), iter_dir=Path(iter_dir))
+        if _is_prediction_group(str(self.group)):
+            if str(self.group) == "predict":
+                self._run_predict_inference_to_manifest(it=int(it), n_iter=int(n_iter), iter_dir=Path(iter_dir))
+            else:
+                self._run_inference_to_manifest(it=int(it), n_iter=int(n_iter), iter_dir=Path(iter_dir))
         else:
             # Run inference and write a per-rank shard feather.
             shard_path = iter_dir / f"rank{self.rank}.feather"
@@ -409,7 +595,7 @@ class Evaluator:
             barrier()
 
         # Skip metric logging for predict runs to reduce noise and overhead.
-        if self.group == "predict":
+        if _is_prediction_group(str(self.group)):
             if wait_metrics and self.ddp_enabled:
                 barrier()
             return {}

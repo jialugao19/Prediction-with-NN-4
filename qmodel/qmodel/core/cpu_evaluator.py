@@ -15,7 +15,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from qmodel.components.amp_scaler import MyScaler
 from qmodel.components.checkpoint import CheckpointSaver
-from qmodel.core.predict_chunks import PredictChunkWriter
+from qmodel.core.predict_chunks import InferenceChunkWriter, LivePredictChunkWriter, PredictChunkWriter
 from qmodel.data.dataloader import setup_eval_dataloader
 from qmodel.distributed import barrier, get_ddp_state
 from qmodel.logger import logger
@@ -26,6 +26,12 @@ from qmodel.models import build_model
 from qmodel.util import merge_date_time_dataframe
 
 from qmodel.config import QConfig
+
+
+def _is_prediction_group(group: str) -> bool:
+    """Return whether one dataset group should behave like prediction-only inference."""
+    # Treat both the legacy predict group and formal inference_* groups as prediction-only.
+    return str(group) == "predict" or str(group).startswith("inference_")
 
 
 class CpuEvaluator:
@@ -40,7 +46,7 @@ class CpuEvaluator:
     ) -> None:
         """Initialize evaluator state and optional TensorBoard writer."""
         # Validate group and store core knobs.
-        if str(group) not in ["train", "test", "val", "predict"]:
+        if not isinstance(group, str) or len(group) == 0:
             raise RuntimeError(f"Invalid group: {group}")
         self.config = config
         self.group = str(group)
@@ -57,7 +63,7 @@ class CpuEvaluator:
         self.checkpointer = CheckpointSaver(config.root_dir, config, device=torch.device(config.device))
 
         # Manage the TensorBoard writer ownership like the CUDA evaluator does.
-        if (not self.enable_logging) or self.group == "predict":
+        if (not self.enable_logging) or _is_prediction_group(self.group):
             self._owns_writer = False
             self.writer = writer
         else:
@@ -235,6 +241,95 @@ class CpuEvaluator:
         logger.info("finish streaming predict chunks")
         return Path(manifest_path)
 
+    def _run_live_predict_inference_to_manifest(self, *, it: int, n_iter: int, iter_dir: Path) -> Path:
+        """Run CPU predict inference and stream legacy live-style outputs to parquet chunks."""
+        # Require a single-rank predict path so the legacy live manifest stays globally consistent.
+        if self.ddp_enabled:
+            raise RuntimeError("Streaming live predict chunks require non-DDP execution.")
+
+        # Build model and load checkpoint weights.
+        config = self.config
+        device = torch.device(config.device)
+        if device.type != "cpu":
+            raise RuntimeError(f"CpuEvaluator requires CPU device, got: {device}")
+
+        amp_scaler = MyScaler(config.use_amp, config.amp_dtype)
+        model = build_model(config.model_class, config.model).to(device=device, dtype=config.eval_dtype)
+        ckpt_path = Path(config.root_dir) / "ckpt" / f"iter_{int(it)}.pt"
+        self.checkpointer.load(ckpt_path, model, None, None, amp_scaler)
+        model.eval()
+
+        # Create a legacy live chunk writer rooted at the iter directory.
+        chunk_row_count = int(self.config.evaluator.predict_chunk_row_count)
+        writer = LivePredictChunkWriter(
+            iter_dir=Path(iter_dir),
+            it=int(it),
+            chunk_row_count=int(chunk_row_count),
+            group=str(self.group),
+        )
+
+        # Iterate over batches and append directly into the legacy live writer.
+        dataloader = setup_eval_dataloader(config, group=self.group, shuffle=False)
+        with torch.no_grad():
+            for step_idx, batch in enumerate(dataloader):
+                # Stop early when n_iter is configured for partial eval.
+                if int(n_iter) > 0 and int(step_idx) >= int(n_iter):
+                    break
+
+                # Run forward pass and stream the CPU outputs into parquet buffers.
+                data, target, meta = batch
+                out = model(data.to(device))
+                pred_raw, _ = self._inverse_label_tensors(out.detach().cpu(), target.detach().cpu())
+                writer.append(pred_raw, meta.detach().cpu())
+
+        # Close the writer and return the manifest path for downstream report code.
+        manifest_path = writer.close()
+        logger.info("finish streaming legacy live predict chunks")
+        return Path(manifest_path)
+
+    def _run_inference_to_manifest(self, *, it: int, n_iter: int, iter_dir: Path) -> Path:
+        """Run CPU inference and stream formal inference outputs to parquet chunks with a manifest."""
+        # Require a single-rank inference path so the manifest stays globally consistent.
+        if self.ddp_enabled:
+            raise RuntimeError("Streaming inference chunks require non-DDP execution.")
+
+        # Build model and load checkpoint weights.
+        config = self.config
+        device = torch.device(config.device)
+        if device.type != "cpu":
+            raise RuntimeError(f"CpuEvaluator requires CPU device, got: {device}")
+
+        amp_scaler = MyScaler(config.use_amp, config.amp_dtype)
+        model = build_model(config.model_class, config.model).to(device=device, dtype=config.eval_dtype)
+        ckpt_path = Path(config.root_dir) / "ckpt" / f"iter_{int(it)}.pt"
+        self.checkpointer.load(ckpt_path, model, None, None, amp_scaler)
+        model.eval()
+
+        # Create an inference chunk writer rooted at the iter directory.
+        chunk_row_count = int(self.config.evaluator.predict_chunk_row_count)
+        writer = InferenceChunkWriter(
+            iter_dir=Path(iter_dir),
+            it=int(it),
+            chunk_row_count=int(chunk_row_count),
+            group=str(self.group),
+        )
+
+        # Iterate over batches and append directly into the inference writer.
+        dataloader = setup_eval_dataloader(config, group=self.group, shuffle=False)
+        with torch.no_grad():
+            for step_idx, batch in enumerate(dataloader):
+                if int(n_iter) > 0 and int(step_idx) >= int(n_iter):
+                    break
+                data, target, meta = batch
+                out = model(data.to(device))
+                pred_raw, _ = self._inverse_label_tensors(out.detach().cpu(), target.detach().cpu())
+                writer.append(pred_raw, meta.detach().cpu())
+
+        # Close the writer and return the manifest path for downstream report code.
+        manifest_path = writer.close()
+        logger.info("finish streaming inference chunks")
+        return Path(manifest_path)
+
     def _finish_pending_metrics(self, *, block: bool) -> dict[str, float]:
         """Join and log one pending metrics job if it has completed."""
         # Return early when there is no pending job.
@@ -292,8 +387,11 @@ class CpuEvaluator:
         # Resolve the iter output directory early so predict can write its manifest there.
         iter_dir = self._eval_iter_dir(int(it))
         iter_dir.mkdir(parents=True, exist_ok=True)
-        if self.group == "predict":
-            self._run_predict_inference_to_manifest(it=int(it), n_iter=int(n_iter), iter_dir=Path(iter_dir))
+        if _is_prediction_group(self.group):
+            if self.group == "predict":
+                self._run_predict_inference_to_manifest(it=int(it), n_iter=int(n_iter), iter_dir=Path(iter_dir))
+            else:
+                self._run_inference_to_manifest(it=int(it), n_iter=int(n_iter), iter_dir=Path(iter_dir))
         else:
             # Run inference and write per-rank shard feather.
             shard_path = iter_dir / f"rank{int(self.rank)}.feather"
@@ -305,7 +403,7 @@ class CpuEvaluator:
             barrier()
 
         # Skip metric logging for predict runs to keep outputs clean.
-        if self.group == "predict":
+        if _is_prediction_group(self.group):
             if wait_metrics and self.ddp_enabled:
                 barrier()
             return {}
