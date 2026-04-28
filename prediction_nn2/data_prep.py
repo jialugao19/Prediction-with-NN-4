@@ -61,7 +61,7 @@ class DataPrepConfig:
     heavy_tanh_c: float
     add_is_zero_features: bool
     include_session_id: bool
-    include_predict_split: bool
+    include_inference_splits: bool
     norm_fit_scope: str
     label_norm: str
     label_norm_fit_scope: str
@@ -152,70 +152,8 @@ def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[p
     raw_fwd["raw_has_fwd_minute"] = 1
     raw_fwd = raw_fwd.drop_duplicates(list(raw_keys), keep="first").reset_index(drop=True)
 
-    # Drop invalid price rows so log/ratio transforms are well-defined.
-    df = df.copy()
-    close = df["Close"].to_numpy(dtype=float)
-    open_ = df["Open"].to_numpy(dtype=float)
-    high = df["High"].to_numpy(dtype=float)
-    low = df["Low"].to_numpy(dtype=float)
-    vol = df["Vol"].to_numpy(dtype=float)
-    amount = df["Amount"].to_numpy(dtype=float)
-    m_price = np.isfinite(close) & np.isfinite(open_) & np.isfinite(high) & np.isfinite(low)
-    m_price &= np.isfinite(vol) & np.isfinite(amount)
-    m_price &= (close > 0.0) & (open_ > 0.0) & (high > 0.0) & (low > 0.0)
-    m_price &= (vol >= 0.0) & (amount >= 0.0)
-    df = df.loc[m_price].reset_index(drop=True)
-
-    # Compute log prices to define return-like features and labels.
-    df["log_close"] = np.log(df["Close"].to_numpy(dtype=float))
-
-    # Compute within-stock intraday returns as simple derived features.
-    g = df.groupby("StockCode", sort=False)
-    df["ret_1m"] = g["log_close"].diff(1)
-    df["ret_5m"] = g["log_close"].diff(5)
-    df["ret_2m"] = g["log_close"].diff(2)
-    df["ret_3m"] = g["log_close"].diff(3)
-    df["ret_10m"] = g["log_close"].diff(10)
-
-    # Compute price-shape and activity features without rank transforms.
-    df["hl"] = np.log(df["High"].to_numpy(dtype=float) / df["Low"].to_numpy(dtype=float))
-    df["oc"] = np.log(df["Close"].to_numpy(dtype=float) / df["Open"].to_numpy(dtype=float))
-    df["log_vol"] = np.log(df["Vol"].to_numpy(dtype=float) + 1.0)
-    df["log_amount"] = np.log(df["Amount"].to_numpy(dtype=float) + 1.0)
-    df["minute_norm"] = df["MinuteIndex"].to_numpy(dtype=float) / 240.0
-    df["session_minute_norm"] = (df["MinuteIndex"].to_numpy(dtype=int) % 120).astype(float) / 120.0
-
-    # Compute longer-window volatility and activity summaries per stock.
-    # Compute sub-10-minute volatility and activity summaries per stock.
-    df["vol_10m"] = g["ret_1m"].rolling(window=10, min_periods=2).std(ddof=0).reset_index(level=0, drop=True)
-    df["log_vol_5m_mean"] = g["log_vol"].rolling(window=5, min_periods=1).mean().reset_index(level=0, drop=True)
-    df["log_amount_5m_mean"] = g["log_amount"].rolling(window=5, min_periods=1).mean().reset_index(level=0, drop=True)
-
-    # Optionally attach the session_id feature, which is removed by default per spec.
-    if bool(config.include_session_id):
-        df["session_id"] = (df["MinuteIndex"].to_numpy(dtype=int) >= 120).astype(float)
-
-    # Apply monotonic heavy-tail transforms so NN training is numerically stable.
-    if bool(config.use_ret_signed_log1p):
-        # Compress return tails with a signed log1p map while preserving order and sign.
-        for name in list(_RET_FEATURES):
-            v = df[str(name)].to_numpy(dtype=float, copy=False)
-            df[str(name)] = (np.sign(v) * np.log1p(np.abs(v))).astype(np.float32, copy=False)
-    if bool(config.use_heavy_tanh):
-        # Squash heavy-tail price-shape/vol features with tanh(x/c) and a fixed positive c.
-        c = float(config.heavy_tanh_c)
-        for name in list(_HEAVY_TAIL_FEATURES):
-            v = df[str(name)].to_numpy(dtype=float, copy=False)
-            df[str(name)] = np.tanh(v / c).astype(np.float32, copy=False)
-
-    # Optionally add mass-at-zero indicator features without zscore participation.
-    is_zero_cols: list[str] = []
-    if bool(config.add_is_zero_features):
-        # Create one binary is_zero feature per configured source column.
-        for src in list(_IS_ZERO_SOURCE_FEATURES):
-            out_name = f"{str(src)}_is_zero"
-            is_zero_cols.append(str(out_name))
-            df[str(out_name)] = (df[str(src)].to_numpy(dtype=float, copy=False) == 0.0).astype(np.float32, copy=False)
+    # Compute feature columns before applying any label-based filtering.
+    df, feat_cols = _compute_feature_frame(df, config)
 
     # Align forward log_close by joining on (StockCode, Date, MinuteIndex+h) to avoid shift jumps on missing minutes.
     keys = ["StockCode", "Date", "MinuteIndex"]
@@ -229,11 +167,6 @@ def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[p
     pre_drop_rows = int(df.shape[0])
     df = df.loc[df["MinuteIndex"].to_numpy(dtype=int) <= int(239 - h)].reset_index(drop=True)
     dropped_last_h_rows = int(pre_drop_rows - int(df.shape[0]))
-
-    # Prepare the ordered feature/label columns for invalid-value accounting.
-    feat_cols = list(_STOCK_FEATURES) + list(is_zero_cols) + list(_TIME_FEATURES)
-    if bool(config.include_session_id):
-        feat_cols = list(_STOCK_FEATURES) + list(is_zero_cols) + ["minute_norm", "session_id", "session_minute_norm"]
 
     # Summarize NaN/inf statistics before dropping invalid rows.
     need = feat_cols + ["label_ret"]
@@ -274,6 +207,124 @@ def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[p
         "feature_warmup_minutes": int(_FEATURE_WARMUP_MINUTES),
     }
     return df, invalid_feature_stats, audit
+
+
+def _compute_feature_frame(df: pd.DataFrame, config: DataPrepConfig) -> tuple[pd.DataFrame, list[str]]:
+    """Compute model feature columns before any label-based row filtering."""
+    # Drop invalid price rows so log/ratio transforms are well-defined.
+    df = df.copy()
+    close = df["Close"].to_numpy(dtype=float)
+    open_ = df["Open"].to_numpy(dtype=float)
+    high = df["High"].to_numpy(dtype=float)
+    low = df["Low"].to_numpy(dtype=float)
+    vol = df["Vol"].to_numpy(dtype=float)
+    amount = df["Amount"].to_numpy(dtype=float)
+    m_price = np.isfinite(close) & np.isfinite(open_) & np.isfinite(high) & np.isfinite(low)
+    m_price &= np.isfinite(vol) & np.isfinite(amount)
+    m_price &= (close > 0.0) & (open_ > 0.0) & (high > 0.0) & (low > 0.0)
+    m_price &= (vol >= 0.0) & (amount >= 0.0)
+    df = df.loc[m_price].reset_index(drop=True)
+
+    # Compute log prices to define return-like features.
+    df["log_close"] = np.log(df["Close"].to_numpy(dtype=float))
+
+    # Compute within-stock intraday returns as simple derived features.
+    g = df.groupby("StockCode", sort=False)
+    df["ret_1m"] = g["log_close"].diff(1)
+    df["ret_5m"] = g["log_close"].diff(5)
+    df["ret_2m"] = g["log_close"].diff(2)
+    df["ret_3m"] = g["log_close"].diff(3)
+    df["ret_10m"] = g["log_close"].diff(10)
+
+    # Compute price-shape and activity features without rank transforms.
+    df["hl"] = np.log(df["High"].to_numpy(dtype=float) / df["Low"].to_numpy(dtype=float))
+    df["oc"] = np.log(df["Close"].to_numpy(dtype=float) / df["Open"].to_numpy(dtype=float))
+    df["log_vol"] = np.log(df["Vol"].to_numpy(dtype=float) + 1.0)
+    df["log_amount"] = np.log(df["Amount"].to_numpy(dtype=float) + 1.0)
+    df["minute_norm"] = df["MinuteIndex"].to_numpy(dtype=float) / 240.0
+    df["session_minute_norm"] = (df["MinuteIndex"].to_numpy(dtype=int) % 120).astype(float) / 120.0
+
+    # Compute longer-window volatility and activity summaries per stock.
+    df["vol_10m"] = g["ret_1m"].rolling(window=10, min_periods=2).std(ddof=0).reset_index(level=0, drop=True)
+    df["log_vol_5m_mean"] = g["log_vol"].rolling(window=5, min_periods=1).mean().reset_index(level=0, drop=True)
+    df["log_amount_5m_mean"] = g["log_amount"].rolling(window=5, min_periods=1).mean().reset_index(level=0, drop=True)
+
+    # Optionally attach the session_id feature, which is removed by default per spec.
+    if bool(config.include_session_id):
+        df["session_id"] = (df["MinuteIndex"].to_numpy(dtype=int) >= 120).astype(float)
+
+    # Apply monotonic heavy-tail transforms so NN training is numerically stable.
+    if bool(config.use_ret_signed_log1p):
+        for name in list(_RET_FEATURES):
+            v = df[str(name)].to_numpy(dtype=float, copy=False)
+            df[str(name)] = (np.sign(v) * np.log1p(np.abs(v))).astype(np.float32, copy=False)
+    if bool(config.use_heavy_tanh):
+        c = float(config.heavy_tanh_c)
+        for name in list(_HEAVY_TAIL_FEATURES):
+            v = df[str(name)].to_numpy(dtype=float, copy=False)
+            df[str(name)] = np.tanh(v / c).astype(np.float32, copy=False)
+
+    # Optionally add mass-at-zero indicator features without zscore participation.
+    is_zero_cols: list[str] = []
+    if bool(config.add_is_zero_features):
+        for src in list(_IS_ZERO_SOURCE_FEATURES):
+            out_name = f"{str(src)}_is_zero"
+            is_zero_cols.append(str(out_name))
+            df[str(out_name)] = (df[str(src)].to_numpy(dtype=float, copy=False) == 0.0).astype(np.float32, copy=False)
+
+    # Resolve the ordered feature list used by downstream filtering and export.
+    feat_cols = list(_STOCK_FEATURES) + list(is_zero_cols) + list(_TIME_FEATURES)
+    if bool(config.include_session_id):
+        feat_cols = list(_STOCK_FEATURES) + list(is_zero_cols) + ["minute_norm", "session_id", "session_minute_norm"]
+    return df, feat_cols
+
+
+def _build_single_day_inference_table(trade_date: int, config: DataPrepConfig) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Build one inference day dataframe without label-based filtering."""
+    # Track raw row count to quantify feature-only filtering.
+    day_raw = _read_stock1m_day(int(trade_date), config)
+    raw_rows = int(day_raw.shape[0])
+
+    # Compute feature columns without requiring any future label availability.
+    day_feat, feat_cols = _compute_feature_frame(day_raw, config)
+
+    # Keep only rows whose feature vector is fully finite.
+    m = np.ones((day_feat.shape[0],), dtype=bool)
+    for c in list(feat_cols):
+        v = day_feat[str(c)].to_numpy(dtype=float, copy=False)
+        m &= np.isfinite(v)
+    day_feat = day_feat.loc[m].reset_index(drop=True)
+    kept_rows = int(day_feat.shape[0])
+
+    # Apply the configured stock-feature transform on each minute cross-section.
+    if bool(config.use_cross_sectional_gaussianize):
+        day_feat_out = _cross_sectional_gaussianize(day_feat, list(_STOCK_FEATURES))
+    else:
+        day_feat_out = day_feat
+
+    # Attach date/time integer columns and keep only schema columns.
+    day_norm = _date_time_int_columns(day_feat_out)
+    stock_feature_names = _stock_feature_output_names(config)
+    is_zero_feature_names = _is_zero_feature_output_names(config)
+    time_feature_names = _time_feature_output_names(config)
+    keep_cols = (
+        ["StockCode", "DateTime", "Date", "MinuteIndex"]
+        + list(stock_feature_names)
+        + list(is_zero_feature_names)
+        + list(time_feature_names)
+        + ["date_int", "time_int"]
+    )
+    day_out = day_norm.loc[:, keep_cols].reset_index(drop=True)
+
+    # Assemble an explicit per-day audit record for cross-period aggregation.
+    audit = {
+        "trade_date": int(trade_date),
+        "raw_rows": int(raw_rows),
+        "kept_rows": int(kept_rows),
+        "sampled_rows": int(day_out.shape[0]),
+        "out_rows": int(day_out.shape[0]),
+    }
+    return day_out, audit
 
 
 def _collect_invalid_feature_stats(df: pd.DataFrame, feat_cols: list[str], label_col: str) -> list[dict[str, object]]:
@@ -1324,17 +1375,147 @@ def _build_single_day_table_task(args: tuple[int, DataPrepConfig]) -> tuple[pd.D
     return _build_single_day_table(int(trade_date), config)
 
 
+def _build_single_day_inference_table_task(args: tuple[int, DataPrepConfig]) -> tuple[pd.DataFrame, dict[str, object]]:
+    """Unpack starmap-style args so Pool.imap can stream inference day results."""
+    # Unpack task tuple and delegate into the core inference per-day builder.
+    trade_date, config = args
+    return _build_single_day_inference_table(int(trade_date), config)
+
+
 def _data_prep_iterator(
     pool: mp.pool.Pool | None,
     tasks: list[tuple[int, DataPrepConfig]],
+    task_fn,
 ):
     """Build the day-result iterator used by data prep."""
     # Run sequentially when workers=1 so debugging and local repro stay simple.
     if pool is None:
-        return map(_build_single_day_table_task, list(tasks))
+        return map(task_fn, list(tasks))
 
     # Stream one day at a time from worker processes to bound parent memory.
-    return pool.imap(_build_single_day_table_task, list(tasks), chunksize=1)
+    return pool.imap(task_fn, list(tasks), chunksize=1)
+
+
+def _audit_rates(a: dict[str, object]) -> dict[str, float]:
+    """Convert raw/kept/sampled counters into float rates."""
+    # Compute kept and sampled rates with explicit float conversions.
+    raw = float(a["raw_rows"])
+    kept = float(a["kept_rows"])
+    sampled = float(a["sampled_rows"])
+    return {
+        "kept_rate": float(kept / raw),
+        "sampled_rate_vs_kept": float(sampled / kept),
+        "sampled_rate_vs_raw": float(sampled / raw),
+    }
+
+
+def _inference_group_contract(group_name: str, source_split: str, date_list: list[int]) -> dict[str, object]:
+    """Describe one formal inference group contract."""
+    # Record the sample definition so old label-filtered groups can be detected.
+    return {
+        "type": "feature_only_inference_split",
+        "group": str(group_name),
+        "source_split": str(source_split),
+        "dates": [int(d) for d in list(date_list)],
+        "uses_label_filter": False,
+        "uses_sampling": False,
+        "target_placeholder": "nan",
+    }
+
+
+def _inference_split_specs(train_dates: list[int], val_dates: list[int], test_dates: list[int]) -> list[tuple[str, list[int], str]]:
+    """Return the formal inference split specification list."""
+    # Define the stable inference split ordering once.
+    return [
+        ("inference_train", [int(d) for d in list(train_dates)], "train"),
+        ("inference_val", [int(d) for d in list(val_dates)], "val"),
+        ("inference_test", [int(d) for d in list(test_dates)], "test"),
+    ]
+
+
+def _load_pooled_zscore_params(stats_path: Path, feature_names: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Load pooled feature zscore parameters from YAML."""
+    # Parse the YAML payload and validate the stored feature order.
+    import yaml
+
+    payload = yaml.safe_load(Path(stats_path).read_text(encoding="utf-8"))
+    rows = list(payload["features"])
+    stored_names = [str(row["feature"]) for row in list(rows)]
+    if list(stored_names) != list(feature_names):
+        raise RuntimeError(f"Pooled zscore feature order mismatch: stored={stored_names} expected={feature_names}")
+
+    # Materialize the mean/std vectors aligned with feature_names.
+    mean = np.asarray([float(row["mean"]) for row in list(rows)], dtype=np.float32)
+    std = np.asarray([float(row["std"]) for row in list(rows)], dtype=np.float32)
+    return mean, std
+
+
+def _materialize_inference_group(
+    config: DataPrepConfig,
+    group_name: str,
+    date_list: list[int],
+    npz_dir: Path,
+    feature_names: list[str],
+    feature_mean: np.ndarray | None,
+    feature_std: np.ndarray | None,
+) -> tuple[int, list[dict[str, object]], dict[str, object]]:
+    """Materialize one formal inference group from raw split dates."""
+    # Resolve worker setup before launching a bounded second pass over test dates.
+    workers = int(config.workers)
+    start_method = "spawn"
+    ctx = mp.get_context(str(start_method))
+    pool = ctx.Pool(processes=int(workers)) if int(workers) > 1 else None
+    try:
+        # Stream day-level inference tables and write one raw binary group.
+        t0 = time.time()
+        tasks = [(int(d), config) for d in list(date_list)]
+        it = _data_prep_iterator(pool, tasks, _build_single_day_inference_table_task)
+        infer_x = Path(npz_dir) / f"{str(group_name)}_x.f32"
+        infer_y = Path(npz_dir) / f"{str(group_name)}_y.f32"
+        infer_m = Path(npz_dir) / f"{str(group_name)}_meta.i64"
+        rows = 0
+        audits: list[dict[str, object]] = []
+        with open(infer_x, "wb") as out_x, open(infer_y, "wb") as out_y, open(infer_m, "wb") as out_m:
+            for i, (day_df, audit) in enumerate(it, start=1):
+                # Convert the per-day dataframe into arrays and apply the training zscore when needed.
+                x_day = day_df[feature_names].to_numpy(dtype=np.float32, copy=False)
+                if feature_mean is not None and feature_std is not None:
+                    x_day = _standardize(x_day, feature_mean, feature_std)
+                y_day = np.full((int(x_day.shape[0]), 1), np.nan, dtype=np.float32)
+                meta_day = day_df[["StockCode", "date_int", "time_int"]].to_numpy(dtype=np.int64, copy=False)
+                x_day.tofile(out_x)
+                y_day.tofile(out_y)
+                meta_day.tofile(out_m)
+
+                # Track split-level counters for audit aggregation.
+                rows += int(x_day.shape[0])
+                audits.append(dict(audit))
+
+                # Print coarse-grained progress so long inference builds are observable in logs.
+                if int(i) == 1 or int(i) % 20 == 0 or int(i) == int(len(date_list)):
+                    print(f"[data_prep] tag={group_name} day={i}/{len(date_list)} rows={rows}", flush=True)
+        t1 = time.time()
+    finally:
+        # Close the worker pool on both success and failure to avoid leaking processes.
+        if pool is not None:
+            pool.close()
+            pool.join()
+
+    # Build split-level audit summary for metadata and report rendering.
+    raw_rows = int(sum(int(a["raw_rows"]) for a in list(audits)))
+    kept_rows = int(sum(int(a["kept_rows"]) for a in list(audits)))
+    sampled_rows = int(sum(int(a["sampled_rows"]) for a in list(audits)))
+    split_audit = {
+        "tag": str(group_name),
+        "workers": int(workers),
+        "days": int(len(date_list)),
+        "raw_rows": int(raw_rows),
+        "kept_rows": int(kept_rows),
+        "sampled_rows": int(sampled_rows),
+        "out_rows": int(rows),
+        "elapsed_seconds": float(t1 - t0),
+    }
+    return int(rows), audits, split_audit
 
 
 def _progress_metrics(
@@ -1446,6 +1627,11 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             raise RuntimeError("Existing meta.yaml is missing prep_config; cannot validate sampled data seed.")
         storage = dict(meta["storage"])
         groups = dict(storage["groups"])
+        inference_specs = _inference_split_specs(list(train_dates), list(val_dates), list(test_dates))
+        expected_inference_contracts = {
+            str(group_name): _inference_group_contract(str(group_name), str(source_split), list(date_list))
+            for group_name, date_list, source_split in list(inference_specs)
+        }
 
         # Ensure all referenced binary groups exist on disk before claiming completion.
         for group in list(groups.keys()):
@@ -1495,56 +1681,67 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             if not label_stats_path.exists():
                 raise RuntimeError(f"Missing label zscore params for existing meta.yaml: {label_stats_path}")
 
-        # Optionally materialize the predict split from existing train/val/test splits.
-        if bool(config.include_predict_split) and "predict" not in groups:
-            # Concatenate standardized group binaries into a single predict group.
-            import shutil
+        # Optionally materialize the formal inference splits from raw split dates.
+        if bool(config.include_inference_splits):
+            current_inference_contracts = dict(meta.get("inference_contracts", {}))
+            need_inference_rebuild = False
+            for group_name, _date_list, _source_split in list(inference_specs):
+                if str(group_name) not in groups:
+                    need_inference_rebuild = True
+                    break
+                if dict(current_inference_contracts.get(str(group_name), {})) != dict(expected_inference_contracts[str(group_name)]):
+                    need_inference_rebuild = True
+                    break
+            if need_inference_rebuild:
+                feature_mean: np.ndarray | None = None
+                feature_std: np.ndarray | None = None
+                if not bool(config.use_cross_sectional_gaussianize):
+                    pooled_stats_path = stats_dir / str(meta_stock_norm["params_path"])
+                    feature_mean, feature_std = _load_pooled_zscore_params(pooled_stats_path, list(feature_names))
 
-            train_rows = int(groups["train"]["rows"])
-            val_rows = int(groups["val"]["rows"])
-            test_rows = int(groups["test"]["rows"])
-            pred_rows = int(train_rows + val_rows + test_rows)
-            feature_dim = int(groups["train"]["feature_dim"])
-            if int(feature_dim) != int(len(feature_names)):
-                raise RuntimeError(f"meta feature_dim mismatch: meta={feature_dim} expected={len(feature_names)}")
+                # Remove legacy predict artifacts before rebuilding the formal inference groups.
+                groups.pop("predict", None)
+                meta.get("audit", {}).pop("predict", None)
+                meta.get("audit_rates", {}).pop("predict", None)
+                meta.get("dates", {}).pop("predict", None)
+                meta.get("audit_daily", {}).pop("predict", None)
+                for legacy_name in ["predict_x.f32", "predict_y.f32", "predict_meta.i64", "audit_daily_predict.yaml"]:
+                    legacy_path = npz_dir / legacy_name
+                    if legacy_path.exists():
+                        legacy_path.unlink()
 
-            # Copy the split binaries sequentially to keep IO streaming.
-            pred_x = npz_dir / "predict_x.f32"
-            pred_y = npz_dir / "predict_y.f32"
-            pred_m = npz_dir / "predict_meta.i64"
-            with open(pred_x, "wb") as out_x, open(pred_y, "wb") as out_y, open(pred_m, "wb") as out_m:
-                for tag in ["train", "val", "test"]:
-                    # Append one split file into the predict group.
-                    g = dict(groups[str(tag)])
-                    with open(npz_dir / str(g["x"]), "rb") as in_x:
-                        shutil.copyfileobj(in_x, out_x, length=16 * 1024 * 1024)
-                    with open(npz_dir / str(g["y"]), "rb") as in_y:
-                        shutil.copyfileobj(in_y, out_y, length=16 * 1024 * 1024)
-                    with open(npz_dir / str(g["meta"]), "rb") as in_meta:
-                        shutil.copyfileobj(in_meta, out_m, length=16 * 1024 * 1024)
-
-            # Extend meta.yaml to include the newly created predict group and audit summary.
-            predict_audit = {
-                "tag": "predict",
-                "workers": int(meta["audit"]["train"]["workers"]),
-                "days": int(meta["audit"]["train"]["days"]) + int(meta["audit"]["val"]["days"]) + int(meta["audit"]["test"]["days"]),
-                "raw_rows": int(meta["audit"]["train"]["raw_rows"]) + int(meta["audit"]["val"]["raw_rows"]) + int(meta["audit"]["test"]["raw_rows"]),
-                "kept_rows": int(meta["audit"]["train"]["kept_rows"]) + int(meta["audit"]["val"]["kept_rows"]) + int(meta["audit"]["test"]["kept_rows"]),
-                "sampled_rows": int(meta["audit"]["train"]["sampled_rows"]) + int(meta["audit"]["val"]["sampled_rows"]) + int(meta["audit"]["test"]["sampled_rows"]),
-                "out_rows": int(pred_rows),
-                "elapsed_seconds": float(meta["audit"]["train"]["elapsed_seconds"])
-                + float(meta["audit"]["val"]["elapsed_seconds"])
-                + float(meta["audit"]["test"]["elapsed_seconds"]),
-            }
-            groups["predict"] = {"rows": int(pred_rows), "feature_dim": int(feature_dim), "x": pred_x.name, "y": pred_y.name, "meta": pred_m.name}
-            meta["storage"]["groups"] = groups
-            meta["audit"]["predict"] = predict_audit
-            meta["audit_rates"]["predict"] = {
-                "kept_rate": float(predict_audit["kept_rows"]) / float(predict_audit["raw_rows"]),
-                "sampled_rate_vs_kept": float(predict_audit["sampled_rows"]) / float(predict_audit["kept_rows"]),
-                "sampled_rate_vs_raw": float(predict_audit["sampled_rows"]) / float(predict_audit["raw_rows"]),
-            }
-            meta["dates"]["predict"] = list(meta["dates"]["train"]) + list(meta["dates"]["val"]) + list(meta["dates"]["test"])
+                # Rebuild the formal inference groups so they no longer depend on label availability.
+                feature_dim = int(groups["train"]["feature_dim"])
+                meta["inference_contracts"] = {}
+                for group_name, date_list, source_split in list(inference_specs):
+                    rows, daily_audits, split_audit = _materialize_inference_group(
+                        config,
+                        str(group_name),
+                        list(date_list),
+                        npz_dir,
+                        list(feature_names),
+                        feature_mean,
+                        feature_std,
+                    )
+                    groups[str(group_name)] = {
+                        "rows": int(rows),
+                        "feature_dim": int(feature_dim),
+                        "x": f"{str(group_name)}_x.f32",
+                        "y": f"{str(group_name)}_y.f32",
+                        "meta": f"{str(group_name)}_meta.i64",
+                    }
+                    meta["audit"][str(group_name)] = dict(split_audit)
+                    meta["audit_rates"][str(group_name)] = _audit_rates(dict(split_audit))
+                    meta["dates"][str(group_name)] = [int(d) for d in list(date_list)]
+                    meta["audit_daily"][str(group_name)] = list(daily_audits)
+                    meta["inference_contracts"][str(group_name)] = _inference_group_contract(
+                        str(group_name),
+                        str(source_split),
+                        list(date_list),
+                    )
+                    audit_path = npz_dir / f"audit_daily_{str(group_name)}.yaml"
+                    audit_path.write_text(yaml.safe_dump(list(daily_audits), sort_keys=False, allow_unicode=True), encoding="utf-8")
+                meta["storage"]["groups"] = groups
             meta_path.write_text(yaml.safe_dump(meta, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
         # Ensure distribution artifacts exist; recompute them from existing bins when missing.
@@ -1558,7 +1755,7 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             if scope == "train_only":
                 moment_paths = [npz_dir / "train_x.f32"]
                 moment_rows = [int(groups["train"]["rows"])]
-            elif scope in ["train_val_test", "predict_all_dates"]:
+            elif scope in ["train_val_test", "inference_all_dates"]:
                 moment_paths = [npz_dir / "train_x.f32", npz_dir / "val_x.f32", npz_dir / "test_x.f32"]
                 moment_rows = [int(groups["train"]["rows"]), int(groups["val"]["rows"]), int(groups["test"]["rows"])]
             else:
@@ -1595,8 +1792,9 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             "groups": sorted(list(groups.keys())),
             "progress": _progress_metrics(progress, list(meta["dates"]["train"]), list(meta["dates"]["val"]), list(meta["dates"]["test"])),
         }
-        if "predict" in groups:
-            out["predict_rows"] = int(groups["predict"]["rows"])
+        for group_name in ["inference_train", "inference_val", "inference_test"]:
+            if group_name in groups:
+                out[f"{group_name}_rows"] = int(groups[group_name]["rows"])
         return out
 
     # Define the stable feature ordering early so array materialization is consistent.
@@ -1624,7 +1822,7 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             # Stream per-day processing inside worker processes while writing arrays sequentially in the main process.
             t0 = time.time()
             tasks = [(int(d), config) for d in list(date_list)]
-            it = _data_prep_iterator(pool, tasks)
+            it = _data_prep_iterator(pool, tasks, _build_single_day_table_task)
 
             # Accumulate audits and row counts without materializing the full split in memory.
             rows = 0
@@ -1726,7 +1924,8 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
     train_daily_audits = list(yaml.safe_load((npz_dir / "audit_daily_train.yaml").read_text(encoding="utf-8")))
     val_daily_audits = list(yaml.safe_load((npz_dir / "audit_daily_val.yaml").read_text(encoding="utf-8")))
     test_daily_audits = list(yaml.safe_load((npz_dir / "audit_daily_test.yaml").read_text(encoding="utf-8")))
-    predict_daily_audits = list(train_daily_audits) + list(val_daily_audits) + list(test_daily_audits)
+    combined_daily_audits = list(train_daily_audits) + list(val_daily_audits) + list(test_daily_audits)
+    predict_daily_audits: list[dict[str, object]] = []
 
     # Compute split-level audit summaries from the daily audit tables.
     def _sum_audits(tag: str, xs: list[dict[str, object]], elapsed: float) -> dict[str, object]:
@@ -1750,27 +1949,19 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
     train_audit = _sum_audits("train", train_daily_audits, float(progress["elapsed_seconds"]["train"]))
     val_audit = _sum_audits("val", val_daily_audits, float(progress["elapsed_seconds"]["val"]))
     test_audit = _sum_audits("test", test_daily_audits, float(progress["elapsed_seconds"]["test"]))
-    predict_audit = {
-        "tag": "predict",
-        "workers": int(workers),
-        "days": int(train_audit["days"]) + int(val_audit["days"]) + int(test_audit["days"]),
-        "raw_rows": int(train_audit["raw_rows"]) + int(val_audit["raw_rows"]) + int(test_audit["raw_rows"]),
-        "kept_rows": int(train_audit["kept_rows"]) + int(val_audit["kept_rows"]) + int(test_audit["kept_rows"]),
-        "sampled_rows": int(train_audit["sampled_rows"]) + int(val_audit["sampled_rows"]) + int(test_audit["sampled_rows"]),
-        "out_rows": int(train_audit["out_rows"]) + int(val_audit["out_rows"]) + int(test_audit["out_rows"]),
-        "elapsed_seconds": float(train_audit["elapsed_seconds"]) + float(val_audit["elapsed_seconds"]) + float(test_audit["elapsed_seconds"]),
-    }
+    inference_audits: dict[str, dict[str, object]] = {}
+    inference_daily_audits: dict[str, list[dict[str, object]]] = {}
 
     # Resolve the data-clean output directory before writing aggregated reports.
     stats_dir = Path(config.out_dir) / "data_clean"
 
     # Aggregate invalid-value stats before any downstream normalization/reporting.
-    invalid_stats_table = _aggregate_invalid_feature_stats(predict_daily_audits)
+    invalid_stats_table = _aggregate_invalid_feature_stats(combined_daily_audits)
     _write_invalid_feature_artifacts(invalid_stats_table, stats_dir)
 
     # Write required audit artifacts so missingness and label alignment are observable.
     predict_dates = list(train_dates) + list(val_dates) + list(test_dates)
-    _write_label_audit_artifacts(predict_daily_audits, stats_dir)
+    _write_label_audit_artifacts(combined_daily_audits, stats_dir)
     _write_kept_rows_by_minute_artifacts(npz_dir, list(predict_dates), int(config.horizon_minutes), stats_dir)
     _write_drop_top_stocks_artifacts(npz_dir, list(predict_dates), stats_dir)
     _write_value_transform_params_artifact(
@@ -1806,7 +1997,7 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         elif scope == "train_val_test":
             fit_paths = [npz_dir / "train_x.f32", npz_dir / "val_x.f32", npz_dir / "test_x.f32"]
             fit_rows = [int(train_audit["out_rows"]), int(val_audit["out_rows"]), int(test_audit["out_rows"])]
-        elif scope == "predict_all_dates":
+        elif scope == "inference_all_dates":
             fit_paths = [npz_dir / "train_x.f32", npz_dir / "val_x.f32", npz_dir / "test_x.f32"]
             fit_rows = [int(train_audit["out_rows"]), int(val_audit["out_rows"]), int(test_audit["out_rows"])]
         else:
@@ -1856,7 +2047,7 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         elif label_scope == "train_val_test":
             label_fit_paths = [npz_dir / "train_y.f32", npz_dir / "val_y.f32", npz_dir / "test_y.f32"]
             label_fit_rows = [int(train_audit["out_rows"]), int(val_audit["out_rows"]), int(test_audit["out_rows"])]
-        elif label_scope == "predict_all_dates":
+        elif label_scope == "inference_all_dates":
             label_fit_paths = [npz_dir / "train_y.f32", npz_dir / "val_y.f32", npz_dir / "test_y.f32"]
             label_fit_rows = [int(train_audit["out_rows"]), int(val_audit["out_rows"]), int(test_audit["out_rows"])]
         else:
@@ -1874,19 +2065,6 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
     else:
         raise RuntimeError(f"Unknown label_norm: {config.label_norm}")
 
-    # Convert raw/kept/sampled counters into float rates for report consumption.
-    def _audit_rates(a: dict[str, object]) -> dict[str, float]:
-        """Convert raw/kept/sampled counters into float rates."""
-        # Compute kept and sampled rates with explicit float conversions.
-        raw = float(a["raw_rows"])
-        kept = float(a["kept_rows"])
-        sampled = float(a["sampled_rows"])
-        return {
-            "kept_rate": float(kept / raw),
-            "sampled_rate_vs_kept": float(sampled / kept),
-            "sampled_rate_vs_raw": float(sampled / raw),
-        }
-
     # Record the raw binary storage layout so the dataset can memory-map without loading full arrays.
     storage = {
         "format": "raw_bin_v1",
@@ -1898,31 +2076,35 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         },
     }
 
-    # Optionally materialize predict split binaries after normalization to avoid extra per-day writes.
-    if bool(config.include_predict_split):
-        # Concatenate standardized group binaries into a single predict group.
-        import shutil
-
-        pred_x = npz_dir / "predict_x.f32"
-        pred_y = npz_dir / "predict_y.f32"
-        pred_m = npz_dir / "predict_meta.i64"
-        with open(pred_x, "wb") as out_x, open(pred_y, "wb") as out_y, open(pred_m, "wb") as out_m:
-            for tag in ["train", "val", "test"]:
-                # Append one split file into the predict group.
-                g = dict(storage["groups"][str(tag)])
-                with open(npz_dir / str(g["x"]), "rb") as in_x:
-                    shutil.copyfileobj(in_x, out_x, length=16 * 1024 * 1024)
-                with open(npz_dir / str(g["y"]), "rb") as in_y:
-                    shutil.copyfileobj(in_y, out_y, length=16 * 1024 * 1024)
-                with open(npz_dir / str(g["meta"]), "rb") as in_meta:
-                    shutil.copyfileobj(in_meta, out_m, length=16 * 1024 * 1024)
-        storage["groups"]["predict"] = {
-            "rows": int(train_audit["out_rows"]) + int(val_audit["out_rows"]) + int(test_audit["out_rows"]),
-            "feature_dim": int(len(feature_names)),
-            "x": pred_x.name,
-            "y": pred_y.name,
-            "meta": pred_m.name,
-        }
+    # Optionally materialize formal inference split binaries after normalization.
+    if bool(config.include_inference_splits):
+        # Build the formal inference groups from raw split dates without label-based filtering or sampling.
+        feature_mean: np.ndarray | None = None
+        feature_std: np.ndarray | None = None
+        if not bool(config.use_cross_sectional_gaussianize):
+            feature_mean = mean
+            feature_std = std
+        for group_name, date_list, source_split in list(_inference_split_specs(list(train_dates), list(val_dates), list(test_dates))):
+            rows, daily_audits, split_audit = _materialize_inference_group(
+                config,
+                str(group_name),
+                list(date_list),
+                npz_dir,
+                list(feature_names),
+                feature_mean,
+                feature_std,
+            )
+            storage["groups"][str(group_name)] = {
+                "rows": int(rows),
+                "feature_dim": int(len(feature_names)),
+                "x": f"{str(group_name)}_x.f32",
+                "y": f"{str(group_name)}_y.f32",
+                "meta": f"{str(group_name)}_meta.i64",
+            }
+            inference_audits[str(group_name)] = dict(split_audit)
+            inference_daily_audits[str(group_name)] = list(daily_audits)
+            audit_path = npz_dir / f"audit_daily_{str(group_name)}.yaml"
+            audit_path.write_text(yaml.safe_dump(list(daily_audits), sort_keys=False, allow_unicode=True), encoding="utf-8")
 
     # Persist split metadata and preprocessing audit for reproducibility.
     meta = {
@@ -1970,16 +2152,25 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         },
         "audit_daily": {"train": train_daily_audits, "val": val_daily_audits, "test": test_daily_audits},
     }
-    if bool(config.include_predict_split):
-        meta["dates"]["predict"] = list(dates)
-        meta["audit"]["predict"] = predict_audit
-        meta["audit_rates"]["predict"] = _audit_rates(predict_audit)
+    if bool(config.include_inference_splits):
+        meta["inference_contracts"] = {}
+        for group_name, date_list, source_split in list(_inference_split_specs(list(train_dates), list(val_dates), list(test_dates))):
+            split_audit = dict(inference_audits[str(group_name)])
+            meta["dates"][str(group_name)] = [int(d) for d in list(date_list)]
+            meta["audit"][str(group_name)] = split_audit
+            meta["audit_rates"][str(group_name)] = _audit_rates(split_audit)
+            meta["audit_daily"][str(group_name)] = list(inference_daily_audits[str(group_name)])
+            meta["inference_contracts"][str(group_name)] = _inference_group_contract(
+                str(group_name),
+                str(source_split),
+                list(date_list),
+            )
     meta_path.write_text(yaml.safe_dump(meta, sort_keys=False, allow_unicode=True), encoding="utf-8")
     progress_path.unlink()
 
     # Return a small in-memory summary for the pipeline.
     progress = {"stage": "done", "index": 0, "elapsed_seconds": dict(progress["elapsed_seconds"])}
-    return {
+    out = {
         "done": True,
         "feature_names": feature_names,
         "train_rows": int(train_audit["out_rows"]),
@@ -1992,3 +2183,7 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         "groups": sorted(list(storage["groups"].keys())),
         "progress": _progress_metrics(progress, train_dates, val_dates, test_dates),
     }
+    for group_name in ["inference_train", "inference_val", "inference_test"]:
+        if group_name in storage["groups"]:
+            out[f"{group_name}_rows"] = int(storage["groups"][group_name]["rows"])
+    return out

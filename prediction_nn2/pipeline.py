@@ -58,7 +58,7 @@ class PipelineConfig:
     data_prep_heavy_tanh_c: float
     data_prep_add_is_zero_features: bool
     data_prep_include_session_id: bool
-    data_prep_include_predict_split: bool
+    data_prep_include_inference_splits: bool
     data_prep_norm_fit_scope: str
     data_prep_label_norm: str
     data_prep_label_norm_fit_scope: str
@@ -599,7 +599,7 @@ def _prepare_split_inputs(
         heavy_tanh_c=float(cfg.data_prep_heavy_tanh_c),
         add_is_zero_features=bool(cfg.data_prep_add_is_zero_features),
         include_session_id=bool(cfg.data_prep_include_session_id),
-        include_predict_split=bool(cfg.data_prep_include_predict_split),
+        include_inference_splits=bool(cfg.data_prep_include_inference_splits),
         norm_fit_scope=str(cfg.data_prep_norm_fit_scope),
         label_norm=str(cfg.data_prep_label_norm),
         label_norm_fit_scope=str(cfg.data_prep_label_norm_fit_scope),
@@ -657,6 +657,15 @@ def _load_existing_eval_manifest(qconf: SimpleNamespace, eval_dir_name: str, bes
     return manifest_path
 
 
+def _load_existing_inference_manifest(qconf: SimpleNamespace, inference_dir_name: str, best_it: int) -> Path:
+    """Load an existing streamed inference manifest for one split."""
+    # Resolve the expected streamed inference manifest path and require it to exist.
+    manifest_path = Path(qconf.root_dir) / str(inference_dir_name) / f"iter_{int(best_it)}" / "inference_manifest.yaml"
+    if not manifest_path.exists():
+        raise RuntimeError(f"Missing existing inference manifest: {manifest_path}")
+    return manifest_path
+
+
 def _run_eval_manifest_once(qconf: SimpleNamespace, group: str, best_it: int, dst_name: str) -> Path:
     """Run one streamed evaluator pass and move it into a stable split-specific directory."""
     # Remove any stale temporary eval directory left by an interrupted prior run.
@@ -689,6 +698,38 @@ def _run_eval_manifest_once(qconf: SimpleNamespace, group: str, best_it: int, ds
     return manifest_path
 
 
+def _run_inference_manifest_once(qconf: SimpleNamespace, group: str, best_it: int, dst_name: str) -> Path:
+    """Run one streamed inference evaluator pass and move it into a stable split-specific directory."""
+    # Remove any stale temporary inference directory left by an interrupted prior run.
+    import shutil
+
+    run_dir = Path(qconf.root_dir)
+    tmp_iter_dir = run_dir / "inference" / f"iter_{int(best_it)}"
+    if tmp_iter_dir.exists():
+        shutil.rmtree(tmp_iter_dir)
+
+    # Run the evaluator in inference chunked-manifest mode for the requested split.
+    if torch.device(qconf.device).type == "cuda":
+        from qmodel.core.evaluator import Evaluator
+
+        evaluator = Evaluator(qconf, group=str(group), writer=None, enable_logging=False)
+    else:
+        from qmodel.core.cpu_evaluator import CpuEvaluator
+
+        evaluator = CpuEvaluator(qconf, group=str(group), writer=None, enable_logging=False)
+
+    # Stream predictions into inference parquet chunks and close evaluator resources.
+    evaluator._run_inference_to_manifest(it=int(best_it), n_iter=0, iter_dir=tmp_iter_dir)
+    evaluator.close()
+
+    # Move the finished streamed inference output into its stable destination and return the manifest path.
+    dst_iter_dir = _move_eval_dir(run_dir, src_name="inference", dst_name=str(dst_name), it=int(best_it))
+    manifest_path = Path(dst_iter_dir) / "inference_manifest.yaml"
+    if not manifest_path.exists():
+        raise RuntimeError(f"Missing streamed inference manifest after move: {manifest_path}")
+    return manifest_path
+
+
 def _run_train_report_postprocess(
     cfg: PipelineConfig,
     prep: dict[str, object],
@@ -714,6 +755,17 @@ def _run_train_report_postprocess(
     # Rebuild the test manifest when it is missing.
     if test_manifest_path is None:
         test_manifest_path = _run_eval_manifest_once(qconf, "test", int(best_it), "eval_test")
+
+    # Reuse an existing inference-test manifest when it is already on disk.
+    inference_test_manifest_path: Path | None = None
+    if bool(require_existing_eval):
+        candidate = Path(qconf.root_dir) / "inference_test" / f"iter_{int(best_it)}" / "inference_manifest.yaml"
+        if candidate.exists():
+            inference_test_manifest_path = candidate
+
+    # Rebuild the inference-test manifest when it is missing.
+    if inference_test_manifest_path is None:
+        inference_test_manifest_path = _run_inference_manifest_once(qconf, "inference_test", int(best_it), "inference_test")
 
     # Reuse an existing train manifest when it is already on disk.
     train_manifest_path: Path | None = None
@@ -1075,8 +1127,9 @@ def _load_prep_summary_from_meta(meta_path: Path) -> dict[str, object]:
         "audit_rates": dict(meta["audit_rates"]),
         "groups": sorted(list(groups.keys())),
     }
-    if "predict" in groups:
-        out["predict_rows"] = int(groups["predict"]["rows"])
+    for group_name in ["inference_train", "inference_val", "inference_test"]:
+        if group_name in groups:
+            out[f"{group_name}_rows"] = int(groups[group_name]["rows"])
     return out
 
 
@@ -1101,7 +1154,7 @@ def run_data_clean_stage(
         "val_days": int(val_days),
         "test_days": int(test_days),
         "use_cross_sectional_gaussianize": bool(cfg.use_cross_sectional_gaussianize),
-        "include_predict_split": bool(cfg.data_prep_include_predict_split),
+        "include_inference_splits": bool(cfg.data_prep_include_inference_splits),
         "norm_fit_scope": str(cfg.data_prep_norm_fit_scope),
         "label_norm": str(cfg.data_prep_label_norm),
         "label_norm_fit_scope": str(cfg.data_prep_label_norm_fit_scope),
@@ -1377,6 +1430,14 @@ def run_test_evaluation_stage(cfg: PipelineConfig, *, out_root: Path, qconf: Sim
     # Reuse or rebuild the streamed test manifest under eval_test.
     if not Path(test_manifest_path).exists():
         test_manifest_path = _run_eval_manifest_once(qconf, "test", int(best_it), "eval_test")
+
+    # Reuse or rebuild the streamed inference-test manifest under inference_test.
+    inference_manifest_path = Path(qconf.root_dir) / "inference_test" / f"iter_{int(best_it)}" / "inference_manifest.yaml"
+    if bool(require_existing_eval) and Path(inference_manifest_path).exists():
+        inference_manifest_path = _load_existing_inference_manifest(qconf, "inference_test", int(best_it))
+    elif not Path(inference_manifest_path).exists():
+        inference_manifest_path = _run_inference_manifest_once(qconf, "inference_test", int(best_it), "inference_test")
+
     _write_stage_manifest(
         manifest_path,
         {
@@ -1384,6 +1445,7 @@ def run_test_evaluation_stage(cfg: PipelineConfig, *, out_root: Path, qconf: Sim
             "fingerprint": str(fp),
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "test_manifest_path": str(Path(test_manifest_path).as_posix()),
+            "inference_manifest_path": str(Path(inference_manifest_path).as_posix()),
         },
     )
     return test_manifest_path
@@ -1553,7 +1615,7 @@ def _run_single_split_staged(cfg: PipelineConfig, *, out_root: Path, start_trade
     out_root = Path(out_root)
 
     if mode == "train_full":
-        # Run data clean, clean report, train, and train report without predict heavy stages.
+        # Run data clean, clean report, train, and train report without inference-heavy stages.
         prep, prep_elapsed = run_data_clean_stage(
             cfg,
             out_root=out_root,
@@ -1662,7 +1724,7 @@ def _default_config() -> PipelineConfig:
         data_prep_heavy_tanh_c=3.0,
         data_prep_add_is_zero_features=False,
         data_prep_include_session_id=False,
-        data_prep_include_predict_split=False,
+        data_prep_include_inference_splits=True,
         data_prep_norm_fit_scope="train_only",
         data_prep_label_norm="pooled_zscore",
         data_prep_label_norm_fit_scope="train_only",
@@ -1717,7 +1779,7 @@ def _run_pipeline_with_split_runner(cfg: PipelineConfig, split_runner) -> None:
         heavy_tanh_c=float(cfg.data_prep_heavy_tanh_c),
         add_is_zero_features=bool(cfg.data_prep_add_is_zero_features),
         include_session_id=bool(cfg.data_prep_include_session_id),
-        include_predict_split=False,
+        include_inference_splits=False,
         norm_fit_scope="train_only",
         label_norm=str(cfg.data_prep_label_norm),
         label_norm_fit_scope=str(cfg.data_prep_label_norm_fit_scope),
@@ -1805,7 +1867,7 @@ def _run_pipeline_with_split_runner(cfg: PipelineConfig, split_runner) -> None:
 
 def run_pipeline(cfg: PipelineConfig) -> None:
     """Execute the staged pipeline under /data-cache/nn based on cfg.pipeline_mode."""
-    # Dispatch split execution through the staged runner so predict work is optional.
+    # Dispatch split execution through the staged runner so inference work is optional.
     _run_pipeline_with_split_runner(cfg, _run_single_split_staged)
 
 
