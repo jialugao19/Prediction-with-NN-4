@@ -579,6 +579,11 @@ def annual_pooled_pearson_ic_from_manifest(manifest_path: Path, out_csv: Path, o
     out = pd.DataFrame(rows).sort_values("year", kind="stable").reset_index(drop=True)
     out.to_csv(Path(out_csv), index=False)
 
+    # Skip a one-point figure because the table is the clearer representation.
+    if int(out.shape[0]) <= 1:
+        Path(out_png).unlink(missing_ok=True)
+        return out
+
     # Plot the yearly Pearson IC curve with a zero reference line.
     fig = plt.figure(figsize=(10, 4))
     ax = fig.add_subplot(1, 1, 1)
@@ -1682,6 +1687,11 @@ def annual_pooled_ic(df: pd.DataFrame, out_csv: Path, out_png: Path) -> pd.DataF
         rows.append({"year": int(y), "pearson_ic": _pearson(pred, tgt), "rank_ic": _spearman(pred, tgt), "count": int(np.isfinite(pred).sum())})
     out = pd.DataFrame(rows).sort_values("year", kind="stable").reset_index(drop=True)
     out.to_csv(out_csv, index=False)
+
+    # Skip a one-point figure because the table is the clearer representation.
+    if int(out.shape[0]) <= 1:
+        Path(out_png).unlink(missing_ok=True)
+        return out
 
     # Plot yearly IC bars for Pearson and Rank IC.
     fig = plt.figure(figsize=(10, 4))

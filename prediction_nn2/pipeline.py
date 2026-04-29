@@ -1504,6 +1504,9 @@ def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path
             for row in annual_tbl.to_dict(orient="records")
         ],
     )
+    annual_body = render_value_rows([("annual_csv", Path(artifacts.annual_csv).as_posix())]) + annual_table
+    if int(annual_tbl.shape[0]) > 1:
+        annual_body += render_embedded_figure("Annual IC", Path(artifacts.annual_png), "Annual pooled IC curve from the test manifest.")
 
     # Assemble the final self-contained single-column HTML report.
     sections = [
@@ -1536,9 +1539,7 @@ def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path
         ),
         render_section(
             f"Annual IC ({year_range})",
-            render_value_rows([("annual_csv", Path(artifacts.annual_csv).as_posix())])
-            + annual_table
-            + render_embedded_figure("Annual IC", Path(artifacts.annual_png), "Annual pooled IC curve from the test manifest."),
+            annual_body,
         ),
         render_section(
             "Intraday IC",
@@ -1584,7 +1585,7 @@ def run_test_evaluation_report_stage(cfg: PipelineConfig, *, out_root: Path, tes
     manifest_stat = Path(test_manifest_path).stat()
     stage_cfg = {
         "stage": "test_evaluation_report",
-        "report_version": 2,
+        "report_version": 3,
         "manifest": str(Path(test_manifest_path).as_posix()),
         "manifest_size_bytes": int(manifest_stat.st_size),
         "manifest_mtime_ns": int(manifest_stat.st_mtime_ns),
