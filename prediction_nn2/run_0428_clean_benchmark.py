@@ -42,7 +42,11 @@ def read_yaml(path: Path) -> dict:
 def find_inference_manifest() -> Path:
     """Find the clean inference manifest selected by the test-evaluation stage."""
     # Read the stage manifest because it records the selected best checkpoint path.
-    stage_manifest = SPLIT_ROOT / "stage_manifests" / "test_evaluation.yaml"
+    stage_manifest_candidates = [
+        SPLIT_ROOT / "manifests" / "test_evaluation.yaml",
+        SPLIT_ROOT / "stage_manifests" / "test_evaluation.yaml",
+    ]
+    stage_manifest = next(path for path in stage_manifest_candidates if path.exists())
     payload = read_yaml(stage_manifest)
     manifest_path = Path(str(payload["inference_manifest_path"]))
 
@@ -58,8 +62,23 @@ def find_inference_manifest() -> Path:
     return manifest_path
 
 
+def pipeline_outputs_exist() -> bool:
+    """Check whether the expensive pipeline stages already finished."""
+    # Require the HTML reports and manifest that downstream stages consume.
+    required_paths = [
+        SPLIT_ROOT / "train_report.html",
+        SPLIT_ROOT / "test_evaluation_report.html",
+        SPLIT_ROOT / "manifests" / "test_evaluation.yaml",
+    ]
+    return all(path.exists() for path in required_paths)
+
+
 def run_clean_pipeline() -> Path:
     """Run the clean training, eval, inference, and test-report pipeline."""
+    # Reuse completed pipeline outputs when resuming the wrapper.
+    if pipeline_outputs_exist():
+        return find_inference_manifest()
+
     # Execute the project pipeline with the fixed 0428 config.
     cfg = build_pipeline_config()
     run_pipeline(cfg)
