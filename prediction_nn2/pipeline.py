@@ -51,6 +51,7 @@ class PipelineConfig:
     rolling_step_days: int
     seed: int
     horizon_minutes: int
+    label_entry_lag_minutes: int
     sample_stocks_per_minute: int
     use_cross_sectional_gaussianize: bool
     data_prep_use_ret_signed_log1p: bool
@@ -244,7 +245,11 @@ def _export_train_loss_curve(tb_dir: Path, out_png: Path) -> None:
     steps = steps[keep]
     values = values[keep]
 
-    # Plot the deduplicated mean loss curve for report readability.
+    # Compute the 1000-step sliding-window mean for the requested smoother overlay.
+    smooth_window = 1000
+    smooth_values = pd.Series(values).rolling(window=int(smooth_window), min_periods=int(smooth_window)).mean().to_numpy()
+
+    # Plot the raw deduplicated loss curve and the smoother overlay for report readability.
     import matplotlib
 
     matplotlib.use("Agg")
@@ -252,10 +257,12 @@ def _export_train_loss_curve(tb_dir: Path, out_png: Path) -> None:
 
     fig = plt.figure(figsize=(10, 4))
     ax = fig.add_subplot(1, 1, 1)
-    ax.plot(steps, values, linewidth=1.6, color="#4c72b0")
+    ax.plot(steps, values, linewidth=1.0, color="#4c72b0", alpha=0.35, label="raw")
+    ax.plot(steps, smooth_values, linewidth=1.8, color="#dd8452", label="sliding mean (1000)")
     ax.set_title("Training loss curve (TensorBoard scalar: train/objective/loss_mean)")
     ax.set_xlabel("iteration")
     ax.set_ylabel("loss")
+    ax.legend(loc="best")
     fig.tight_layout()
     fig.savefig(out_png, dpi=160)
     plt.close(fig)
@@ -307,10 +314,13 @@ def _model_summary(cfg: PipelineConfig, feature_dim: int, train_rows: int) -> tu
     total_epochs = float(effective_num_iters) / float(batches_per_epoch)
 
     # Assemble the single-column model summary rows.
+    label_definition = f"log_close[t+{int(cfg.horizon_minutes)}] - log_close[t+{int(cfg.label_entry_lag_minutes)}]"
     rows = [
         ("model_class", "GruMlpRegressor"),
         ("input_tensor", f"(B, T={int(cfg.input_window_size)}, F={int(feature_dim)})"),
-        ("prediction_target", f"{int(cfg.horizon_minutes)}-minute forward log return"),
+        ("prediction_target", label_definition),
+        ("label_horizon_minutes", str(int(cfg.horizon_minutes))),
+        ("label_entry_lag_minutes", str(int(cfg.label_entry_lag_minutes))),
         ("rnn_type", "GRU"),
         ("gru_hidden_size", str(int(model_cfg.hidden_size))),
         ("gru_num_layers", str(int(model_cfg.num_layers))),
@@ -592,6 +602,7 @@ def _prepare_split_inputs(
         test_days=int(test_days),
         seed=int(cfg.seed),
         horizon_minutes=int(cfg.horizon_minutes),
+        label_entry_lag_minutes=int(cfg.label_entry_lag_minutes),
         sample_stocks_per_minute=int(_effective_sample_stocks_per_minute(cfg)),
         use_cross_sectional_gaussianize=bool(cfg.use_cross_sectional_gaussianize),
         use_ret_signed_log1p=bool(cfg.data_prep_use_ret_signed_log1p),
@@ -947,8 +958,12 @@ def _render_train_report_html(
         ("val_range", _format_date_range(list(dates["val"]))),
         ("test_range", _format_date_range(list(dates["test"]))),
     ]
+    label_meta = dict(meta["label"])
     clean_rows = [
         ("stock_norm", f"{str(meta['feature_transform']['stock_norm']['type'])} / scope={str(meta['feature_transform']['stock_norm'].get('scope', 'n/a'))}"),
+        ("label_definition", str(label_meta["definition"])),
+        ("label_horizon_minutes", str(int(label_meta["horizon_minutes"]))),
+        ("label_entry_lag_minutes", str(int(label_meta["entry_lag_minutes"]))),
         ("label_norm", f"{str(meta.get('label_transform', {'type': 'none'})['type'])} / scope={str(meta.get('label_transform', {'scope': 'n/a'}).get('scope', 'n/a'))}"),
         ("feature_dim", str(int(len(prep["feature_names"])))),
         ("invalid_report_html", (stats_dir / "invalid_feature_report.html").as_posix()),
@@ -983,7 +998,7 @@ def _render_train_report_html(
         ("best_val_ic", f"{float(val_ic):.6f}"),
         ("best_val_rank_ic", f"{float(val_rank_ic):.6f}"),
         ("train_loss_space", "normalized_label" if str(meta.get("label_transform", {"type": "none"})["type"]) == "pooled_zscore" else "raw_label"),
-        ("eval_metric_space", "raw_forward_log_return"),
+        ("eval_metric_space", "raw_label / " + str(label_meta["definition"])),
         ("train_loss_png", loss_png.as_posix()),
     ]
     # Summarize the training-time LR schedule and initialization policy for reproducibility.
@@ -1050,7 +1065,7 @@ def _render_train_report_html(
         render_section("Data Clean Summary", render_value_rows(clean_rows) + invalid_table),
         render_figure("Data Clean Distribution Overview", stats_dir / "pooled_feature_grid.png", "Pooled standardized feature distributions from the data clean stage."),
         render_section("Validation And Checkpoint", render_value_rows(checkpoint_rows) + sweep_table),
-        render_figure("Train Loss Curve", loss_png, "Training loss exported from TensorBoard `train/objective/loss_mean`, with duplicated resume steps deduplicated and step 0 removed."),
+        render_figure("Train Loss Curve", loss_png, "Training loss exported from TensorBoard `train/objective/loss_mean`, with raw values and a 1000-step sliding mean overlay."),
         render_section(
             "Train Vs Test IC Summary",
             render_value_rows(ic_rows)
@@ -1158,6 +1173,7 @@ def run_data_clean_stage(
         "norm_fit_scope": str(cfg.data_prep_norm_fit_scope),
         "label_norm": str(cfg.data_prep_label_norm),
         "label_norm_fit_scope": str(cfg.data_prep_label_norm_fit_scope),
+        "label_entry_lag_minutes": int(cfg.label_entry_lag_minutes),
         "days_per_call": int(cfg.data_prep_days_per_call),
         "workers": int(cfg.data_prep_workers),
         "horizon_minutes": int(cfg.horizon_minutes),
@@ -1207,6 +1223,7 @@ def run_clean_report_stage(cfg: PipelineConfig, *, out_root: Path) -> Path:
         "norm_fit_scope": str(cfg.data_prep_norm_fit_scope),
         "label_norm": str(cfg.data_prep_label_norm),
         "label_norm_fit_scope": str(cfg.data_prep_label_norm_fit_scope),
+        "label_entry_lag_minutes": int(cfg.label_entry_lag_minutes),
         "data_contract": _load_data_contract_from_meta(meta_path),
     }
     manifest_path = _stage_manifest_path(Path(out_root), "clean_report")
@@ -1367,7 +1384,7 @@ def run_train_report_stage(
     # Build a stage fingerprint so report rebuild can skip when inputs are unchanged.
     stage_cfg = {
         "stage": "train_report",
-        "report_version": 3,
+        "report_version": 4,
         "best_it": int(best_it),
         "data_contract": _load_data_contract_from_meta(Path(prep["meta_path"])),
         "lr_scheduler": _lr_scheduler_contract(cfg, int(prep["train_rows"])),
@@ -1718,6 +1735,7 @@ def _default_config() -> PipelineConfig:
         rolling_step_days=1,
         seed=7,
         horizon_minutes=10,
+        label_entry_lag_minutes=1,
         sample_stocks_per_minute=800,
         use_cross_sectional_gaussianize=False,
         data_prep_use_ret_signed_log1p=True,
@@ -1773,6 +1791,7 @@ def _run_pipeline_with_split_runner(cfg: PipelineConfig, split_runner) -> None:
         test_days=int(cfg.test_days),
         seed=int(cfg.seed),
         horizon_minutes=int(cfg.horizon_minutes),
+        label_entry_lag_minutes=int(cfg.label_entry_lag_minutes),
         sample_stocks_per_minute=int(_effective_sample_stocks_per_minute(cfg)),
         use_cross_sectional_gaussianize=bool(cfg.use_cross_sectional_gaussianize),
         use_ret_signed_log1p=bool(cfg.data_prep_use_ret_signed_log1p),

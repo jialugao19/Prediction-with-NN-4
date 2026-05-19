@@ -61,9 +61,13 @@ def render_clean_report_from_meta(meta_path: Path) -> Path:
     audit_rates = dict(meta["audit_rates"])
     groups = dict(meta["storage"]["groups"])
     norm = dict(meta["feature_transform"]["stock_norm"])
+    label = dict(meta["label"])
     summary_rows = [
         ("meta", meta_path.as_posix()),
         ("stock_norm", f"{norm['type']} / scope={norm.get('scope', 'n/a')}"),
+        ("label_definition", str(label["definition"])),
+        ("label_horizon_minutes", str(int(label["horizon_minutes"]))),
+        ("label_entry_lag_minutes", str(int(label["entry_lag_minutes"]))),
         ("groups", ", ".join(sorted(list(groups.keys())))),
         ("train_days", str(len(dates["train"]))),
         ("val_days", str(len(dates["val"]))),

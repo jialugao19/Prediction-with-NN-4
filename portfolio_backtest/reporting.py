@@ -162,7 +162,7 @@ def build_report_text(config: PortfolioBacktestConfig, strategy_summary_path: Pa
     lines.append("")
     lines.append("### 时间与持有期")
     lines.append("")
-    lines.append("- 每个交易日将分钟 bar 按 `minute_slot = minute % 10` 分为 10 条不重叠子序列, 以避免重叠持有带来的伪高频复用。")
+    lines.append(f"- 每个交易日将分钟 bar 按 `base_minute % {int(config.slot_mod_bars)}` 分为不重叠子序列, 以避免重叠持有带来的伪高频复用。")
     lines.append(f"- Entry: 信号产生后延迟 `entry_delay_bars = {int(config.entry_delay_bars)}` 个可交易 bar 入场。")
     lines.append(f"- Holding: 持有 `holding_bars = {int(config.holding_bars)}` 个 bar, 到期后在首个可交易 bar 出场。")
     lines.append("")
@@ -170,8 +170,14 @@ def build_report_text(config: PortfolioBacktestConfig, strategy_summary_path: Pa
     lines.append("### 选股与目标权重")
     lines.append("")
     lines.append(f"- 每个时间截面(同一 date+time)对所有可用 prediction 的股票做排序。")
-    lines.append(f"- 取 top {float(config.top_frac) * 100:.0f}% 做多, bottom {float(config.top_frac) * 100:.0f}% 做空。")
-    lines.append("- 两端等权且总资金各占 50%, 组合目标为 market-neutral(忽略融资与借券约束)。")
+    if bool(config.long_enabled) and bool(config.short_enabled):
+        lines.append(f"- 取 top {float(config.top_frac) * 100:.0f}% 做多, bottom {float(config.top_frac) * 100:.0f}% 做空。")
+        lines.append("- 两端等权且总资金各占 50%, 组合目标为 market-neutral(忽略融资与借券约束)。")
+    elif bool(config.long_enabled):
+        lines.append(f"- 只取 top {float(config.top_frac) * 100:.0f}% 做多, gross exposure 目标为 100%。")
+    else:
+        lines.append(f"- 只取 bottom {float(config.top_frac) * 100:.0f}% 做空, gross exposure 目标为 100%。")
+    lines.append(f"- 流动性过滤: 保留 `liq_bucket <= {int(config.max_liq_bucket)}` 的候选标的。")
     lines.append("")
 
     lines.append("### Universe 与可交易性")
@@ -284,7 +290,11 @@ def build_self_contained_html_report(config: PortfolioBacktestConfig, strategy_s
                     ("output_dir", Path(config.output_dir).as_posix()),
                     ("entry_delay_bars", str(int(config.entry_delay_bars))),
                     ("holding_bars", str(int(config.holding_bars))),
+                    ("slot_mod_bars", str(int(config.slot_mod_bars))),
                     ("top_frac", f"{float(config.top_frac):.2f}"),
+                    ("long_enabled", str(bool(config.long_enabled))),
+                    ("short_enabled", str(bool(config.short_enabled))),
+                    ("max_liq_bucket", str(int(config.max_liq_bucket))),
                 ]
             ),
         ),

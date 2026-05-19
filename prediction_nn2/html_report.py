@@ -45,6 +45,19 @@ def render_table(headers: list[str], rows: list[list[str]]) -> str:
     return f"<table><thead><tr>{head_html}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
 
 
+def render_html_table(headers: list[str], rows: list[list[str]]) -> str:
+    """Render one HTML table with already-rendered cell fragments."""
+    # Escape headers while allowing trusted cell fragments from local report code.
+    head_html = "".join([f"<th>{html.escape(str(header))}</th>" for header in list(headers)])
+
+    # Build each body row without escaping cells again.
+    body_rows: list[str] = []
+    for row in list(rows):
+        cell_html = "".join([f"<td>{str(cell)}</td>" for cell in list(row)])
+        body_rows.append(f"<tr>{cell_html}</tr>")
+    return f"<table><thead><tr>{head_html}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
+
+
 def render_code_block(text: str) -> str:
     """Render one escaped preformatted text block."""
     # Escape the full payload once so YAML and paths stay readable in HTML.
@@ -86,6 +99,23 @@ def render_section(title: str, body: str) -> str:
     """
 
 
+def render_subsection(title: str, body: str) -> str:
+    """Wrap one HTML fragment inside a titled subsection."""
+    # Keep h3 blocks nested inside their parent section without adding a new page break.
+    return f"""
+    <section class="subsection">
+      <h3>{html.escape(str(title))}</h3>
+      {body}
+    </section>
+    """
+
+
+def render_block_title(title: str) -> str:
+    """Render one compact local block title."""
+    # Use h4 for table groups and figure groups inside a subsection.
+    return f'<h4 class="block-title">{html.escape(str(title))}</h4>'
+
+
 def build_page(title: str, subtitle: str, sections: list[str]) -> str:
     """Assemble one self-contained single-column HTML page."""
     # Build the page shell with a strictly vertical layout and simple typography.
@@ -120,7 +150,7 @@ def build_page(title: str, subtitle: str, sections: list[str]) -> str:
       border: 1px solid var(--line);
       box-shadow: 0 18px 50px rgba(31, 41, 51, 0.10);
     }}
-    h1, h2 {{
+    h1, h2, h3, h4 {{
       font-family: Georgia, "Times New Roman", serif;
       color: #17222e;
     }}
@@ -132,6 +162,14 @@ def build_page(title: str, subtitle: str, sections: list[str]) -> str:
       margin: 0 0 12px 0;
       font-size: 26px;
     }}
+    h3 {{
+      margin: 18px 0 10px 0;
+      font-size: 21px;
+    }}
+    h4 {{
+      margin: 14px 0 6px 0;
+      font-size: 16px;
+    }}
     .subtitle {{
       margin-bottom: 18px;
       color: var(--muted);
@@ -141,6 +179,131 @@ def build_page(title: str, subtitle: str, sections: list[str]) -> str:
       margin-top: 24px;
       padding-top: 16px;
       border-top: 1px solid var(--line);
+    }}
+    .subsection {{
+      margin-top: 18px;
+    }}
+    .block-title {{
+      color: var(--accent);
+      font-family: "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+      font-weight: 700;
+    }}
+    .section-label {{
+      margin: 0 0 8px 0;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }}
+    .summary-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }}
+    .summary-card {{
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.78);
+    }}
+    .summary-card-key {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }}
+    .summary-card-value {{
+      margin-top: 4px;
+      font-size: 22px;
+      font-weight: 700;
+      line-height: 1.25;
+    }}
+    .summary-card-note {{
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }}
+    .takeaways {{
+      margin: 12px 0 0 0;
+      padding: 0;
+      list-style: none;
+    }}
+    .takeaways li {{
+      margin: 7px 0;
+      padding: 9px 11px;
+      border-left: 4px solid var(--accent);
+      background: rgba(24, 78, 119, 0.06);
+    }}
+    .badge {{
+      display: inline-block;
+      min-width: 54px;
+      padding: 2px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1.35;
+      text-align: center;
+      white-space: nowrap;
+    }}
+    .badge-good {{
+      color: #842029;
+      background: #f7d7da;
+      border-color: #e2a6ad;
+    }}
+    .badge-watch {{
+      color: #664d03;
+      background: #fff0bf;
+      border-color: #e3c96a;
+    }}
+    .badge-bad {{
+      color: #0f5132;
+      background: #d9f0e3;
+      border-color: #a6d5ba;
+    }}
+    .badge-neutral {{
+      color: #334155;
+      background: #e8edf3;
+      border-color: #c7d1df;
+    }}
+    .table-wrap {{
+      width: 100%;
+      overflow-x: auto;
+    }}
+    .details {{
+      margin-top: 12px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.58);
+    }}
+    .details summary {{
+      cursor: pointer;
+      color: var(--accent);
+      font-weight: 700;
+    }}
+    .field-notes {{
+      margin-top: 12px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.70);
+    }}
+    .field-notes-title {{
+      margin: 0 0 8px 0;
+      color: var(--accent);
+      font-size: 15px;
+      font-weight: 700;
+    }}
+    .field-note {{
+      margin: 8px 0;
+      color: var(--ink);
+      font-size: 14px;
+      line-height: 1.65;
+    }}
+    .field-note strong {{
+      color: #17222e;
     }}
     .kv-list {{
       display: block;
@@ -186,14 +349,20 @@ def build_page(title: str, subtitle: str, sections: list[str]) -> str:
       margin: 10px 0 0 0;
       font-size: 14px;
     }}
+    .table-wrap table {{
+      min-width: 720px;
+    }}
     th, td {{
       border: 1px solid var(--line);
       padding: 8px 10px;
       text-align: left;
       vertical-align: top;
+      word-break: break-word;
     }}
     th {{
       background: rgba(24, 78, 119, 0.08);
+      position: sticky;
+      top: 0;
     }}
     pre {{
       margin: 10px 0 0 0;
