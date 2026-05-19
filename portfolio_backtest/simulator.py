@@ -24,6 +24,9 @@ def materialize_slot_strategy_table(
     con: duckdb.DuckDBPyConnection,
     parquet_glob: str,
     top_frac: float,
+    long_enabled: bool,
+    short_enabled: bool,
+    max_liq_bucket: int,
     return_col: str,
     fillable_col: str,
     entry_is_up_limit_col: str,
@@ -37,6 +40,26 @@ def materialize_slot_strategy_table(
     position_table_name: str,
 ) -> None:
     """Materialize one non-overlapping target-position table."""
+    # Define side-specific SQL fragments for enabled long/short legs.
+    side_cases: list[str] = []
+    weight_cases: list[str] = []
+    side_filters: list[str] = []
+    if bool(short_enabled):
+        side_cases.append("WHEN rank_asc <= keep_count THEN -1")
+        weight_cases.append("WHEN rank_asc <= keep_count THEN -1.0 * short_gross / keep_count")
+        side_filters.append("rank_asc <= keep_count")
+    if bool(long_enabled):
+        side_cases.append("WHEN rank_asc > name_count - keep_count THEN 1")
+        weight_cases.append("WHEN rank_asc > name_count - keep_count THEN 1.0 * long_gross / keep_count")
+        side_filters.append("rank_asc > name_count - keep_count")
+    if len(side_filters) == 0:
+        raise RuntimeError("At least one of long_enabled or short_enabled must be true.")
+    long_gross = 0.5 if bool(short_enabled) else 1.0
+    short_gross = 0.5 if bool(long_enabled) else 1.0
+    side_case_sql = "\n                    ".join(side_cases)
+    weight_case_sql = "\n                    ".join(weight_cases)
+    side_filter_sql = " OR ".join(side_filters)
+
     # Build the selected positions table from the feature parquet source.
     con.execute(
         f"""
@@ -64,7 +87,7 @@ def materialize_slot_strategy_table(
             FROM read_parquet('{parquet_glob}')
             WHERE {extra_filter_sql}
         ),
-        ranked AS (
+        liquidity_tagged AS (
             SELECT
                 date,
                 time,
@@ -84,10 +107,33 @@ def materialize_slot_strategy_table(
                 entry_is_down_limit,
                 exit_is_up_limit,
                 exit_is_down_limit,
-                row_number() OVER (PARTITION BY date, time ORDER BY prediction) AS rank_asc,
-                count(*) OVER (PARTITION BY date, time) AS name_count,
                 ntile(3) OVER (PARTITION BY date, time ORDER BY signal_amount DESC) AS liq_bucket
             FROM filtered
+        ),
+        ranked AS (
+            SELECT
+                date,
+                time,
+                code,
+                minute_slot,
+                prediction,
+                prediction_available,
+                current_tradable,
+                simple_return,
+                sigma_intraday,
+                adv_amount,
+                is_limit_up_all_day,
+                is_limit_down_all_day,
+                fillable_base,
+                entry_is_up_limit,
+                entry_is_down_limit,
+                exit_is_up_limit,
+                exit_is_down_limit,
+                liq_bucket,
+                row_number() OVER (PARTITION BY date, time ORDER BY prediction) AS rank_asc,
+                count(*) OVER (PARTITION BY date, time) AS name_count
+            FROM liquidity_tagged
+            WHERE liq_bucket <= {int(max_liq_bucket)}
         ),
         tagged AS (
             SELECT
@@ -113,6 +159,8 @@ def materialize_slot_strategy_table(
                     WHEN liq_bucket = 2 THEN {spread_bps_mid:.6f}
                     ELSE {spread_bps_low:.6f}
                 END AS spread_bps,
+                {float(long_gross):.8f} AS long_gross,
+                {float(short_gross):.8f} AS short_gross,
                 rank_asc,
                 name_count,
                 CAST(ceil({top_frac:.8f} * name_count) AS BIGINT) AS keep_count
@@ -148,15 +196,13 @@ def materialize_slot_strategy_table(
             END AS fillable,
             spread_bps,
             CASE
-                WHEN rank_asc <= keep_count THEN -1
-                ELSE 1
+                    {side_case_sql}
             END AS side,
             CASE
-                WHEN rank_asc <= keep_count THEN -0.5 / keep_count
-                ELSE 0.5 / keep_count
+                    {weight_case_sql}
             END AS target_weight
         FROM tagged
-        WHERE rank_asc <= keep_count OR rank_asc > name_count - keep_count
+        WHERE {side_filter_sql}
         """
     )
 def export_duckdb_table(con: duckdb.DuckDBPyConnection, output_dir: Path, table_name: str, output_name: str) -> Path:

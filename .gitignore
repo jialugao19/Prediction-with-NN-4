@@ -13,6 +13,8 @@ txt/
 report/
 outputs/
 tests/
+!portfolio_backtest/tests/
+!portfolio_backtest/tests/*.py
 
 # 通用大文件数据
 *.parquet

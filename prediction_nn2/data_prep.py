@@ -54,6 +54,7 @@ class DataPrepConfig:
     test_days: int
     seed: int
     horizon_minutes: int
+    label_entry_lag_minutes: int
     sample_stocks_per_minute: int
     use_cross_sectional_gaussianize: bool
     use_ret_signed_log1p: bool
@@ -116,6 +117,7 @@ def _prep_config_contract(config: DataPrepConfig) -> dict[str, object]:
         "test_days": int(config.test_days),
         "seed": int(config.seed),
         "horizon_minutes": int(config.horizon_minutes),
+        "label_entry_lag_minutes": int(config.label_entry_lag_minutes),
         "sample_stocks_per_minute": int(config.sample_stocks_per_minute),
         "use_cross_sectional_gaussianize": bool(config.use_cross_sectional_gaussianize),
         "use_ret_signed_log1p": bool(config.use_ret_signed_log1p),
@@ -146,6 +148,9 @@ def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[p
     """Compute non-rank feature transforms and a forward return label."""
     # Precompute raw forward-minute availability to audit label invalid sources.
     h = int(config.horizon_minutes)
+    entry_lag = int(config.label_entry_lag_minutes)
+    if int(entry_lag) < 0 or int(entry_lag) >= int(h):
+        raise RuntimeError(f"label_entry_lag_minutes must be in [0, horizon_minutes), got: {entry_lag} horizon={h}")
     raw_keys = ["StockCode", "Date", "MinuteIndex"]
     raw_fwd = df.loc[:, raw_keys].copy()
     raw_fwd["MinuteIndex"] = raw_fwd["MinuteIndex"].to_numpy(dtype=int) - int(h)
@@ -155,13 +160,17 @@ def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[p
     # Compute feature columns before applying any label-based filtering.
     df, feat_cols = _compute_feature_frame(df, config)
 
-    # Align forward log_close by joining on (StockCode, Date, MinuteIndex+h) to avoid shift jumps on missing minutes.
+    # Align entry and forward log_close by minute-index joins to avoid shift jumps on missing minutes.
     keys = ["StockCode", "Date", "MinuteIndex"]
+    entry = df.loc[:, keys + ["log_close"]].copy()
+    entry["MinuteIndex"] = entry["MinuteIndex"].to_numpy(dtype=int) - int(entry_lag)
+    entry = entry.rename(columns={"log_close": "log_close_entry"})
     fwd = df.loc[:, keys + ["log_close"]].copy()
     fwd["MinuteIndex"] = fwd["MinuteIndex"].to_numpy(dtype=int) - int(h)
     fwd = fwd.rename(columns={"log_close": "log_close_fwd"})
+    df = df.merge(entry, on=list(keys), how="left", sort=False, validate="m:1")
     df = df.merge(fwd, on=list(keys), how="left", sort=False, validate="m:1")
-    df["label_ret"] = df["log_close_fwd"] - df["log_close"]
+    df["label_ret"] = df["log_close_fwd"] - df["log_close_entry"]
 
     # Drop the last horizon window minutes explicitly so downstream invalid ratios reflect real data gaps.
     pre_drop_rows = int(df.shape[0])
@@ -175,6 +184,7 @@ def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[p
     # Audit label invalid decomposition after horizon dropping to separate missing minutes from price filtering.
     label_invalid_mask = ~np.isfinite(df["label_ret"].to_numpy(dtype=float, copy=False))
     missing_fwd_mask = df["log_close_fwd"].isna().to_numpy(dtype=bool, copy=False)
+    missing_entry_mask = df["log_close_entry"].isna().to_numpy(dtype=bool, copy=False)
     raw_has_fwd_mask = (
         df.loc[:, raw_keys]
         .merge(raw_fwd, on=list(raw_keys), how="left", sort=False)["raw_has_fwd_minute"]
@@ -184,7 +194,7 @@ def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[p
     )
     raw_missing_mask = missing_fwd_mask & ~raw_has_fwd_mask
     filtered_missing_mask = missing_fwd_mask & raw_has_fwd_mask
-    other_invalid_mask = label_invalid_mask & ~missing_fwd_mask
+    other_invalid_mask = label_invalid_mask & ~missing_fwd_mask & ~missing_entry_mask
 
     # Keep only rows with finite features and label.
     m = np.ones((df.shape[0],), dtype=bool)
@@ -196,12 +206,16 @@ def _add_features_and_label(df: pd.DataFrame, config: DataPrepConfig) -> tuple[p
         "label_alignment": "minute_index_join",
         "dropped_last_h_rows": int(dropped_last_h_rows),
         "horizon_minutes": int(h),
+        "label_entry_lag_minutes": int(entry_lag),
+        "label_definition": "log_close[t+horizon] - log_close[t+entry_lag]",
         "label_invalid_rows": int(label_invalid_mask.sum()),
         "label_invalid_ratio": float(label_invalid_mask.mean()) if int(df.shape[0]) > 0 else float("nan"),
         "label_invalid_missing_fwd_raw_absent_rows": int(raw_missing_mask.sum()),
         "label_invalid_missing_fwd_raw_absent_ratio": float(raw_missing_mask.mean()) if int(df.shape[0]) > 0 else float("nan"),
         "label_invalid_missing_fwd_filtered_rows": int(filtered_missing_mask.sum()),
         "label_invalid_missing_fwd_filtered_ratio": float(filtered_missing_mask.mean()) if int(df.shape[0]) > 0 else float("nan"),
+        "label_invalid_missing_entry_rows": int(missing_entry_mask.sum()),
+        "label_invalid_missing_entry_ratio": float(missing_entry_mask.mean()) if int(df.shape[0]) > 0 else float("nan"),
         "label_invalid_other_rows": int(other_invalid_mask.sum()),
         "label_invalid_other_ratio": float(other_invalid_mask.mean()) if int(df.shape[0]) > 0 else float("nan"),
         "feature_warmup_minutes": int(_FEATURE_WARMUP_MINUTES),
@@ -1286,13 +1300,14 @@ def _write_feature_distribution_overview(
         ax.plot(grid, ref_pdf, color="#dd8452", linewidth=1.6)
         ax.axvline(0.0, color="#999999", linewidth=0.8, linestyle="--")
         ax.set_xlim(-5.0, 5.0)
+        ax.set_yscale("log")
         ax.set_title(
             f"{name}\nμ={float(row['mean']):.2f}, σ={float(row['std']):.2f}, "
             f"skew={float(row['skew']):.2f}, kurt={float(row['kurtosis']):.2f}",
             fontsize=9,
         )
         ax.set_xlabel("zscore")
-        ax.set_ylabel("density")
+        ax.set_ylabel("density (log)")
 
     # Hide unused subplots so the overview stays visually clean.
     for j in range(int(n_feat), int(len(axes_flat))):
@@ -1587,7 +1602,12 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
         if bool(config.use_cross_sectional_gaussianize)
         else {"type": "pooled_zscore", "scope": str(config.norm_fit_scope), "params_path": "pooled_zscore.yaml"}
     )
-    expected_label = {"type": "forward_log_return", "horizon_minutes": int(config.horizon_minutes)}
+    expected_label = {
+        "type": "forward_log_return",
+        "horizon_minutes": int(config.horizon_minutes),
+        "entry_lag_minutes": int(config.label_entry_lag_minutes),
+        "definition": "log_close[t+horizon] - log_close[t+entry_lag]",
+    }
     expected_label_transform = (
         {"type": "pooled_zscore", "scope": str(config.label_norm_fit_scope), "params_path": "label_zscore.yaml"}
         if str(config.label_norm) == "pooled_zscore"
@@ -2127,7 +2147,12 @@ def prepare_npz_splits(config: DataPrepConfig) -> dict[str, object]:
             "time_features": list(time_features),
         },
         "dates": {"train": train_dates, "val": val_dates, "test": test_dates},
-        "label": {"type": "forward_log_return", "horizon_minutes": int(config.horizon_minutes)},
+        "label": {
+            "type": "forward_log_return",
+            "horizon_minutes": int(config.horizon_minutes),
+            "entry_lag_minutes": int(config.label_entry_lag_minutes),
+            "definition": "log_close[t+horizon] - log_close[t+entry_lag]",
+        },
         "label_transform": dict(label_transform),
         "sampling": {"sample_stocks_per_minute": int(config.sample_stocks_per_minute)},
         "audit": {"train": train_audit, "val": val_audit, "test": test_audit},

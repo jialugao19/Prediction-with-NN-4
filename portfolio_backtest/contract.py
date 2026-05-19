@@ -62,6 +62,10 @@ class PortfolioBacktestConfig:
     stock_basic_path: Path
     namechange_path: Path
     top_frac: float
+    slot_mod_bars: int
+    long_enabled: bool
+    short_enabled: bool
+    max_liq_bucket: int
     entry_delay_bars: int
     holding_bars: int
     annual_days: int
@@ -131,9 +135,7 @@ def build_default_portfolio_backtest_config() -> PortfolioBacktestConfig:
     """Build the canonical portfolio backtest configuration."""
     # Define the fixed repo paths and canonical inference input.
     repo_root = Path("/home/maomao/prediction-NN-2")
-    inference_manifest_path = Path(
-        "/data-cache/nn/upgrade_20260328_gru_seq60_h10/date_ranges/run/inference_test/iter_5000/inference_manifest.yaml"
-    )
+    inference_manifest_path = Path("/data-cache/nn/0428/date_ranges/run/inference_test/iter_140000/inference_manifest.yaml")
 
     # Define the portfolio backtest output layout.
     output_dir = Path("/data-cache/nn/0426/portfolio_backtest")
@@ -149,6 +151,10 @@ def build_default_portfolio_backtest_config() -> PortfolioBacktestConfig:
 
     # Define the selection, horizon, and reporting knobs.
     top_frac = 0.10
+    slot_mod_bars = 10
+    long_enabled = True
+    short_enabled = True
+    max_liq_bucket = 3
     entry_delay_bars = 1
     holding_bars = 10
     annual_days = 252
@@ -176,6 +182,10 @@ def build_default_portfolio_backtest_config() -> PortfolioBacktestConfig:
         stock_basic_path=stock_basic_path,
         namechange_path=namechange_path,
         top_frac=top_frac,
+        slot_mod_bars=slot_mod_bars,
+        long_enabled=long_enabled,
+        short_enabled=short_enabled,
+        max_liq_bucket=max_liq_bucket,
         entry_delay_bars=entry_delay_bars,
         holding_bars=holding_bars,
         annual_days=annual_days,

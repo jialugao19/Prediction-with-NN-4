@@ -277,10 +277,12 @@ def build_feature_day_frame(
     allowed_times: set[int],
     entry_delay_bars: int,
     holding_bars: int,
+    slot_mod_bars: int,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """Build one date slice of features aligned with inference signals."""
     # Restrict the signal universe to model-supported times.
     signal_universe = universe.loc[universe["time"].isin(allowed_times)].copy()
+    signal_universe["minute_slot"] = (signal_universe["base_minute"].astype(np.int32) % int(slot_mod_bars)).astype(np.int32)
     raw_universe_rows = int(signal_universe.shape[0])
 
     # Attach predictions to the signal universe with a left join.
@@ -426,6 +428,7 @@ def materialize_feature_chunks(config: PortfolioBacktestConfig) -> str:
                 allowed_times,
                 config.entry_delay_bars,
                 config.holding_bars,
+                config.slot_mod_bars,
             )
             day_frames.append(feat_day)
             audit_rows.append(audit)
@@ -462,6 +465,7 @@ def materialize_feature_chunks(config: PortfolioBacktestConfig) -> str:
         allowed_times,
         config.entry_delay_bars,
         config.holding_bars,
+        config.slot_mod_bars,
     )
     final_output_path = config.feature_chunk_dir / f"part_{len(chunk_paths):06d}_tail.parquet"
     final_feat_day.to_parquet(final_output_path, index=False)
@@ -476,6 +480,7 @@ def materialize_feature_chunks(config: PortfolioBacktestConfig) -> str:
             {
                 "entry_delay_bars": int(config.entry_delay_bars),
                 "holding_bars": int(config.holding_bars),
+                "slot_mod_bars": int(config.slot_mod_bars),
                 "date_count": int(audit_df.shape[0]),
                 "raw_universe_rows_total": float(audit_df["raw_universe_rows"].sum()),
                 "prediction_rows_total": float(audit_df["prediction_rows"].sum()),

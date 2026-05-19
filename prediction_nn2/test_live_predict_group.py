@@ -66,6 +66,7 @@ def test_prepare_npz_splits_builds_formal_inference_groups_without_label_filter(
         test_days=1,
         seed=7,
         horizon_minutes=10,
+        label_entry_lag_minutes=1,
         sample_stocks_per_minute=1,
         use_cross_sectional_gaussianize=False,
         use_ret_signed_log1p=True,
