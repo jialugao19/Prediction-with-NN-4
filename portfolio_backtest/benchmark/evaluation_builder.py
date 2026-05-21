@@ -25,7 +25,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-REPO_ROOT = Path("/home/maomao/prediction-NN-2")
+REPO_ROOT = Path(__file__).resolve().parents[2]
 BENCHMARK_ID = "20260519_b_label"
 BENCHMARK_ROOT = Path("/data-cache/nn/benchmarks/prediction_nn2") / BENCHMARK_ID
 SOURCE_RUN_ROOT = Path("/data-cache/nn/0519/date_ranges")
@@ -77,11 +77,19 @@ def write_yaml(path: Path, payload: dict[str, Any]) -> Path:
 def copy_file(src: Path, dst: Path) -> Path:
     """Copy one artifact file."""
     # Create the destination parent.
+    src = Path(src)
     dst = Path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
 
+    # Reuse an identical existing destination to avoid repeated large checkpoint copies.
+    if dst.exists():
+        src_stat = src.stat()
+        dst_stat = dst.stat()
+        if int(src_stat.st_size) == int(dst_stat.st_size) and int(src_stat.st_mtime_ns) == int(dst_stat.st_mtime_ns):
+            return dst
+
     # Copy metadata with the payload.
-    shutil.copy2(Path(src), dst)
+    shutil.copy2(src, dst)
     return dst
 
 
@@ -108,6 +116,101 @@ def benchmark_path(relative_path: str) -> Path:
     return BENCHMARK_ROOT / str(relative_path)
 
 
+def source_file_fingerprint(path: Path) -> dict[str, Any]:
+    """Summarize one source file for cache invalidation."""
+    # Hash small manifest/config files so rewrites with identical content keep cache valid.
+    stat = Path(path).stat()
+    return {"path": Path(path).as_posix(), "size_bytes": int(stat.st_size), "sha256": sha256_file(Path(path))}
+
+
+def source_file_stat_fingerprint(path: Path) -> dict[str, Any]:
+    """Summarize one large source file without reading its full content."""
+    # Use stat metadata for large YAML files that are expensive to parse or hash.
+    stat = Path(path).stat()
+    return {"path": Path(path).as_posix(), "size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+
+
+def source_manifest_fingerprint(manifest_path: Path) -> dict[str, Any]:
+    """Summarize one prediction manifest for cache invalidation."""
+    # Use manifest metadata and file stat as the stable source identity.
+    manifest = read_yaml(Path(manifest_path))
+    fingerprint = source_file_fingerprint(Path(manifest_path))
+    fingerprint.update(
+        {
+            "row_count": int(manifest["row_count"]),
+            "chunk_count": int(manifest["chunk_count"]),
+            "date_min": int(manifest["date_min"]),
+            "date_max": int(manifest["date_max"]),
+        }
+    )
+    return fingerprint
+
+
+def artifact_cache_payload(cache_key: str, version: int, source_manifest: Path, output_paths: list[Path]) -> dict[str, Any]:
+    """Build the expected metadata for one cached artifact group."""
+    # Record only stable fields so the payload can be compared across runs.
+    return {
+        "schema_version": 1,
+        "cache_key": str(cache_key),
+        "cache_version": int(version),
+        "benchmark_id": BENCHMARK_ID,
+        "best_checkpoint_iter": int(BEST_CHECKPOINT_ITER),
+        "source_manifest": source_manifest_fingerprint(Path(source_manifest)),
+        "outputs": [Path(path).relative_to(BENCHMARK_ROOT).as_posix() for path in list(output_paths)],
+    }
+
+
+def file_cache_payload(cache_key: str, version: int, source_file: Path, output_paths: list[Path]) -> dict[str, Any]:
+    """Build expected cache metadata for artifacts derived from one source file."""
+    # Record the source file identity and declared output list.
+    return {
+        "schema_version": 1,
+        "cache_key": str(cache_key),
+        "cache_version": int(version),
+        "benchmark_id": BENCHMARK_ID,
+        "best_checkpoint_iter": int(BEST_CHECKPOINT_ITER),
+        "source_file": source_file_fingerprint(Path(source_file)),
+        "outputs": [Path(path).relative_to(BENCHMARK_ROOT).as_posix() for path in list(output_paths)],
+    }
+
+
+def multi_file_stat_cache_payload(cache_key: str, version: int, source_files: list[Path], output_paths: list[Path]) -> dict[str, Any]:
+    """Build cache metadata for outputs derived from several large source files."""
+    # Fingerprint large inputs by stat to avoid repeated full-file reads.
+    return {
+        "schema_version": 1,
+        "cache_key": str(cache_key),
+        "cache_version": int(version),
+        "benchmark_id": BENCHMARK_ID,
+        "best_checkpoint_iter": int(BEST_CHECKPOINT_ITER),
+        "source_files": [source_file_stat_fingerprint(Path(path)) for path in list(source_files)],
+        "outputs": [Path(path).relative_to(BENCHMARK_ROOT).as_posix() for path in list(output_paths)],
+    }
+
+
+def cached_artifacts_are_current(cache_path: Path, expected: dict[str, Any], output_paths: list[Path]) -> bool:
+    """Return whether one cached artifact group can be reused."""
+    # Require every declared output to exist before trusting metadata.
+    for output_path in list(output_paths):
+        if not Path(output_path).exists():
+            return False
+
+    # Compare stable metadata and let parse errors fail loudly.
+    if not Path(cache_path).exists():
+        return False
+    cached = read_yaml(Path(cache_path))
+    cached.pop("generated_at", None)
+    return cached == dict(expected)
+
+
+def write_artifact_cache(cache_path: Path, payload: dict[str, Any]) -> Path:
+    """Persist one cached artifact metadata record."""
+    # Add run time only after cache comparison metadata is fixed.
+    out = dict(payload)
+    out["generated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    return write_yaml(Path(cache_path), out)
+
+
 def parquet_paths_from_manifest(manifest_path: Path, key: str) -> list[Path]:
     """Resolve parquet chunk paths from a manifest."""
     # Load the manifest payload.
@@ -131,6 +234,36 @@ def sync_latest_training_artifacts() -> dict[str, str]:
     # Create the benchmark skeleton directories and copy small static metadata.
     for relative_dir in ["data", "model", "train", "predictions", "evaluation", "reports", "code"]:
         (BENCHMARK_ROOT / relative_dir).mkdir(parents=True, exist_ok=True)
+    source_files = [
+        SOURCE_RUN_ROOT / "artifacts" / "npz" / "meta.yaml",
+        SOURCE_RUN_ROOT / "manifests" / "train.yaml",
+        SOURCE_RUN_ROOT / "run" / "eval_train" / f"iter_{BEST_CHECKPOINT_ITER}" / "predict_manifest.yaml",
+        SOURCE_RUN_ROOT / "run" / "eval_test" / f"iter_{BEST_CHECKPOINT_ITER}" / "predict_manifest.yaml",
+        SOURCE_RUN_ROOT / "run" / "inference_test" / f"iter_{BEST_CHECKPOINT_ITER}" / "inference_manifest.yaml",
+        SOURCE_RUN_ROOT / "train_report.html",
+        SOURCE_RUN_ROOT / "run" / "ckpt" / f"iter_{BEST_CHECKPOINT_ITER}.pt",
+    ]
+    output_paths = [
+        BENCHMARK_ROOT / "data" / "npz_meta.yaml",
+        BENCHMARK_ROOT / "data" / "normalization_contract.yaml",
+        BENCHMARK_ROOT / "data" / "feature_names.yaml",
+        BENCHMARK_ROOT / "predictions" / "train_predict_manifest.yaml",
+        BENCHMARK_ROOT / "predictions" / "test_predict_manifest.yaml",
+        BENCHMARK_ROOT / "predictions" / "inference_test_manifest.yaml",
+        BENCHMARK_ROOT / "train" / "checkpoint_manifest.yaml",
+        BENCHMARK_ROOT / "train" / "checkpoint_metrics.csv",
+        BENCHMARK_ROOT / "train" / "train_config.yaml",
+        BENCHMARK_ROOT / "train" / "tensorboard_manifest.yaml",
+        BENCHMARK_ROOT / "train" / "train_loss_curve.png",
+        BENCHMARK_ROOT / "model" / "best_checkpoint.pt",
+    ]
+    cache_path = BENCHMARK_ROOT / "evaluation" / "cache" / "latest_training_artifacts.yaml"
+    expected_cache = multi_file_stat_cache_payload("latest_training_artifacts", 1, source_files, output_paths)
+    if cached_artifacts_are_current(cache_path, expected_cache, output_paths):
+        copy_training_post_eval_artifacts()
+        return {"status": "cached", "source_run_root": SOURCE_RUN_ROOT.as_posix()}
+
+    # Copy template files only when the source bundle changed or cache is missing.
     for relative_path in ["benchmark.yaml", "code/diff.patch", "code/git_snapshot.yaml", "code/source_files_manifest.yaml", "model/effective_model_summary.yaml", "model/state_dict_summary.yaml", "train/train_config.yaml"]:
         optional_copy_file(BASELINE_TEMPLATE_ROOT / relative_path, BENCHMARK_ROOT / relative_path)
 
@@ -220,6 +353,7 @@ def sync_latest_training_artifacts() -> dict[str, str]:
 
     # Sync model IC artifacts that exist in the latest run.
     copy_training_post_eval_artifacts()
+    write_artifact_cache(cache_path, expected_cache)
     return {"status": "synced", "source_run_root": SOURCE_RUN_ROOT.as_posix()}
 
 
@@ -390,6 +524,19 @@ def standardize_signal_metrics() -> pd.DataFrame:
     """Write the stable signal bucket metrics table."""
     # Resolve latest eval-test prediction chunks.
     pred_manifest = SOURCE_RUN_ROOT / "run" / "eval_test" / f"iter_{BEST_CHECKPOINT_ITER}" / "predict_manifest.yaml"
+    output_paths = [
+        BENCHMARK_ROOT / "evaluation" / "signal_bucket_metrics.csv",
+        BENCHMARK_ROOT / "evaluation" / "top_tail_metrics.csv",
+        BENCHMARK_ROOT / "evaluation" / "model_signal_monotonicity_daily.csv",
+        BENCHMARK_ROOT / "evaluation" / "figures" / "model_signal_decile_return.png",
+        BENCHMARK_ROOT / "evaluation" / "figures" / "model_signal_top_minus_bottom.png",
+    ]
+    cache_path = BENCHMARK_ROOT / "evaluation" / "cache" / "signal_bucket_metrics.yaml"
+    expected_cache = artifact_cache_payload("signal_bucket_metrics", 2, pred_manifest, output_paths)
+    if cached_artifacts_are_current(cache_path, expected_cache, output_paths):
+        return pd.read_csv(BENCHMARK_ROOT / "evaluation" / "signal_bucket_metrics.csv")
+
+    # Read prediction chunks only when the cached artifact is stale or missing.
     pred_paths = parquet_paths_from_manifest(pred_manifest, "chunk_files")
     pred_sql_paths = duckdb_path_list(pred_paths)
 
@@ -473,6 +620,7 @@ def standardize_signal_metrics() -> pd.DataFrame:
     fig.tight_layout()
     fig.savefig(figure_dir / "model_signal_top_minus_bottom.png", dpi=160)
     plt.close(fig)
+    write_artifact_cache(cache_path, expected_cache)
     return out
 
 
@@ -504,6 +652,16 @@ def build_time_bucket_metrics() -> pd.DataFrame:
     """Write the stable time bucket attribution table."""
     # Aggregate target return by intraday time from latest eval-test predictions.
     pred_manifest = SOURCE_RUN_ROOT / "run" / "eval_test" / f"iter_{BEST_CHECKPOINT_ITER}" / "predict_manifest.yaml"
+    output_paths = [
+        BENCHMARK_ROOT / "evaluation" / "time_bucket_metrics.csv",
+        BENCHMARK_ROOT / "evaluation" / "time_bucket_metrics.yaml",
+    ]
+    cache_path = BENCHMARK_ROOT / "evaluation" / "cache" / "time_bucket_metrics.yaml"
+    expected_cache = artifact_cache_payload("time_bucket_metrics", 1, pred_manifest, output_paths)
+    if cached_artifacts_are_current(cache_path, expected_cache, output_paths):
+        return pd.read_csv(BENCHMARK_ROOT / "evaluation" / "time_bucket_metrics.csv")
+
+    # Scan the eval-test parquet only when the compact time artifact is stale.
     pred_sql_paths = duckdb_path_list(parquet_paths_from_manifest(pred_manifest, "chunk_files"))
     con = duckdb.connect()
     con.execute("set threads to 8")
@@ -532,6 +690,7 @@ def build_time_bucket_metrics() -> pd.DataFrame:
         BENCHMARK_ROOT / "evaluation" / "time_bucket_metrics.yaml",
         {"schema_version": 1, "status": "computed", "metrics_csv": "evaluation/time_bucket_metrics.csv", "row_count": int(out.shape[0])},
     )
+    write_artifact_cache(cache_path, expected_cache)
     return out
 
 
@@ -539,6 +698,16 @@ def build_extreme_value_metrics() -> dict[str, Any]:
     """Write extreme value diagnostics."""
     # Resolve latest eval-test prediction chunks.
     pred_manifest = SOURCE_RUN_ROOT / "run" / "eval_test" / f"iter_{BEST_CHECKPOINT_ITER}" / "predict_manifest.yaml"
+    output_paths = [
+        BENCHMARK_ROOT / "evaluation" / "extreme_value_metrics.csv",
+        BENCHMARK_ROOT / "evaluation" / "extreme_value_metrics.yaml",
+    ]
+    cache_path = BENCHMARK_ROOT / "evaluation" / "cache" / "extreme_value_metrics.yaml"
+    expected_cache = artifact_cache_payload("extreme_value_metrics", 1, pred_manifest, output_paths)
+    if cached_artifacts_are_current(cache_path, expected_cache, output_paths):
+        return read_yaml(BENCHMARK_ROOT / "evaluation" / "extreme_value_metrics.yaml")
+
+    # Build tail metrics only when cached output is stale.
     pred_sql_paths = duckdb_path_list(parquet_paths_from_manifest(pred_manifest, "chunk_files"))
 
     # Aggregate target-tail diagnostics in DuckDB.
@@ -588,6 +757,7 @@ def build_extreme_value_metrics() -> dict[str, Any]:
     rows.to_csv(csv_path, index=False)
     payload = {"schema_version": 1, "status": "computed", "metrics_csv": "evaluation/extreme_value_metrics.csv", "rows": rows.to_dict(orient="records")}
     write_yaml(BENCHMARK_ROOT / "evaluation" / "extreme_value_metrics.yaml", payload)
+    write_artifact_cache(cache_path, expected_cache)
     return payload
 
 
@@ -596,6 +766,16 @@ def build_normalization_metrics() -> dict[str, Any]:
     # Load frozen normalization and latest eval-test prediction chunks.
     norm = read_yaml(BENCHMARK_ROOT / "data" / "normalization_contract.yaml")
     pred_manifest = SOURCE_RUN_ROOT / "run" / "eval_test" / f"iter_{BEST_CHECKPOINT_ITER}" / "predict_manifest.yaml"
+    output_paths = [
+        BENCHMARK_ROOT / "evaluation" / "normalization_metrics.csv",
+        BENCHMARK_ROOT / "evaluation" / "normalization_metrics.yaml",
+    ]
+    cache_path = BENCHMARK_ROOT / "evaluation" / "cache" / "normalization_metrics.yaml"
+    expected_cache = artifact_cache_payload("normalization_metrics", 1, pred_manifest, output_paths)
+    if cached_artifacts_are_current(cache_path, expected_cache, output_paths):
+        return read_yaml(BENCHMARK_ROOT / "evaluation" / "normalization_metrics.yaml")
+
+    # Scan prediction chunks only when the distribution diagnostics are stale.
     pred_paths = parquet_paths_from_manifest(pred_manifest, "chunk_files")
     pred_sql_paths = duckdb_path_list(pred_paths)
 
@@ -663,6 +843,7 @@ def build_normalization_metrics() -> dict[str, Any]:
     out.to_csv(BENCHMARK_ROOT / "evaluation" / "normalization_metrics.csv", index=False)
     payload = {"schema_version": 1, "status": "computed", "metrics_csv": "evaluation/normalization_metrics.csv", "normalization_contract": "data/normalization_contract.yaml"}
     write_yaml(BENCHMARK_ROOT / "evaluation" / "normalization_metrics.yaml", payload)
+    write_artifact_cache(cache_path, expected_cache)
     return payload
 
 
@@ -827,6 +1008,16 @@ def build_residual_diagnostics() -> dict[str, Any]:
     """Build residual diagnostics from selected eval-test predictions."""
     # Resolve prediction chunks and aggregate residual moments.
     pred_manifest = SOURCE_RUN_ROOT / "run" / "eval_test" / f"iter_{BEST_CHECKPOINT_ITER}" / "predict_manifest.yaml"
+    output_paths = [
+        BENCHMARK_ROOT / "evaluation" / "model_ic" / "test_residual_diagnostics.yaml",
+        BENCHMARK_ROOT / "evaluation" / "figures" / "test_residual_diagnostics.png",
+    ]
+    cache_path = BENCHMARK_ROOT / "evaluation" / "cache" / "residual_diagnostics.yaml"
+    expected_cache = artifact_cache_payload("residual_diagnostics", 1, pred_manifest, output_paths)
+    if cached_artifacts_are_current(cache_path, expected_cache, output_paths):
+        return read_yaml(BENCHMARK_ROOT / "evaluation" / "model_ic" / "test_residual_diagnostics.yaml")
+
+    # Scan prediction chunks only when residual diagnostics are stale.
     pred_paths = parquet_paths_from_manifest(pred_manifest, "chunk_files")
     pred_sql_paths = duckdb_path_list(pred_paths)
     out_dir = BENCHMARK_ROOT / "evaluation" / "model_ic"
@@ -880,6 +1071,7 @@ def build_residual_diagnostics() -> dict[str, Any]:
     fig.tight_layout()
     fig.savefig(figure_dir / "test_residual_diagnostics.png", dpi=160)
     plt.close(fig)
+    write_artifact_cache(cache_path, expected_cache)
     return payload
 
 
@@ -888,6 +1080,24 @@ def build_training_diagnostics() -> dict[str, str]:
     # Prepare the output directory.
     out_dir = BENCHMARK_ROOT / "train" / "diagnostics"
     out_dir.mkdir(parents=True, exist_ok=True)
+    output_paths = [
+        out_dir / "checkpoint_parameter_update_norms.csv",
+        out_dir / "gradient_norm_availability.yaml",
+        out_dir / "train_val_gap.csv",
+        out_dir / "train_runtime_scalar_summary.csv",
+        out_dir / "train_runtime_scalar_summary.yaml",
+        out_dir / "checkpoint_selector_table.csv",
+    ]
+    cache_path = BENCHMARK_ROOT / "evaluation" / "cache" / "training_diagnostics.yaml"
+    expected_cache = file_cache_payload("training_diagnostics", 1, BENCHMARK_ROOT / "train" / "checkpoint_manifest.yaml", output_paths)
+    if cached_artifacts_are_current(cache_path, expected_cache, output_paths):
+        return {
+            "checkpoint_parameter_update_norms": "train/diagnostics/checkpoint_parameter_update_norms.csv",
+            "gradient_norm_availability": "train/diagnostics/gradient_norm_availability.yaml",
+            "train_val_gap": "train/diagnostics/train_val_gap.csv",
+            "train_runtime_scalar_summary": "train/diagnostics/train_runtime_scalar_summary.csv",
+            "checkpoint_selector_table": "train/diagnostics/checkpoint_selector_table.csv",
+        }
 
     # Compute parameter and update norms from retained checkpoints.
     ckpt_manifest = read_yaml(BENCHMARK_ROOT / "train" / "checkpoint_manifest.yaml")
@@ -969,6 +1179,7 @@ def build_training_diagnostics() -> dict[str, str]:
     selector["decision"] = np.where(selector["val/objective/mse"].astype(float) == best_mse, "promote", "reject")
     selector["reason"] = np.where(selector["decision"] == "promote", "minimum validation MSE among retained candidate checkpoints", "validation MSE is higher than selected checkpoint")
     selector.to_csv(out_dir / "checkpoint_selector_table.csv", index=False)
+    write_artifact_cache(cache_path, expected_cache)
 
     return {
         "checkpoint_parameter_update_norms": "train/diagnostics/checkpoint_parameter_update_norms.csv",
@@ -1286,4 +1497,3 @@ def readable_csv(path: Path) -> bool:
         return True
     except Exception:
         return False
-

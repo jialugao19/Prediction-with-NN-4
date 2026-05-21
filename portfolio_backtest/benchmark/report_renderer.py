@@ -13,7 +13,7 @@ import pandas as pd
 import yaml
 
 from prediction_nn2.html_report import build_page, render_block_title, render_code_block, render_embedded_figure, render_html_table, render_section, render_subsection, render_table, render_value_rows
-from portfolio_backtest.benchmark.evaluation_builder import BENCHMARK_ID, BENCHMARK_ROOT, BEST_CHECKPOINT_ITER, REPORT_FIGURE_DIR, REPO_BENCHMARK_REPORT_DIR, REPO_ROOT, SOURCE_RUN_ROOT, copy_file, read_yaml
+from portfolio_backtest.benchmark.evaluation_builder import BENCHMARK_ID, BENCHMARK_ROOT, BEST_CHECKPOINT_ITER, REPORT_FIGURE_DIR, REPO_BENCHMARK_REPORT_DIR, REPO_ROOT, SOURCE_RUN_ROOT, cached_artifacts_are_current, copy_file, multi_file_stat_cache_payload, read_yaml, write_artifact_cache, write_yaml
 from portfolio_backtest.benchmark.report_fields import FIELD_DEFINITIONS, display_metric_name, format_report_cell, format_report_value
 
 
@@ -620,32 +620,91 @@ def save_volatility_bucket_stability_figure(out_path: Path) -> Path:
     return out_path
 
 
+def figure_is_current(out_path: Path, input_paths: list[Path]) -> bool:
+    """Return whether one figure is newer than all source tables."""
+    # Require the figure and every input table before comparing mtimes.
+    if not Path(out_path).exists():
+        return False
+    for input_path in list(input_paths):
+        if not Path(input_path).exists():
+            return False
+
+    # Reuse the figure when no source table is newer.
+    output_mtime = Path(out_path).stat().st_mtime_ns
+    return all(output_mtime >= Path(input_path).stat().st_mtime_ns for input_path in list(input_paths))
+
+
+def build_or_reuse_figure(name: str, out_path: Path, input_paths: list[Path], builders: dict[str, Any]) -> Path:
+    """Build one report figure only when its source tables changed."""
+    # Skip matplotlib work when the figure already reflects its small source artifacts.
+    if figure_is_current(Path(out_path), list(input_paths)):
+        return Path(out_path)
+
+    # Dispatch to the explicit figure builder.
+    return Path(builders[str(name)]())
+
+
 def build_report_figures(summary: dict[str, Any], train_ic: dict[str, Any], test_ic: dict[str, Any]) -> dict[str, Path]:
     """Build all report-specific figures."""
     # Ensure the target figure directory exists.
     configure_report_plot_style()
     REPORT_FIGURE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Render every figure from the existing benchmark tables.
+    # Register figure builders and their compact source artifacts.
+    builders: dict[str, Any] = {
+        "ic_summary": lambda: save_ic_summary_figure(train_ic, test_ic, REPORT_FIGURE_DIR / "ic_summary_bar.png"),
+        "checkpoint": lambda: save_checkpoint_selection_figure(REPORT_FIGURE_DIR / "checkpoint_selection_metrics.png"),
+        "signal_quality": lambda: save_signal_quality_figure(REPORT_FIGURE_DIR / "signal_bucket_return_hit_rate.png"),
+        "trading_cost": lambda: save_trading_cost_figure(REPORT_FIGURE_DIR / "trading_cost_bridge.png"),
+        "time_bucket": lambda: save_time_bucket_figure(REPORT_FIGURE_DIR / "time_bucket_net_bps_per_turnover.png"),
+        "liquidity_top": lambda: save_liquidity_top_bucket_figure(REPORT_FIGURE_DIR / "liquidity_top_signal_bucket.png"),
+        "pred_target_distribution": lambda: save_prediction_target_distribution_figure(REPORT_FIGURE_DIR / "prediction_target_distribution.png"),
+        "pred_target_scale": lambda: save_prediction_target_scale_by_checkpoint_figure(REPORT_FIGURE_DIR / "prediction_target_scale_by_checkpoint.png"),
+        "bootstrap_ci": lambda: save_bootstrap_ci_figure(REPORT_FIGURE_DIR / "bootstrap_confidence_intervals.png"),
+        "month_stability": lambda: save_month_stability_figure(REPORT_FIGURE_DIR / "month_stability_metrics.png"),
+        "regime_stability": lambda: save_regime_stability_figure(REPORT_FIGURE_DIR / "regime_stability_metrics.png"),
+        "volatility_stability": lambda: save_volatility_bucket_stability_figure(REPORT_FIGURE_DIR / "volatility_bucket_stability_metrics.png"),
+    }
+    figure_specs = {
+        "ic_summary": (REPORT_FIGURE_DIR / "ic_summary_bar.png", [BENCHMARK_ROOT / "evaluation" / "model_ic" / "daily_ic_summary_train.yaml", BENCHMARK_ROOT / "evaluation" / "model_ic" / "daily_ic_summary_test.yaml"]),
+        "checkpoint": (REPORT_FIGURE_DIR / "checkpoint_selection_metrics.png", [BENCHMARK_ROOT / "train" / "diagnostics" / "checkpoint_selector_table.csv"]),
+        "signal_quality": (REPORT_FIGURE_DIR / "signal_bucket_return_hit_rate.png", [BENCHMARK_ROOT / "evaluation" / "signal_bucket_metrics.csv"]),
+        "trading_cost": (REPORT_FIGURE_DIR / "trading_cost_bridge.png", [BENCHMARK_ROOT / "evaluation" / "trading_rule_metrics.csv"]),
+        "time_bucket": (REPORT_FIGURE_DIR / "time_bucket_net_bps_per_turnover.png", [BENCHMARK_ROOT / "evaluation" / "time_bucket_metrics.csv"]),
+        "liquidity_top": (REPORT_FIGURE_DIR / "liquidity_top_signal_bucket.png", [BENCHMARK_ROOT / "evaluation" / "liquidity_bucket_metrics.csv"]),
+        "pred_target_distribution": (REPORT_FIGURE_DIR / "prediction_target_distribution.png", [BENCHMARK_ROOT / "evaluation" / "normalization_metrics.csv"]),
+        "pred_target_scale": (REPORT_FIGURE_DIR / "prediction_target_scale_by_checkpoint.png", [BENCHMARK_ROOT / "train" / "diagnostics" / "checkpoint_selector_table.csv"]),
+        "bootstrap_ci": (REPORT_FIGURE_DIR / "bootstrap_confidence_intervals.png", [BENCHMARK_ROOT / "evaluation" / "bootstrap_confidence_intervals.csv"]),
+        "month_stability": (REPORT_FIGURE_DIR / "month_stability_metrics.png", [BENCHMARK_ROOT / "evaluation" / "month_stability_metrics.csv"]),
+        "regime_stability": (REPORT_FIGURE_DIR / "regime_stability_metrics.png", [BENCHMARK_ROOT / "evaluation" / "regime_stability_metrics.csv"]),
+        "volatility_stability": (REPORT_FIGURE_DIR / "volatility_bucket_stability_metrics.png", [BENCHMARK_ROOT / "evaluation" / "volatility_bucket_stability_metrics.csv"]),
+    }
+
+    # Render only stale figures from the existing benchmark tables.
     figures = {
-        "ic_summary": save_ic_summary_figure(train_ic, test_ic, REPORT_FIGURE_DIR / "ic_summary_bar.png"),
-        "checkpoint": save_checkpoint_selection_figure(REPORT_FIGURE_DIR / "checkpoint_selection_metrics.png"),
-        "signal_quality": save_signal_quality_figure(REPORT_FIGURE_DIR / "signal_bucket_return_hit_rate.png"),
-        "trading_cost": save_trading_cost_figure(REPORT_FIGURE_DIR / "trading_cost_bridge.png"),
-        "time_bucket": save_time_bucket_figure(REPORT_FIGURE_DIR / "time_bucket_net_bps_per_turnover.png"),
-        "liquidity_top": save_liquidity_top_bucket_figure(REPORT_FIGURE_DIR / "liquidity_top_signal_bucket.png"),
-        "pred_target_distribution": save_prediction_target_distribution_figure(REPORT_FIGURE_DIR / "prediction_target_distribution.png"),
-        "pred_target_scale": save_prediction_target_scale_by_checkpoint_figure(REPORT_FIGURE_DIR / "prediction_target_scale_by_checkpoint.png"),
-        "bootstrap_ci": save_bootstrap_ci_figure(REPORT_FIGURE_DIR / "bootstrap_confidence_intervals.png"),
-        "month_stability": save_month_stability_figure(REPORT_FIGURE_DIR / "month_stability_metrics.png"),
-        "regime_stability": save_regime_stability_figure(REPORT_FIGURE_DIR / "regime_stability_metrics.png"),
-        "volatility_stability": save_volatility_bucket_stability_figure(REPORT_FIGURE_DIR / "volatility_bucket_stability_metrics.png"),
+        name: build_or_reuse_figure(name, out_path, input_paths, builders)
+        for name, (out_path, input_paths) in dict(figure_specs).items()
     }
     return figures
 
 
 def basic_info_rows() -> dict[str, list[tuple[str, str]]]:
     """Build basic data, model, and method rows for reports."""
+    # Reuse the compact report data cache to avoid reparsing the large npz meta YAML.
+    cache_output = BENCHMARK_ROOT / "reports" / "cache" / "basic_info_rows.yaml"
+    cache_path = BENCHMARK_ROOT / "reports" / "cache" / "basic_info_rows.cache.yaml"
+    source_files = [
+        BENCHMARK_ROOT / "data" / "npz_meta.yaml",
+        BENCHMARK_ROOT / "data" / "normalization_contract.yaml",
+        BENCHMARK_ROOT / "model" / "effective_model_summary.yaml",
+        BENCHMARK_ROOT / "train" / "train_config.yaml",
+        BENCHMARK_ROOT / "train" / "checkpoint_manifest.yaml",
+    ]
+    expected_cache = multi_file_stat_cache_payload("basic_info_rows", 1, source_files, [cache_output])
+    if cached_artifacts_are_current(cache_path, expected_cache, [cache_output]):
+        cached = read_yaml(cache_output)
+        return {str(key): [tuple(item) for item in list(value)] for key, value in dict(cached).items()}
+
     # Load frozen contracts.
     meta = read_yaml(BENCHMARK_ROOT / "data" / "npz_meta.yaml")
     norm = read_yaml(BENCHMARK_ROOT / "data" / "normalization_contract.yaml")
@@ -699,7 +758,11 @@ def basic_info_rows() -> dict[str, list[tuple[str, str]]]:
         ("backtest_method", "q95_q80_signal_proxy from eval_test prediction buckets; execution backtest is not materialized."),
         ("evaluation_contract", "join validation, IC, signal/time/extreme/normalization/proxy trading metrics, comparison against parent."),
     ]
-    return {"data": data_rows, "model": model_rows, "method": method_rows}
+    # Persist a compact cache for report-only rerenders.
+    out = {"data": [list(row) for row in data_rows], "model": [list(row) for row in model_rows], "method": [list(row) for row in method_rows]}
+    write_yaml(cache_output, out)
+    write_artifact_cache(cache_path, expected_cache)
+    return {str(key): [tuple(item) for item in list(value)] for key, value in dict(out).items()}
 
 
 def markdown_table_from_csv(path: Path, n_rows: int) -> str:
@@ -1472,5 +1535,3 @@ def write_evaluation_card_html(summary: dict[str, Any], comparison: dict[str, An
     out.write_text(html, encoding="utf-8")
     copy_file(out, REPO_BENCHMARK_REPORT_DIR / "current_baseline_evaluation_card.html")
     return out
-
-
