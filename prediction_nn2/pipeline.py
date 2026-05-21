@@ -68,12 +68,20 @@ class PipelineConfig:
     data_prep_workers: int
     batch_size: int
     num_workers: int
+    dataloader_pin_memory: bool
+    dataloader_prefetch_factor: int
+    dataloader_persistent_workers: bool
     num_iters: int
     save_every: int
     eval_every: int
     eval_during: bool
     eval_during_num_iters: int
     eval_batch_size: int
+    train_profile_section: str
+    train_profile_wait: int
+    train_profile_warmup: int
+    train_profile_active: int
+    train_profile_repeat: int
     learning_rate: float
     hidden_dims: list[int]
     dropout: float
@@ -211,6 +219,20 @@ def _train_stage_contract(cfg: PipelineConfig, feature_dim: int, train_rows: int
         "use_lr_sched": "custom",
         "num_iters": int(effective_num_iters),
         "lr_scheduler": _lr_scheduler_contract(cfg, int(train_rows)),
+        "dataloader": {
+            "batch_size": int(cfg.batch_size),
+            "num_workers": int(cfg.num_workers),
+            "pin_memory": bool(cfg.dataloader_pin_memory),
+            "prefetch_factor": int(cfg.dataloader_prefetch_factor),
+            "persistent_workers": bool(cfg.dataloader_persistent_workers),
+        },
+        "profiler": {
+            "profile_section": str(cfg.train_profile_section),
+            "wait": int(cfg.train_profile_wait),
+            "warmup": int(cfg.train_profile_warmup),
+            "active": int(cfg.train_profile_active),
+            "repeat": int(cfg.train_profile_repeat),
+        },
     }
 
 
@@ -340,6 +362,10 @@ def _model_summary(cfg: PipelineConfig, feature_dim: int, train_rows: int) -> tu
         ("save_every", str(int(cfg.save_every))),
         ("eval_every", str(int(cfg.eval_every))),
         ("num_workers", str(int(cfg.num_workers))),
+        ("dataloader_pin_memory", str(bool(cfg.dataloader_pin_memory))),
+        ("dataloader_prefetch_factor", str(int(cfg.dataloader_prefetch_factor))),
+        ("dataloader_persistent_workers", str(bool(cfg.dataloader_persistent_workers))),
+        ("train_profile_section", str(cfg.train_profile_section)),
     ]
     return rows, model_cfg
 
@@ -486,6 +512,9 @@ def _build_qmodel_config(cfg: PipelineConfig, feature_dim: int, run_root: Path, 
         expr_name="prediction-nn-2",
         batch_size=int(cfg.batch_size),
         num_workers=int(cfg.num_workers),
+        dataloader_pin_memory=bool(cfg.dataloader_pin_memory),
+        dataloader_prefetch_factor=int(cfg.dataloader_prefetch_factor),
+        dataloader_persistent_workers=bool(cfg.dataloader_persistent_workers),
         num_iters=int(effective_num_iters),
         save_every=int(cfg.save_every),
         eval_every=int(cfg.eval_every),
@@ -498,13 +527,13 @@ def _build_qmodel_config(cfg: PipelineConfig, feature_dim: int, run_root: Path, 
         tensorboard_dir=str(Path(run_root) / "run" / "tb"),
         lr_scheduler=LRSchedulerConfig(**lr_scheduler_cfg),
         profiler=SimpleNamespace(
-            profile_section="none",
+            profile_section=str(cfg.train_profile_section),
             profile_dir=str(Path(run_root) / "run" / "profile"),
             all_ranks=False,
-            wait=0,
-            warmup=0,
-            active=0,
-            repeat=0,
+            wait=int(cfg.train_profile_wait),
+            warmup=int(cfg.train_profile_warmup),
+            active=int(cfg.train_profile_active),
+            repeat=int(cfg.train_profile_repeat),
         ),
         evaluator=evaluator,
         eval_metric_fns=[builtin.eval_global_ic, builtin.eval_rank_ic, builtin.eval_distribution_scalars, _eval_mse_metric],
@@ -843,7 +872,13 @@ def _run_train_report_postprocess(
         "train": {
             "device": str(device),
             "pin_memory": bool(pin_memory),
+            "dataloader_pin_memory": bool(cfg.dataloader_pin_memory),
+            "dataloader_prefetch_factor": int(cfg.dataloader_prefetch_factor),
+            "dataloader_persistent_workers": bool(cfg.dataloader_persistent_workers),
+            "batch_size": int(cfg.batch_size),
+            "eval_batch_size": int(cfg.eval_batch_size),
             "num_workers": int(cfg.num_workers),
+            "train_profile_section": str(cfg.train_profile_section),
         },
         "eval": {
             "summary_stream_seconds": float(t_summary1 - t_summary0),
@@ -1085,7 +1120,12 @@ def _render_train_report_html(
         ("summary_stream_seconds", f"{float(perf['eval']['summary_stream_seconds']):.4f}"),
         ("rolling_ic_seconds", f"{float(perf['eval']['rolling_ic_seconds']):.4f}"),
         ("device", str(perf["train"]["device"])),
+        ("batch_size", str(int(perf["train"]["batch_size"]))),
         ("num_workers", str(int(perf["train"]["num_workers"]))),
+        ("dataloader_pin_memory", str(bool(perf["train"]["dataloader_pin_memory"]))),
+        ("dataloader_prefetch_factor", str(int(perf["train"]["dataloader_prefetch_factor"]))),
+        ("dataloader_persistent_workers", str(bool(perf["train"]["dataloader_persistent_workers"]))),
+        ("train_profile_section", str(perf["train"]["train_profile_section"])),
     ]
 
     # Assemble the final self-contained single-column HTML report.
@@ -1815,14 +1855,22 @@ def _default_config() -> PipelineConfig:
         data_prep_label_norm_fit_scope="train_only",
         data_prep_days_per_call=100,
         data_prep_workers=32,
-        batch_size=4096,
-        num_workers=4,
+        batch_size=8192,
+        num_workers=8,
+        dataloader_pin_memory=True,
+        dataloader_prefetch_factor=4,
+        dataloader_persistent_workers=True,
         num_iters=140001,
         save_every=35000,
         eval_every=10000,
         eval_during=False,
         eval_during_num_iters=0,
-        eval_batch_size=4096,
+        eval_batch_size=8192,
+        train_profile_section="none",
+        train_profile_wait=20,
+        train_profile_warmup=5,
+        train_profile_active=20,
+        train_profile_repeat=1,
         learning_rate=1e-3,
         hidden_dims=[512, 512],
         dropout=0.0,

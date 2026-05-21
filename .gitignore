@@ -2,6 +2,8 @@
 # data / evaluation 产出
 ############################
 data/
+!qmodel/qmodel/data/
+!qmodel/qmodel/data/*.py
 
 # evaluation 中间结果
 evaluation/factor_panel_*.parquet
