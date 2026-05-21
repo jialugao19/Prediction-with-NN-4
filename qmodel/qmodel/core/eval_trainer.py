@@ -54,23 +54,35 @@ class _AsyncBase:
         self.grad_clip_norm = grad_clip_norm
 
     def _h2d_transfer(self, curr_it: int):
+        """Fetch one CPU batch and submit its host-to-device transfer."""
+        # Measure Python/DataLoader time separately from CUDA copy time.
+        loader_t0 = time.perf_counter()
         with torch.profiler.record_function(f"_h2d_transfer_{curr_it}"):
             try:
                 data, target, other_meta = next(self.it)
             except StopIteration:
-                return torch.Tensor(), torch.Tensor(), None, None
+                return torch.Tensor(), torch.Tensor(), None, None, 0.0, 0.0, None, None
+            loader_cpu_ms = (time.perf_counter() - loader_t0) * 1000.0
 
+            # Submit non-blocking H2D copies on the transfer stream.
+            h2d_submit_t0 = time.perf_counter()
             with torch.cuda.stream(self.stream1):  # type: ignore
                 assert data.is_pinned()
+                h2d_start = torch.cuda.Event(enable_timing=True)
+                h2d_end = torch.cuda.Event(enable_timing=True)
+                h2d_start.record(self.stream1)
                 data = data.to(self.device, non_blocking=True)
                 if self.move_target:
                     assert target.is_pinned()
                     target = target.to(self.device, non_blocking=True)
+                h2d_end.record(self.stream1)
+            h2d_submit_ms = (time.perf_counter() - h2d_submit_t0) * 1000.0
 
+            # Return the completion event that the model stream must wait on.
             event = torch.cuda.Event()
             event.record(self.stream1)
 
-            return data, target, other_meta, event
+            return data, target, other_meta, event, loader_cpu_ms, h2d_submit_ms, h2d_start, h2d_end
 
     def _init(self):
         raise NotImplementedError
@@ -109,7 +121,9 @@ class _AsyncBase:
             # Measure per-iteration CPU wall time for iter_ms.
             iter_t0 = time.perf_counter()
             self._pre_step(curr_it)
-            data, target, other_meta, event1 = f1.result()
+            checkpoint_ms = float(getattr(self, "_last_pre_step_ms", 0.0))
+            self._last_pre_step_ms = 0.0
+            data, target, other_meta, event1, loader_cpu_ms, h2d_submit_ms, h2d_start, h2d_end = f1.result()
             if event1 is None:  # means finished
                 break
 
@@ -128,6 +142,7 @@ class _AsyncBase:
             with torch.cuda.stream(self.model_stream):  # type: ignore
                 output = self._step(data, target, other_meta, curr_it)
             model_run_end.record(self.model_stream)
+            train_detail_events = getattr(self, "_last_train_detail_events", None)
 
             bs = output.shape[0]
             if gbuffer is None:
@@ -173,6 +188,12 @@ class _AsyncBase:
                 data_wait_end,
                 model_run_start,
                 model_run_end,
+                loader_cpu_ms,
+                h2d_submit_ms,
+                h2d_start,
+                h2d_end,
+                train_detail_events,
+                checkpoint_ms,
             )
             self.profiler.step()
 
@@ -196,6 +217,12 @@ class _AsyncBase:
         data_wait_end: Event,
         model_run_start: Event,
         model_run_end: Event,
+        loader_cpu_ms: float,
+        h2d_submit_ms: float,
+        h2d_start: Event | None,
+        h2d_end: Event | None,
+        train_detail_events,
+        checkpoint_ms: float,
     ):
         """(in sub-thread) ex2 will execute _post_step after event is recorded (i.e., buffer copy done)
 
@@ -209,7 +236,20 @@ class _AsyncBase:
         # Convert CUDA wait intervals into ms and push into the rolling timer.
         data_ms = float(data_wait_start.elapsed_time(data_wait_end))
         model_ms = float(model_run_start.elapsed_time(model_run_end))
-        self.timer.add(iter_ms=iter_ms, data_ms=data_ms, model_ms=model_ms)
+        h2d_gpu_ms = float(h2d_start.elapsed_time(h2d_end)) if h2d_start is not None and h2d_end is not None else 0.0
+        forward_ms, backward_ms, optimizer_ms = _train_detail_elapsed_ms(train_detail_events)
+        self.timer.add(
+            iter_ms=iter_ms,
+            data_ms=data_ms,
+            model_ms=model_ms,
+            loader_cpu_ms=float(loader_cpu_ms),
+            h2d_submit_ms=float(h2d_submit_ms),
+            h2d_gpu_ms=float(h2d_gpu_ms),
+            forward_ms=float(forward_ms),
+            backward_ms=float(backward_ms),
+            optimizer_ms=float(optimizer_ms),
+            checkpoint_ms=float(checkpoint_ms),
+        )
 
         with torch.profiler.record_function(f"_post_step_{curr_it}"):
             self._post_step(res, buffer, target, other_meta, curr_it)
@@ -356,23 +396,44 @@ class TrainMixin:
         self.model.train()
 
     def _normal_step(self: TrainProto, data, target, other_meta, curr_it) -> torch.Tensor:
-        self.optimizer.zero_grad(set_to_none=True)
-        # Run a single forward/backward/update step with optional gradient clipping.
+        """Run one forward/backward/optimizer step and record detailed CUDA timings."""
+        # Create CUDA events on the active stream so the async trainer can split model time.
+        detail_events = _new_train_detail_events(self.device)
+        if detail_events is not None:
+            detail_events["start"].record()
 
+        # Clear stale gradients before computing the new loss.
+        self.optimizer.zero_grad(set_to_none=True)
+
+        # Run the forward pass and loss under the configured autocast mode.
         with self.amp_scaler.autocast():
             output = self.model(data)
             loss = self.loss_fn(output, target.to(dtype=output.dtype))
+        if detail_events is not None:
+            detail_events["forward_end"].record()
 
+        # Backpropagate the scaled loss and optionally clip gradients.
         self.amp_scaler.scale(loss).backward()
         if self.grad_clip_norm is not None:
             self.amp_scaler.unscale_(self.optimizer)
             params = [p for g in self.optimizer.param_groups for p in g["params"]]
             torch.nn.utils.clip_grad_norm_(params, max_norm=self.grad_clip_norm)
+        if detail_events is not None:
+            detail_events["backward_end"].record()
+
+        # Apply the optimizer update and advance AMP scale.
         self.amp_scaler.step(self.optimizer)
         self.amp_scaler.update()
+        if detail_events is not None:
+            detail_events["optimizer_end"].record()
 
+        # Step the learning-rate scheduler after the optimizer update.
         self.lr_sched.step()
 
+        # Persist detail events for the async post-step thread.
+        self._last_train_detail_events = detail_events
+
+        # Return a detached scalar loss tensor for logging.
         loss2 = loss.detach()
         if loss2.dim() == 0:
             loss2.unsqueeze_(0)
@@ -453,3 +514,31 @@ class SyncTrainer(TrainMixin, _SyncBase):
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.lr_sched = lr_sched
+
+
+def _new_train_detail_events(device: torch.device) -> dict[str, Event] | None:
+    """Create CUDA events used to split one train step into forward/backward/optimizer."""
+    # Detailed timing is only meaningful for CUDA training.
+    if torch.device(device).type != "cuda":
+        return None
+
+    # Allocate events without synchronization; elapsed_time is queried after step completion.
+    return {
+        "start": torch.cuda.Event(enable_timing=True),
+        "forward_end": torch.cuda.Event(enable_timing=True),
+        "backward_end": torch.cuda.Event(enable_timing=True),
+        "optimizer_end": torch.cuda.Event(enable_timing=True),
+    }
+
+
+def _train_detail_elapsed_ms(events) -> tuple[float, float, float]:
+    """Return forward/backward/optimizer elapsed times from one train-step event set."""
+    # Non-training paths pass None, so keep their timing fields at zero.
+    if events is None:
+        return 0.0, 0.0, 0.0
+
+    # Compute adjacent intervals from already-completed CUDA events.
+    forward_ms = float(events["start"].elapsed_time(events["forward_end"]))
+    backward_ms = float(events["forward_end"].elapsed_time(events["backward_end"]))
+    optimizer_ms = float(events["backward_end"].elapsed_time(events["optimizer_end"]))
+    return forward_ms, backward_ms, optimizer_ms

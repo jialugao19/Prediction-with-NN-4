@@ -96,6 +96,13 @@ def train_timer_metrics(
         f"{namespace}/time/iter_ms": float(means.iter_ms),
         f"{namespace}/time/data_ms": float(means.data_ms),
         f"{namespace}/time/model_ms": float(means.model_ms),
+        f"{namespace}/time/loader_cpu_ms": float(means.loader_cpu_ms),
+        f"{namespace}/time/h2d_submit_ms": float(means.h2d_submit_ms),
+        f"{namespace}/time/h2d_gpu_ms": float(means.h2d_gpu_ms),
+        f"{namespace}/time/forward_ms": float(means.forward_ms),
+        f"{namespace}/time/backward_ms": float(means.backward_ms),
+        f"{namespace}/time/optimizer_ms": float(means.optimizer_ms),
+        f"{namespace}/time/checkpoint_ms": float(means.checkpoint_ms),
     }
 
 

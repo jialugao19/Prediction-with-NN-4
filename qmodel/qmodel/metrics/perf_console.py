@@ -112,6 +112,14 @@ def format_train_perf_line(
     loss_mean: float,
     data_ms: float,
     model_ms: float,
+    iter_ms: float,
+    loader_cpu_ms: float,
+    h2d_submit_ms: float,
+    h2d_gpu_ms: float,
+    forward_ms: float,
+    backward_ms: float,
+    optimizer_ms: float,
+    checkpoint_ms: float,
     rank: int,
     nvml: NvmlSnapshot,
     torch_mem: TorchCudaMemSnapshot,
@@ -123,8 +131,16 @@ def format_train_perf_line(
         f"step={int(step)} "
         f"loss={float(loss):.6g} "
         f"loss_mean={float(loss_mean):.6g} "
+        f"iter_ms={float(iter_ms):.3f} "
         f"data_ms={float(data_ms):.3f} "
         f"model_ms={float(model_ms):.3f} "
+        f"loader_cpu_ms={float(loader_cpu_ms):.3f} "
+        f"h2d_submit_ms={float(h2d_submit_ms):.3f} "
+        f"h2d_gpu_ms={float(h2d_gpu_ms):.3f} "
+        f"forward_ms={float(forward_ms):.3f} "
+        f"backward_ms={float(backward_ms):.3f} "
+        f"optimizer_ms={float(optimizer_ms):.3f} "
+        f"checkpoint_ms={float(checkpoint_ms):.3f} "
         f"rank={int(rank)} "
         f"nvml_used_gib={nvml.used_gib:.3f} "
         f"nvml_total_gib={nvml.total_gib:.3f} "

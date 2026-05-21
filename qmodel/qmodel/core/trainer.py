@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import os
+import time
 from torch.utils.tensorboard import SummaryWriter
 from pathlib import Path
 
@@ -149,7 +150,11 @@ class Trainer(AsyncTrainer):
         do_save = curr_it % self.config.save_every == 0
         do_eval = self.config.eval_during and curr_it % self.config.eval_every == 0
         if not (do_save or do_eval):
+            self._last_pre_step_ms = 0.0
             return
+
+        # Measure checkpoint/eval side effects because they run on the critical training path.
+        pre_t0 = time.perf_counter()
 
         # Synchronize ranks so side effects occur at the same logical step.
         if self.ddp_enabled:
@@ -172,6 +177,9 @@ class Trainer(AsyncTrainer):
             assert self.evaluator is not None
             self.evaluator.eval_partial(curr_it, self.config.eval_during_num_iters, namespace="ckpt_eval")
             torch.cuda.empty_cache()
+
+        # Publish elapsed side-effect wall time to the async training timer.
+        self._last_pre_step_ms = float((time.perf_counter() - pre_t0) * 1000.0)
 
     def _post_step(self, res, buffer, target, other_meta, curr_it):
         """Update loss history and emit training metrics periodically."""
@@ -236,8 +244,16 @@ class Trainer(AsyncTrainer):
                 step=int(curr_it),
                 loss=float(loss_val),
                 loss_mean=float(loss_mean),
+                iter_ms=float(means.iter_ms),
                 data_ms=float(means.data_ms),
                 model_ms=float(means.model_ms),
+                loader_cpu_ms=float(means.loader_cpu_ms),
+                h2d_submit_ms=float(means.h2d_submit_ms),
+                h2d_gpu_ms=float(means.h2d_gpu_ms),
+                forward_ms=float(means.forward_ms),
+                backward_ms=float(means.backward_ms),
+                optimizer_ms=float(means.optimizer_ms),
+                checkpoint_ms=float(means.checkpoint_ms),
                 rank=int(self.rank),
                 nvml=nvml,
                 torch_mem=torch_mem,
