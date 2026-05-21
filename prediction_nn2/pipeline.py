@@ -24,9 +24,10 @@ from prediction_nn2.clean_report import render_clean_report_from_meta
 from prediction_nn2.eval_ic import (
     EvalConfig,
     compute_test_evaluation_report_from_manifest,
+    core_ic_summary_from_manifest,
     daily_pearson_ic_summary_from_manifest,
+    grouped_pooled_ic_from_manifest,
     intraday_time_series_ic_train_test_from_manifest,
-    pooled_pearson_ic_from_manifest,
     rolling_group_ic_from_manifest,
 )
 from prediction_nn2.html_report import build_page, render_embedded_figure, render_figure, render_section, render_table, render_value_rows, render_yaml_block
@@ -789,13 +790,17 @@ def _run_train_report_postprocess(
     if train_manifest_path is None:
         train_manifest_path = _run_eval_manifest_once(qconf, "train", int(best_it), "eval_train")
 
-    # Compute train/test pooled Pearson IC and time-series summaries from manifests.
-    test_pooled = pooled_pearson_ic_from_manifest(Path(test_manifest_path))
-    test_ic_summary_yaml = Path(out_root) / "daily_ic_summary_test.yaml"
+    # Compute train/test core IC and time-series summaries from manifests.
     t_summary0 = time.time()
+    test_core_ic_yaml = Path(out_root) / "core_ic_summary_test.yaml"
+    test_core_ic = core_ic_summary_from_manifest(Path(test_manifest_path), test_core_ic_yaml, 60)
+    test_pooled = dict(test_core_ic["pooled"])
+    test_ic_summary_yaml = Path(out_root) / "daily_ic_summary_test.yaml"
     test_ic_summary = daily_pearson_ic_summary_from_manifest(Path(test_manifest_path), test_ic_summary_yaml)
 
-    train_pooled = pooled_pearson_ic_from_manifest(Path(train_manifest_path))
+    train_core_ic_yaml = Path(out_root) / "core_ic_summary_train.yaml"
+    train_core_ic = core_ic_summary_from_manifest(Path(train_manifest_path), train_core_ic_yaml, 60)
+    train_pooled = dict(train_core_ic["pooled"])
     train_ic_summary_yaml = Path(out_root) / "daily_ic_summary_train.yaml"
     train_ic_summary = daily_pearson_ic_summary_from_manifest(Path(train_manifest_path), train_ic_summary_yaml)
     t_summary1 = time.time()
@@ -816,11 +821,14 @@ def _run_train_report_postprocess(
     price_csv = Path(out_root) / "price_rolling_ic.csv"
     price_png = Path(out_root) / "price_rolling_ic.png"
     price_yaml = Path(out_root) / "price_rolling_ic.yaml"
+    grouped_ic_csv = Path(out_root) / "grouped_pooled_ic.csv"
+    grouped_ic_yaml = Path(out_root) / "grouped_pooled_ic.yaml"
 
-    # Compute the test rolling IC curves from the streamed manifest without a giant test dataframe.
+    # Compute the test rolling IC curves and grouped pooled ICs from streamed manifests.
     t_roll0 = time.time()
     vol_agg = rolling_group_ic_from_manifest(Path(test_manifest_path), eval_cfg, "volatility_label", vol_csv, vol_png, vol_yaml)
     price_agg = rolling_group_ic_from_manifest(Path(test_manifest_path), eval_cfg, "price_label", price_csv, price_png, price_yaml)
+    grouped_ic_summary = grouped_pooled_ic_from_manifest(Path(test_manifest_path), eval_cfg, grouped_ic_csv, grouped_ic_yaml)
     t_roll1 = time.time()
 
     # Persist a compact performance audit for the evaluation and report stage.
@@ -855,6 +863,10 @@ def _run_train_report_postprocess(
         test_pooled,
         train_ic_summary,
         test_ic_summary,
+        train_core_ic,
+        test_core_ic,
+        train_core_ic_yaml,
+        test_core_ic_yaml,
         train_ic_summary_yaml,
         test_ic_summary_yaml,
         int(best_it),
@@ -865,6 +877,9 @@ def _run_train_report_postprocess(
         intraday_png,
         vol_png,
         price_png,
+        grouped_ic_csv,
+        grouped_ic_yaml,
+        grouped_ic_summary,
         loss_png,
         vol_agg,
         price_agg,
@@ -880,6 +895,10 @@ def _render_train_report_html(
     test_pooled: dict[str, float],
     train_ic_summary: dict[str, object],
     test_ic_summary: dict[str, object],
+    train_core_ic: dict[str, object],
+    test_core_ic: dict[str, object],
+    train_core_ic_yaml: Path,
+    test_core_ic_yaml: Path,
     train_ic_summary_yaml: Path,
     test_ic_summary_yaml: Path,
     best_it: int,
@@ -890,6 +909,9 @@ def _render_train_report_html(
     intraday_png: Path,
     vol_png: Path,
     price_png: Path,
+    grouped_ic_csv: Path,
+    grouped_ic_yaml: Path,
+    grouped_ic_summary: dict[str, object],
     loss_png: Path,
     vol_agg,
     price_agg,
@@ -1026,10 +1048,16 @@ def _render_train_report_html(
         ("param_init/nn.GRU", "uniform_(-1/sqrt(hidden_size), +1/sqrt(hidden_size)) (PyTorch default)"),
     ]
     ic_rows = [
-        ("pooled_ic_train", f"{float(train_pooled['pearson_ic']):.6f}"),
-        ("pooled_ic_test", f"{float(test_pooled['pearson_ic']):.6f}"),
+        ("pooled_pearson_ic_train", f"{float(train_pooled['pearson_ic']):.6f}"),
+        ("pooled_pearson_ic_test", f"{float(test_pooled['pearson_ic']):.6f}"),
+        ("pooled_rank_ic_train", f"{float(train_pooled['rank_ic']):.6f}"),
+        ("pooled_rank_ic_test", f"{float(test_pooled['rank_ic']):.6f}"),
         ("pooled_count_train", str(int(train_pooled["count"]))),
         ("pooled_count_test", str(int(test_pooled["count"]))),
+        ("train_rolling_60d_rank_ic_mean", f"{float(train_core_ic['rolling_rank_ic']['rank_ic_mean']):.6f}"),
+        ("test_rolling_60d_rank_ic_mean", f"{float(test_core_ic['rolling_rank_ic']['rank_ic_mean']):.6f}"),
+        ("train_rolling_60d_rank_icir", f"{float(train_core_ic['rolling_rank_ic']['rank_icir_mean']):.6f}"),
+        ("test_rolling_60d_rank_icir", f"{float(test_core_ic['rolling_rank_ic']['rank_icir_mean']):.6f}"),
         ("train_daily_ic_mean", f"{float(train_ic_summary['pearson_ic']['mean']):.6f}"),
         ("test_daily_ic_mean", f"{float(test_ic_summary['pearson_ic']['mean']):.6f}"),
         ("train_daily_ic_std", f"{float(train_ic_summary['pearson_ic']['std']):.6f}"),
@@ -1041,13 +1069,16 @@ def _render_train_report_html(
         ("train_day_count", str(int(train_ic_summary["day_count"]))),
         ("test_day_count", str(int(test_ic_summary["day_count"]))),
     ]
-    rolling_rows = [
-        ("intraday_csv", intraday_csv.as_posix()),
-        ("volatility_csv", vol_csv.as_posix()),
-        ("price_csv", price_csv.as_posix()),
-        ("volatility_curve", str(vol_desc)),
-        ("price_curve", str(price_desc)),
+    grouped_ic_rows = [
+        (
+            str(name),
+            f"{float(values['pearson_ic']):.6f}",
+            f"{float(values['rank_ic']):.6f}",
+            str(int(values["count"])),
+        )
+        for name, values in dict(grouped_ic_summary["groups"]).items()
     ]
+    grouped_ic_table = render_table(["group", "pearson_ic", "rank_ic", "count"], grouped_ic_rows)
     perf_rows = [
         ("perf_audit_yaml", (Path(meta_path).parent.parent.parent / "perf_audit.yaml").as_posix()),
         ("data_prep_seconds", f"{float(perf['data_prep']['elapsed_seconds']):.4f}"),
@@ -1069,8 +1100,15 @@ def _render_train_report_html(
         render_section(
             "Train Vs Test IC Summary",
             render_value_rows(ic_rows)
-            + render_value_rows([("train_summary_yaml", train_ic_summary_yaml.as_posix()), ("test_summary_yaml", test_ic_summary_yaml.as_posix())])
-            + render_yaml_block({"train": train_ic_summary, "test": test_ic_summary}),
+            + render_value_rows(
+                [
+                    ("train_core_ic_yaml", train_core_ic_yaml.as_posix()),
+                    ("test_core_ic_yaml", test_core_ic_yaml.as_posix()),
+                    ("train_daily_summary_yaml", train_ic_summary_yaml.as_posix()),
+                    ("test_daily_summary_yaml", test_ic_summary_yaml.as_posix()),
+                ]
+            )
+            + render_yaml_block({"train_core": train_core_ic, "test_core": test_core_ic, "train_daily": train_ic_summary, "test_daily": test_ic_summary}),
         ),
         render_section(
             "Intraday IC",
@@ -1085,6 +1123,12 @@ def _render_train_report_html(
             "Price Rolling IC",
             render_value_rows([("price_ic_csv", price_csv.as_posix()), ("curve_summary", str(price_desc))])
             + render_embedded_figure("Price Rolling IC", price_png, "Rolling Pearson IC on test data grouped by price label."),
+        ),
+        render_section(
+            "Grouped Pooled IC",
+            render_value_rows([("grouped_pooled_ic_csv", grouped_ic_csv.as_posix()), ("grouped_pooled_ic_yaml", grouped_ic_yaml.as_posix())])
+            + grouped_ic_table
+            + render_yaml_block(grouped_ic_summary),
         ),
         render_section("Performance Audit", render_value_rows(perf_rows) + render_yaml_block(perf)),
     ]
@@ -1384,7 +1428,7 @@ def run_train_report_stage(
     # Build a stage fingerprint so report rebuild can skip when inputs are unchanged.
     stage_cfg = {
         "stage": "train_report",
-        "report_version": 4,
+        "report_version": 6,
         "best_it": int(best_it),
         "data_contract": _load_data_contract_from_meta(Path(prep["meta_path"])),
         "lr_scheduler": _lr_scheduler_contract(cfg, int(prep["train_rows"])),
@@ -1500,6 +1544,8 @@ def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     pooled = dict(artifacts.pooled)
     ic_summary = dict(artifacts.ic_summary)
+    core_ic = dict(artifacts.core_ic)
+    grouped_ic = dict(artifacts.grouped_ic)
     turnover_summary = dict(artifacts.turnover_summary)
     residual_summary = dict(artifacts.residual_summary)
     annual_tbl = artifacts.annual_tbl
@@ -1524,6 +1570,16 @@ def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path
     annual_body = render_value_rows([("annual_csv", Path(artifacts.annual_csv).as_posix())]) + annual_table
     if int(annual_tbl.shape[0]) > 1:
         annual_body += render_embedded_figure("Annual IC", Path(artifacts.annual_png), "Annual pooled IC curve from the test manifest.")
+    grouped_ic_rows = [
+        (
+            str(name),
+            f"{float(values['pearson_ic']):.6f}",
+            f"{float(values['rank_ic']):.6f}",
+            str(int(values["count"])),
+        )
+        for name, values in dict(grouped_ic["groups"]).items()
+    ]
+    grouped_ic_table = render_table(["group", "pearson_ic", "rank_ic", "count"], grouped_ic_rows)
 
     # Assemble the final self-contained single-column HTML report.
     sections = [
@@ -1535,6 +1591,9 @@ def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path
                     ("test_manifest", Path(manifest_path).as_posix()),
                     ("report_dir", Path(report_dir).as_posix()),
                     ("pooled_pearson_ic", f"{float(pooled['pearson_ic']):.6f}"),
+                    ("pooled_rank_ic", f"{float(pooled['rank_ic']):.6f}"),
+                    ("rolling_60d_rank_ic_mean", f"{float(core_ic['rolling_rank_ic']['rank_ic_mean']):.6f}"),
+                    ("rolling_60d_rank_icir", f"{float(core_ic['rolling_rank_ic']['rank_icir_mean']):.6f}"),
                     ("count", str(int(pooled["count"]))),
                 ]
             ),
@@ -1544,6 +1603,7 @@ def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path
             "Daily IC Summary",
             render_value_rows(
                 [
+                    ("core_ic_yaml", Path(artifacts.core_ic_yaml).as_posix()),
                     ("ic_summary_yaml", Path(artifacts.ic_summary_yaml).as_posix()),
                     ("daily_ic_mean", f"{float(ic_summary['pearson_ic']['mean']):.6f}"),
                     ("daily_ic_std", f"{float(ic_summary['pearson_ic']['std']):.6f}"),
@@ -1552,7 +1612,7 @@ def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path
                     ("day_count", str(int(ic_summary["day_count"]))),
                 ]
             )
-            + render_yaml_block(ic_summary),
+            + render_yaml_block({"core": core_ic, "daily": ic_summary}),
         ),
         render_section(
             f"Annual IC ({year_range})",
@@ -1574,6 +1634,12 @@ def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path
             render_value_rows([("price_csv", Path(artifacts.price_csv).as_posix()), ("price_yaml", Path(artifacts.price_yaml).as_posix())])
             + render_embedded_figure("Test Price Rolling IC", Path(artifacts.price_png), "Rolling IC grouped by price label.")
             + render_yaml_block(yaml.safe_load(Path(artifacts.price_yaml).read_text(encoding="utf-8"))),
+        ),
+        render_section(
+            "Grouped Pooled IC",
+            render_value_rows([("grouped_pooled_ic_csv", Path(artifacts.grouped_ic_csv).as_posix()), ("grouped_pooled_ic_yaml", Path(artifacts.grouped_ic_yaml).as_posix())])
+            + grouped_ic_table
+            + render_yaml_block(grouped_ic),
         ),
         render_section(
             "Rank Diagnostics",
@@ -1602,7 +1668,7 @@ def run_test_evaluation_report_stage(cfg: PipelineConfig, *, out_root: Path, tes
     manifest_stat = Path(test_manifest_path).stat()
     stage_cfg = {
         "stage": "test_evaluation_report",
-        "report_version": 3,
+        "report_version": 5,
         "manifest": str(Path(test_manifest_path).as_posix()),
         "manifest_size_bytes": int(manifest_stat.st_size),
         "manifest_mtime_ns": int(manifest_stat.st_mtime_ns),
