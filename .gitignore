@@ -3,7 +3,13 @@
 ############################
 data/
 !qmodel/qmodel/data/
-!qmodel/qmodel/data/*.py
+!qmodel/qmodel/data/**/
+!qmodel/qmodel/data/**/*.py
+!qmodel/qmodel/data/**/*.pyi
+!qmodel/qmodel/data/**/*.cpp
+!qmodel/qmodel/data/**/Makefile
+qmodel/qmodel/data/**/*.so
+qmodel/qmodel/data/**/*.o
 
 # evaluation 中间结果
 evaluation/factor_panel_*.parquet
