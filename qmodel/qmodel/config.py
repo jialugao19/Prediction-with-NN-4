@@ -82,6 +82,9 @@ class QConfig:
     # iteration configuration
     batch_size: int = field(init=False)
     num_workers: int = field(init=False)
+    dataloader_pin_memory: bool = field(init=False)
+    dataloader_prefetch_factor: int = field(init=False)
+    dataloader_persistent_workers: bool = field(init=False)
     num_iters: int = field(init=False)
     save_every: int = field(init=False)
     eval_every: int = field(init=False)
