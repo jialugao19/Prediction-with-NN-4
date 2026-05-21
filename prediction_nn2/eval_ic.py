@@ -315,6 +315,46 @@ class OnlineMoments:
         return {"count": int(n), "mean": float(mean), "std": float(std), "t_stat": float(t_stat), "positive_ratio": float(pos_ratio)}
 
 
+class InMemoryPooledICAccumulator:
+    """Accumulate pooled IC inputs and finalize Pearson/Rank IC."""
+
+    def __init__(self) -> None:
+        """Initialize Pearson moments and exact-rank buffers."""
+        # Keep Pearson online while retaining finite pairs for exact pooled Spearman.
+        self._pearson = OnlinePearsonAccumulator()
+        self._pred_parts: list[np.ndarray] = []
+        self._target_parts: list[np.ndarray] = []
+
+    def update(self, x: np.ndarray, y: np.ndarray) -> None:
+        """Add one vector chunk to the pooled IC accumulator."""
+        # Filter finite pairs once so Pearson and rank IC use the same sample.
+        m = np.isfinite(x) & np.isfinite(y)
+        x2 = x[m].astype(np.float64, copy=False)
+        y2 = y[m].astype(np.float64, copy=False)
+        if int(x2.shape[0]) == 0:
+            return
+
+        # Update streaming Pearson moments and store compact arrays for final rank IC.
+        self._pearson.update(x2, y2)
+        self._pred_parts.append(x2.astype(np.float32, copy=False))
+        self._target_parts.append(y2.astype(np.float32, copy=False))
+
+    def finalize(self) -> dict[str, float]:
+        """Return Pearson/Rank IC and finite sample count."""
+        # Concatenate retained finite pairs before exact pooled ranking.
+        count = int(self._pearson.count())
+        if int(count) < 2:
+            return {"pearson_ic": float("nan"), "rank_ic": float("nan"), "count": int(count)}
+
+        # Compute pooled rank IC with scipy ranks to avoid pandas object overhead.
+        pred = np.concatenate(self._pred_parts).astype(np.float64, copy=False)
+        target = np.concatenate(self._target_parts).astype(np.float64, copy=False)
+        pred_rank = stats.rankdata(pred, method="average").astype(np.float64, copy=False)
+        target_rank = stats.rankdata(target, method="average").astype(np.float64, copy=False)
+        rank_ic = _pearson(pred_rank, target_rank)
+        return {"pearson_ic": float(self._pearson.finalize()), "rank_ic": float(rank_ic), "count": int(count)}
+
+
 def _daily_pearson_ic_for_one_date(day_df: pd.DataFrame) -> float:
     """Compute one day's daily IC as the mean of intraday cross-sectional ICs."""
     # Compute one cross-sectional Pearson IC for each timestamp in the day.
@@ -332,55 +372,181 @@ def _daily_pearson_ic_for_one_date(day_df: pd.DataFrame) -> float:
     return float(vals.mean(dtype=np.float64))
 
 
+def _daily_rank_ic_for_one_date(day_df: pd.DataFrame) -> float:
+    """Compute one day's daily Rank IC as the mean of intraday cross-sectional Rank ICs."""
+    # Compute one cross-sectional Rank IC for each timestamp in the day.
+    day_ics: list[float] = []
+    for (_date, _time), group in day_df.groupby(["date", "time"], sort=False):
+        pred = group["prediction"].to_numpy(dtype=np.float64, copy=False)
+        tgt = group["target"].to_numpy(dtype=np.float64, copy=False)
+        day_ics.append(float(_spearman(pred, tgt)))
+
+    # Average finite intraday Rank ICs to get one daily observation.
+    vals = np.asarray(day_ics, dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if int(vals.shape[0]) == 0:
+        return float("nan")
+    return float(vals.mean(dtype=np.float64))
+
+
+def _rolling_rank_ic_summary(daily: pd.DataFrame, window_days: int) -> dict[str, object]:
+    """Summarize rolling-window daily Rank IC mean and ICIR."""
+    # Sort daily observations by date before assigning fixed rolling windows.
+    daily2 = daily.dropna(subset=["rank_ic"]).sort_values("date", kind="stable").reset_index(drop=True)
+    rows: list[dict[str, object]] = []
+    for start in range(0, int(daily2.shape[0]), int(window_days)):
+        # Slice one non-overlapping window and compute mean/std/ICIR.
+        window = daily2.iloc[start : start + int(window_days)]
+        vals = window["rank_ic"].to_numpy(dtype=np.float64, copy=False)
+        vals = vals[np.isfinite(vals)]
+        mean = float(vals.mean(dtype=np.float64)) if int(vals.shape[0]) > 0 else float("nan")
+        std = float(vals.std(ddof=1)) if int(vals.shape[0]) > 1 else float("nan")
+        icir = float(mean / std) if np.isfinite(mean) and np.isfinite(std) and float(std) > 0.0 else float("nan")
+        if int(window.shape[0]) == 0:
+            continue
+        rows.append(
+            {
+                "window_id": int(len(rows)),
+                "start_date": int(window.iloc[0]["date"]),
+                "end_date": int(window.iloc[-1]["date"]),
+                "day_count": int(vals.shape[0]),
+                "rank_ic_mean": float(mean),
+                "rank_ic_std": float(std),
+                "rank_icir": float(icir),
+            }
+        )
+
+    # Aggregate window-level statistics for compact report display.
+    out = pd.DataFrame(rows)
+    mean_vals = out["rank_ic_mean"].to_numpy(dtype=np.float64, copy=False) if int(out.shape[0]) > 0 else np.asarray([], dtype=np.float64)
+    icir_vals = out["rank_icir"].to_numpy(dtype=np.float64, copy=False) if int(out.shape[0]) > 0 else np.asarray([], dtype=np.float64)
+    return {
+        "window_days": int(window_days),
+        "window_count": int(out.shape[0]),
+        "rank_ic_mean": float(np.nanmean(mean_vals)) if bool(np.isfinite(mean_vals).any()) else float("nan"),
+        "rank_icir_mean": float(np.nanmean(icir_vals)) if bool(np.isfinite(icir_vals).any()) else float("nan"),
+        "windows": rows,
+    }
+
+
+def _daily_rank_ic_from_manifest_duckdb(manifest_path: Path) -> pd.DataFrame:
+    """Compute daily Rank IC observations from a manifest with DuckDB."""
+    # Rank prediction/target inside each timestamp cross-section and average timestamp ICs by date.
+    import duckdb
+
+    con = duckdb.connect(database=":memory:")
+    con.execute("PRAGMA threads=16")
+    scan = _duckdb_manifest_scan(Path(manifest_path))
+    daily = con.execute(
+        f"""
+        WITH base AS (
+            SELECT
+                date::INTEGER AS date,
+                time::INTEGER AS time,
+                prediction::DOUBLE AS prediction,
+                target::DOUBLE AS target
+            FROM {scan}
+            WHERE isfinite(prediction) AND isfinite(target)
+        ),
+        ranked AS (
+            SELECT
+                date,
+                time,
+                rank() OVER (PARTITION BY date, time ORDER BY prediction)
+                    + (count(*) OVER (PARTITION BY date, time, prediction) - 1) / 2.0 AS prediction_rank,
+                rank() OVER (PARTITION BY date, time ORDER BY target)
+                    + (count(*) OVER (PARTITION BY date, time, target) - 1) / 2.0 AS target_rank
+            FROM base
+        ),
+        timestamp_ic AS (
+            SELECT date, time, corr(prediction_rank, target_rank) AS rank_ic
+            FROM ranked
+            GROUP BY date, time
+        )
+        SELECT date, avg(rank_ic) AS rank_ic
+        FROM timestamp_ic
+        GROUP BY date
+        ORDER BY date
+        """
+    ).fetchdf()
+    con.close()
+    return daily
+
+
+def core_ic_summary_from_manifest(manifest_path: Path, out_yaml: Path, rolling_window_days: int) -> dict[str, object]:
+    """Write core pooled IC and rolling daily Rank IC metrics from a manifest."""
+    # Compute exact pooled Pearson/Rank IC directly from parquet chunks.
+    import yaml
+
+    pooled = pooled_ic_from_manifest(Path(manifest_path))
+
+    # Compute daily Rank IC observations with DuckDB so rolling summaries do not stream in Python.
+    daily = _daily_rank_ic_from_manifest_duckdb(Path(manifest_path))
+    rolling = _rolling_rank_ic_summary(daily, int(rolling_window_days))
+    summary = {"pooled": dict(pooled), "rolling_rank_ic": dict(rolling), "day_count": int(daily.shape[0])}
+    Path(out_yaml).write_text(yaml.safe_dump(summary, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return summary
+
+
+def _manifest_parquet_paths(manifest_path: Path) -> list[Path]:
+    """Resolve every parquet chunk path recorded in a predict manifest."""
+    # Load the manifest and expand relative chunk paths against the manifest directory.
+    import yaml
+
+    manifest_path = Path(manifest_path)
+    manifest = dict(yaml.safe_load(manifest_path.read_text(encoding="utf-8")))
+    base_dir = Path(manifest_path).parent
+    return [base_dir / str(rel) for rel in list(manifest["chunk_files"])]
+
+
+def _duckdb_path_list(paths: list[Path]) -> str:
+    """Render a DuckDB SQL list literal for parquet file paths."""
+    # Quote paths explicitly so DuckDB scans only the manifest's recorded chunks.
+    quoted = []
+    for path in list(paths):
+        s = Path(path).as_posix().replace("'", "''")
+        quoted.append(f"'{s}'")
+    return "[" + ", ".join(quoted) + "]"
+
+
+def _duckdb_manifest_scan(manifest_path: Path) -> str:
+    """Build a DuckDB read_parquet expression for one predict manifest."""
+    # Keep this as a small SQL fragment shared by pooled and grouped IC queries.
+    return f"read_parquet({_duckdb_path_list(_manifest_parquet_paths(Path(manifest_path)))})"
+
+
 def pooled_ic_from_manifest(manifest_path: Path) -> dict[str, float]:
-    """Compute pooled Pearson/Rank IC from a predict manifest without materializing a full dataframe."""
-    # Stream once to accumulate Pearson moments and to spill finite pairs for exact Spearman via external sort.
-    import subprocess
-    import tempfile
+    """Compute pooled Pearson/Rank IC from a predict manifest with DuckDB parquet scans."""
+    # Use DuckDB window ranks to avoid multi-GB TSV materialization and repeated external sorts.
+    import duckdb
 
-    reader = PredictionChunkReader(Path(manifest_path))
-    acc = OnlinePearsonAccumulator()
-    with tempfile.TemporaryDirectory(prefix="rank_ic_") as td:
-        tmp_dir = Path(td)
-        pred_value = Path(tmp_dir) / "pred_value.tsv"
-        tgt_value = Path(tmp_dir) / "tgt_value.tsv"
-        pred_sorted = Path(tmp_dir) / "pred_value_sorted.tsv"
-        tgt_sorted = Path(tmp_dir) / "tgt_value_sorted.tsv"
-        pred_rank = Path(tmp_dir) / "pred_rank.tsv"
-        tgt_rank = Path(tmp_dir) / "tgt_rank.tsv"
-        pred_rank_sorted = Path(tmp_dir) / "pred_rank_sorted.tsv"
-        tgt_rank_sorted = Path(tmp_dir) / "tgt_rank_sorted.tsv"
-
-        # Write raw (value,row_id) TSVs for prediction and target while updating pooled Pearson moments.
-        with pred_value.open("w", encoding="utf-8") as fp_pred, tgt_value.open("w", encoding="utf-8") as fp_tgt:
-            for chunk in reader.iter_prediction_chunks(["row_id", "prediction", "target"]):
-                row_id = chunk["row_id"].to_numpy(dtype=np.int64, copy=False)
-                pred = chunk["prediction"].to_numpy(dtype=np.float32, copy=False)
-                tgt = chunk["target"].to_numpy(dtype=np.float32, copy=False)
-                acc.update(pred.astype(np.float64, copy=False), tgt.astype(np.float64, copy=False))
-                m = np.isfinite(pred) & np.isfinite(tgt)
-                if int(m.sum()) == 0:
-                    continue
-                pred_tbl = pd.DataFrame({"value": pred[m], "row_id": row_id[m]})
-                tgt_tbl = pd.DataFrame({"value": tgt[m], "row_id": row_id[m]})
-                pred_tbl.to_csv(fp_pred, sep="\t", header=False, index=False, float_format="%.9g")
-                tgt_tbl.to_csv(fp_tgt, sep="\t", header=False, index=False, float_format="%.9g")
-
-        # External-sort by (value,row_id) so rank assignment is globally correct with stable tie order.
-        subprocess.run(["sort", "-t", "\t", "-k1,1g", "-k2,2n", pred_value.as_posix(), "-o", pred_sorted.as_posix()], check=True)
-        subprocess.run(["sort", "-t", "\t", "-k1,1g", "-k2,2n", tgt_value.as_posix(), "-o", tgt_sorted.as_posix()], check=True)
-
-        # Convert sorted (value,row_id) into (row_id,rank) with pandas-compatible average-tie ranks.
-        _write_average_ranks_from_value_sorted(Path(pred_sorted), Path(pred_rank))
-        _write_average_ranks_from_value_sorted(Path(tgt_sorted), Path(tgt_rank))
-
-        # External-sort the rank tables by row_id for a streaming merge join.
-        subprocess.run(["sort", "-t", "\t", "-k1,1n", pred_rank.as_posix(), "-o", pred_rank_sorted.as_posix()], check=True)
-        subprocess.run(["sort", "-t", "\t", "-k1,1n", tgt_rank.as_posix(), "-o", tgt_rank_sorted.as_posix()], check=True)
-
-        # Merge pred/tgt ranks by row_id and compute Pearson on ranks in one pass.
-        rank_ic = float(_pearson_from_row_id_rank_files(Path(pred_rank_sorted), Path(tgt_rank_sorted)))
-        return {"pearson_ic": float(acc.finalize()), "rank_ic": float(rank_ic), "count": int(acc.count())}
+    scan = _duckdb_manifest_scan(Path(manifest_path))
+    con = duckdb.connect(database=":memory:")
+    con.execute("PRAGMA threads=16")
+    row = con.execute(
+        f"""
+        WITH base AS (
+            SELECT prediction::DOUBLE AS prediction, target::DOUBLE AS target
+            FROM {scan}
+            WHERE isfinite(prediction) AND isfinite(target)
+        ),
+        ranked AS (
+            SELECT
+                prediction,
+                target,
+                rank() OVER (ORDER BY prediction) + (count(*) OVER (PARTITION BY prediction) - 1) / 2.0 AS prediction_rank,
+                rank() OVER (ORDER BY target) + (count(*) OVER (PARTITION BY target) - 1) / 2.0 AS target_rank
+            FROM base
+        )
+        SELECT
+            corr(prediction, target) AS pearson_ic,
+            corr(prediction_rank, target_rank) AS rank_ic,
+            count(*) AS count
+        FROM ranked
+        """
+    ).fetchone()
+    con.close()
+    return {"pearson_ic": float(row[0]), "rank_ic": float(row[1]), "count": int(row[2])}
 
 
 def pooled_pearson_ic_from_manifest(manifest_path: Path) -> dict[str, float]:
@@ -1163,6 +1329,284 @@ def rolling_group_ic_from_manifest(manifest_path: Path, config: EvalConfig, labe
     return agg
 
 
+def _stock1m_trade_dates(stock1m_dir: Path) -> list[int]:
+    """List stock1m trade dates as yyyymmdd integers."""
+    # Scan year folders and parse feather filenames into sorted trade dates.
+    dates: list[int] = []
+    for path in sorted(Path(stock1m_dir).glob("*/*.feather")):
+        dates.append(int(Path(path).stem))
+    return sorted(dates)
+
+
+def _market_amount_by_date(config: EvalConfig, dates: list[int]) -> dict[int, float]:
+    """Compute full-market traded amount for each requested yyyymmdd date."""
+    # Read only Amount so regime construction does not load unnecessary columns.
+    out: dict[int, float] = {}
+    for d in list(dates):
+        year = int(d) // 10000
+        path = Path(config.stock1m_dir) / str(year) / f"{int(d)}.feather"
+        day = pd.read_feather(path, columns=["Amount"])
+        out[int(d)] = float(day["Amount"].to_numpy(dtype=np.float64, copy=False).sum(dtype=np.float64))
+    return out
+
+
+def _prior_5d_market_amount_regime(config: EvalConfig, manifest_dates_yymmdd: list[int]) -> dict[int, int]:
+    """Assign each manifest date to a 3-bucket prior-5d market-liquidity regime."""
+    # Restrict the stock1m calendar to manifest dates plus the five prior sessions needed for rolling scores.
+    manifest_yyyymmdd = sorted([20000000 + int(d) for d in list(manifest_dates_yymmdd)])
+    calendar = _stock1m_trade_dates(Path(config.stock1m_dir))
+    start_idx = int(calendar.index(int(min(manifest_yyyymmdd))))
+    end_idx = int(calendar.index(int(max(manifest_yyyymmdd)))) + 1
+    dates = calendar[max(0, int(start_idx) - 5) : int(end_idx)]
+
+    # Build a shifted 5-day rolling market-amount score on the restricted calendar.
+    amount_by_date = _market_amount_by_date(config, list(dates))
+    cal = pd.DataFrame({"date": list(dates), "amount": [float(amount_by_date[int(d)]) for d in list(dates)]})
+    cal["prior_5d_amount"] = cal["amount"].rolling(window=5, min_periods=5).sum().shift(1)
+
+    # Split manifest dates into low/mid/high liquidity regimes by prior-5d market amount.
+    keep = cal.loc[cal["date"].isin(list(manifest_yyyymmdd))].dropna(subset=["prior_5d_amount"]).copy()
+    keep["regime"] = pd.qcut(keep["prior_5d_amount"], q=3, labels=[0, 1, 2]).astype(int)
+    return {int(row["date"]) - 20000000: int(row["regime"]) for row in keep.to_dict(orient="records")}
+
+
+def _update_prediction_quantile_ic(accs: dict[str, InMemoryPooledICAccumulator], group: pd.DataFrame) -> None:
+    """Update prediction top/bottom pooled IC accumulators for one timestamp."""
+    # Rank prediction within the timestamp cross-section and select requested quantile regions.
+    tmp = group[["prediction", "target"]].dropna(subset=["prediction", "target"]).copy()
+    if int(tmp.shape[0]) < 2:
+        return
+    pct = tmp["prediction"].rank(method="average", pct=True).to_numpy(dtype=np.float64, copy=False)
+    pred = tmp["prediction"].to_numpy(dtype=np.float64, copy=False)
+    target = tmp["target"].to_numpy(dtype=np.float64, copy=False)
+
+    # Accumulate bottom 90% and top 10% prediction samples into separate pooled ICs.
+    accs["prediction_low_p90"].update(pred[pct <= 0.9], target[pct <= 0.9])
+    accs["prediction_high_p10"].update(pred[pct > 0.9], target[pct > 0.9])
+
+
+def _update_label_bucket_ic(accs: dict[str, InMemoryPooledICAccumulator], group: pd.DataFrame, label_col: str, prefix: str) -> None:
+    """Update high/low label-bucket pooled IC accumulators for one timestamp."""
+    # Rank the requested label within timestamp and split into low/high halves.
+    tmp = group[["prediction", "target", label_col]].dropna(subset=["prediction", "target", label_col]).copy()
+    if int(tmp.shape[0]) < 2:
+        return
+    pct = tmp[str(label_col)].rank(method="average", pct=True).to_numpy(dtype=np.float64, copy=False)
+    pred = tmp["prediction"].to_numpy(dtype=np.float64, copy=False)
+    target = tmp["target"].to_numpy(dtype=np.float64, copy=False)
+
+    # Accumulate low and high bucket samples into independent pooled ICs.
+    accs[f"{str(prefix)}_low"].update(pred[pct <= 0.5], target[pct <= 0.5])
+    accs[f"{str(prefix)}_high"].update(pred[pct > 0.5], target[pct > 0.5])
+
+
+def _manifest_dates_from_duckdb(manifest_path: Path) -> list[int]:
+    """Read the sorted date list from a predict manifest with DuckDB."""
+    # Query distinct dates from parquet metadata/data without materializing prediction rows in Python.
+    import duckdb
+
+    con = duckdb.connect(database=":memory:")
+    con.execute("PRAGMA threads=16")
+    scan = _duckdb_manifest_scan(Path(manifest_path))
+    dates = con.execute(f"SELECT DISTINCT date::INTEGER AS date FROM {scan} ORDER BY date").fetchdf()["date"].astype(int).tolist()
+    con.close()
+    return [int(d) for d in list(dates)]
+
+
+def _build_group_ic_label_cache_one_date(task: tuple[int, str, int, str]) -> int:
+    """Build one date's grouped-IC label cache parquet."""
+    # Decode the multiprocessing task and skip dates that already have a cache file.
+    d_yymmdd, stock1m_dir, horizon_minutes, label_dir = task
+    out_path = Path(label_dir) / f"{int(d_yymmdd)}.parquet"
+    if out_path.exists():
+        return int(d_yymmdd)
+
+    # Load same-day stock1m fields and compute labels aligned to qmodel date/time/code keys.
+    cfg = EvalConfig(stock1m_dir=Path(stock1m_dir), window_size=1, step_size=1, horizon_minutes=int(horizon_minutes))
+    d_yyyymmdd = 20000000 + int(d_yymmdd)
+    panel = _load_price_panel_for_dates(cfg, [int(d_yyyymmdd)])
+    panel["date"] = int(d_yymmdd)
+    panel["time"] = pd.to_datetime(panel["DateTime"]).dt.strftime("%H%M%S").astype(int)
+    panel["code"] = panel["StockCode"].astype(np.int64)
+    panel["liquidity_label"] = panel["Amount"].astype(np.float64)
+    panel["volatility_label"] = _forward_vol_label(panel, int(horizon_minutes)).astype(np.float64)
+    panel[["date", "time", "code", "liquidity_label", "volatility_label"]].to_parquet(out_path, index=False)
+    return int(d_yymmdd)
+
+
+def _build_group_ic_label_cache(manifest_path: Path, config: EvalConfig, label_dir: Path) -> list[int]:
+    """Build or reuse per-date liquidity/volatility label parquet files."""
+    # Resolve manifest dates and create the cache directory used by DuckDB joins.
+    dates_yymmdd = _manifest_dates_from_duckdb(Path(manifest_path))
+    label_dir = Path(label_dir)
+    label_dir.mkdir(parents=True, exist_ok=True)
+
+    # Materialize missing label files in parallel; existing files are cache hits.
+    tasks = [
+        (int(d_yymmdd), Path(config.stock1m_dir).as_posix(), int(config.horizon_minutes), Path(label_dir).as_posix())
+        for d_yymmdd in list(dates_yymmdd)
+        if not (Path(label_dir) / f"{int(d_yymmdd)}.parquet").exists()
+    ]
+    if len(tasks) > 0:
+        workers = min(16, int(len(tasks)))
+        ctx = mp.get_context("fork")
+        with ctx.Pool(processes=int(workers)) as pool:
+            pool.map(_build_group_ic_label_cache_one_date, list(tasks))
+    return [int(d) for d in list(dates_yymmdd)]
+
+
+def _regime_dataframe(config: EvalConfig, manifest_dates_yymmdd: list[int]) -> pd.DataFrame:
+    """Build a date-to-regime dataframe from prior-5d full-market traded amount."""
+    # Compute prior-5d market amount using the same shifted convention as regime IC.
+    manifest_yyyymmdd = sorted([20000000 + int(d) for d in list(manifest_dates_yymmdd)])
+    calendar = _stock1m_trade_dates(Path(config.stock1m_dir))
+    start_idx = int(calendar.index(int(min(manifest_yyyymmdd))))
+    end_idx = int(calendar.index(int(max(manifest_yyyymmdd)))) + 1
+    dates = calendar[max(0, int(start_idx) - 5) : int(end_idx)]
+    amount_by_date = _market_amount_by_date(config, list(dates))
+    cal = pd.DataFrame({"date_yyyymmdd": list(dates), "amount": [float(amount_by_date[int(d)]) for d in list(dates)]})
+    cal["prior_5d_amount"] = cal["amount"].rolling(window=5, min_periods=5).sum().shift(1)
+
+    # Convert tertiles into stable group names consumed by the grouped IC query.
+    keep = cal.loc[cal["date_yyyymmdd"].isin(list(manifest_yyyymmdd))].dropna(subset=["prior_5d_amount"]).copy()
+    keep["date"] = keep["date_yyyymmdd"].astype(int) - 20000000
+    keep["regime_id"] = pd.qcut(keep["prior_5d_amount"], q=3, labels=[0, 1, 2]).astype(int)
+    names = {0: "regime_low", 1: "regime_mid", 2: "regime_high"}
+    keep["metric_group"] = keep["regime_id"].map(dict(names))
+    return keep[["date", "metric_group", "prior_5d_amount"]].reset_index(drop=True)
+
+
+def _duckdb_grouped_ic_dataframe(manifest_path: Path, config: EvalConfig, label_dir: Path, dates_yymmdd: list[int]) -> pd.DataFrame:
+    """Compute grouped pooled ICs with DuckDB over prediction and cached label parquet."""
+    # Register the small regime dataframe and scan prediction/label parquet directly in DuckDB.
+    import duckdb
+
+    con = duckdb.connect(database=":memory:")
+    con.execute("PRAGMA threads=16")
+    con.register("regime_df", _regime_dataframe(config, list(dates_yymmdd)))
+    pred_scan = _duckdb_manifest_scan(Path(manifest_path))
+    label_glob = (Path(label_dir) / "*.parquet").as_posix().replace("'", "''")
+
+    # Compute all group memberships, then rank within each metric_group using average-tie ranks.
+    out = con.execute(
+        f"""
+        WITH pred AS (
+            SELECT
+                date::INTEGER AS date,
+                time::INTEGER AS time,
+                code::BIGINT AS code,
+                prediction::DOUBLE AS prediction,
+                target::DOUBLE AS target
+            FROM {pred_scan}
+            WHERE isfinite(prediction) AND isfinite(target)
+        ),
+        prediction_pct AS (
+            SELECT *, cume_dist() OVER (PARTITION BY date, time ORDER BY prediction) AS prediction_rank_pct
+            FROM pred
+        ),
+        prediction_groups AS (
+            SELECT 'prediction_low_p90' AS metric_group, prediction, target
+            FROM prediction_pct
+            WHERE prediction_rank_pct <= 0.9
+            UNION ALL
+            SELECT 'prediction_high_p10' AS metric_group, prediction, target
+            FROM prediction_pct
+            WHERE prediction_rank_pct > 0.9
+        ),
+        joined AS (
+            SELECT
+                pred.date,
+                pred.time,
+                pred.code,
+                pred.prediction,
+                pred.target,
+                label.liquidity_label::DOUBLE AS liquidity_label,
+                label.volatility_label::DOUBLE AS volatility_label
+            FROM pred
+            JOIN read_parquet('{label_glob}') AS label
+            USING (date, time, code)
+        ),
+        liquidity_pct AS (
+            SELECT *, cume_dist() OVER (PARTITION BY date, time ORDER BY liquidity_label) AS liquidity_rank_pct
+            FROM joined
+            WHERE isfinite(liquidity_label)
+        ),
+        volatility_pct AS (
+            SELECT *, cume_dist() OVER (PARTITION BY date, time ORDER BY volatility_label) AS volatility_rank_pct
+            FROM joined
+            WHERE isfinite(volatility_label)
+        ),
+        label_groups AS (
+            SELECT 'liquidity_low' AS metric_group, prediction, target
+            FROM liquidity_pct
+            WHERE liquidity_rank_pct <= 0.5
+            UNION ALL
+            SELECT 'liquidity_high' AS metric_group, prediction, target
+            FROM liquidity_pct
+            WHERE liquidity_rank_pct > 0.5
+            UNION ALL
+            SELECT 'volatility_low' AS metric_group, prediction, target
+            FROM volatility_pct
+            WHERE volatility_rank_pct <= 0.5
+            UNION ALL
+            SELECT 'volatility_high' AS metric_group, prediction, target
+            FROM volatility_pct
+            WHERE volatility_rank_pct > 0.5
+        ),
+        regime_groups AS (
+            SELECT regime_df.metric_group, pred.prediction, pred.target
+            FROM pred
+            JOIN regime_df USING (date)
+        ),
+        selected AS (
+            SELECT * FROM prediction_groups
+            UNION ALL
+            SELECT * FROM label_groups
+            UNION ALL
+            SELECT * FROM regime_groups
+        ),
+        ranked AS (
+            SELECT
+                metric_group,
+                prediction,
+                target,
+                rank() OVER (PARTITION BY metric_group ORDER BY prediction)
+                    + (count(*) OVER (PARTITION BY metric_group, prediction) - 1) / 2.0 AS prediction_rank,
+                rank() OVER (PARTITION BY metric_group ORDER BY target)
+                    + (count(*) OVER (PARTITION BY metric_group, target) - 1) / 2.0 AS target_rank
+            FROM selected
+        )
+        SELECT
+            metric_group AS "group",
+            corr(prediction, target) AS pearson_ic,
+            corr(prediction_rank, target_rank) AS rank_ic,
+            count(*) AS count
+        FROM ranked
+        GROUP BY metric_group
+        ORDER BY metric_group
+        """
+    ).fetchdf()
+    con.close()
+    return out
+
+
+def grouped_pooled_ic_from_manifest(manifest_path: Path, config: EvalConfig, out_csv: Path, out_yaml: Path) -> dict[str, object]:
+    """Compute prediction-quantile, liquidity, volatility, and regime pooled IC metrics."""
+    # Build or reuse label cache beside the output CSV and compute grouped ICs in DuckDB.
+    import yaml
+
+    label_dir = Path(out_csv).parent / f"group_ic_label_cache_h{int(config.horizon_minutes)}"
+    dates_yymmdd = _build_group_ic_label_cache(Path(manifest_path), config, Path(label_dir))
+    out = _duckdb_grouped_ic_dataframe(Path(manifest_path), config, Path(label_dir), list(dates_yymmdd))
+    out.to_csv(Path(out_csv), index=False)
+    summary = {
+        "label_cache_dir": Path(label_dir).as_posix(),
+        "groups": {str(row["group"]): {k: row[k] for k in ["pearson_ic", "rank_ic", "count"]} for row in out.to_dict(orient="records")},
+    }
+    Path(out_yaml).write_text(yaml.safe_dump(summary, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    return summary
+
+
 @dataclass(frozen=True)
 class TestEvaluationReportArtifacts:
     """Bundle the test-evaluation streaming report outputs computed from a manifest."""
@@ -1170,6 +1614,11 @@ class TestEvaluationReportArtifacts:
     pooled: dict[str, float]
     ic_summary: dict[str, object]
     ic_summary_yaml: Path
+    core_ic: dict[str, object]
+    core_ic_yaml: Path
+    grouped_ic: dict[str, object]
+    grouped_ic_csv: Path
+    grouped_ic_yaml: Path
     annual_tbl: pd.DataFrame
     annual_csv: Path
     annual_png: Path
@@ -1198,6 +1647,9 @@ def compute_test_evaluation_report_from_manifest(manifest_path: Path, eval_cfg: 
     # Resolve all output paths under the report root to keep pipeline wiring minimal.
     out_root = Path(out_root)
     ic_summary_yaml = Path(out_root) / "test_daily_ic_summary.yaml"
+    core_ic_yaml = Path(out_root) / "test_core_ic_summary.yaml"
+    grouped_ic_csv = Path(out_root) / "test_grouped_pooled_ic.csv"
+    grouped_ic_yaml = Path(out_root) / "test_grouped_pooled_ic.yaml"
     annual_csv = Path(out_root) / "annual_ic.csv"
     annual_png = Path(out_root) / "annual_ic.png"
     intraday_csv = Path(out_root) / "test_intraday_ic.csv"
@@ -1215,8 +1667,9 @@ def compute_test_evaluation_report_from_manifest(manifest_path: Path, eval_cfg: 
     price_png = Path(out_root) / "test_price_rolling_ic.png"
     price_yaml = Path(out_root) / "test_price_rolling_ic.yaml"
 
-    # Compute pooled Pearson IC using a streaming accumulator.
-    pooled = pooled_pearson_ic_from_manifest(Path(manifest_path))
+    # Compute exact pooled Pearson/Rank IC and rolling 60d Rank IC summary.
+    core_ic = core_ic_summary_from_manifest(Path(manifest_path), Path(core_ic_yaml), 60)
+    pooled = dict(core_ic["pooled"])
 
     # Compute day-level Pearson IC summaries from intraday cross-sectional ICs.
     ic_summary = daily_pearson_ic_summary_from_manifest(Path(manifest_path), Path(ic_summary_yaml))
@@ -1235,12 +1688,18 @@ def compute_test_evaluation_report_from_manifest(manifest_path: Path, eval_cfg: 
     # Compute rolling-group IC curves by streaming one date at a time and attaching labels per day.
     vol_curve = rolling_group_ic_from_manifest(Path(manifest_path), eval_cfg, "volatility_label", Path(vol_csv), Path(vol_png), Path(vol_yaml))
     price_curve = rolling_group_ic_from_manifest(Path(manifest_path), eval_cfg, "price_label", Path(price_csv), Path(price_png), Path(price_yaml))
+    grouped_ic = grouped_pooled_ic_from_manifest(Path(manifest_path), eval_cfg, Path(grouped_ic_csv), Path(grouped_ic_yaml))
 
     # Return a compact artifact bundle so the pipeline can render report.html without extra IO.
     return TestEvaluationReportArtifacts(
         pooled=dict(pooled),
         ic_summary=dict(ic_summary),
         ic_summary_yaml=Path(ic_summary_yaml),
+        core_ic=dict(core_ic),
+        core_ic_yaml=Path(core_ic_yaml),
+        grouped_ic=dict(grouped_ic),
+        grouped_ic_csv=Path(grouped_ic_csv),
+        grouped_ic_yaml=Path(grouped_ic_yaml),
         annual_tbl=annual_tbl,
         annual_csv=Path(annual_csv),
         annual_png=Path(annual_png),
@@ -1545,14 +2004,14 @@ def residual_diagnostics(df: pd.DataFrame, out_yaml: Path, out_png: Path) -> dic
 
 
 def _load_price_panel_for_dates(config: EvalConfig, dates: list[int]) -> pd.DataFrame:
-    """Load Close series for the requested trade dates from stock1m."""
-    # Read Close and DateTime for each date and concatenate into one table.
+    """Load price/liquidity fields for the requested trade dates from stock1m."""
+    # Read Close/Amount and DateTime for each date and concatenate into one table.
     parts: list[pd.DataFrame] = []
     for d in list(dates):
         # Resolve file path by year folder convention.
         year = int(d) // 10000
         path = Path(config.stock1m_dir) / str(year) / f"{int(d)}.feather"
-        day = pd.read_feather(path, columns=["StockCode", "DateTime", "Close", "Date"])
+        day = pd.read_feather(path, columns=["StockCode", "DateTime", "Close", "Amount", "Date"])
         day = day.sort_values(["StockCode", "DateTime"], kind="stable").reset_index(drop=True)
         parts.append(day)
     out = pd.concat(parts, axis=0).reset_index(drop=True)
@@ -1599,11 +2058,12 @@ def attach_labels(pred_df: pd.DataFrame, config: EvalConfig) -> pd.DataFrame:
         # Load price panel for this date and compute same-day labels.
         panel = _load_price_panel_for_dates(config, [int(d_yyyymmdd)])
         panel["price_label"] = panel["Close"].astype(float)
+        panel["liquidity_label"] = panel["Amount"].astype(float)
         panel["volatility_label"] = _forward_vol_label(panel, int(config.horizon_minutes)).astype(float)
 
         # Merge labels onto prediction rows using (StockCode, DateTime) keys.
         key_cols = ["StockCode", "DateTime"]
-        day_merged = day_pred.merge(panel[key_cols + ["price_label", "volatility_label"]], on=key_cols, how="left", validate="many_to_one")
+        day_merged = day_pred.merge(panel[key_cols + ["price_label", "liquidity_label", "volatility_label"]], on=key_cols, how="left", validate="many_to_one")
         parts.append(day_merged)
 
     # Concatenate day merges back into one dataframe in stable original order.
@@ -1630,11 +2090,12 @@ def _attach_labeled_day_for_date_task(d_yymmdd: int) -> pd.DataFrame:
 
     # Compute price and forward-volatility labels on the filtered panel.
     panel["price_label"] = panel["Close"].astype(float)
+    panel["liquidity_label"] = panel["Amount"].astype(float)
     panel["volatility_label"] = _forward_vol_label(panel, int(cfg.horizon_minutes)).astype(float)
 
     # Merge labels onto prediction rows using (StockCode, DateTime) keys.
     key_cols = ["StockCode", "DateTime"]
-    day_merged = day_pred.merge(panel[key_cols + ["price_label", "volatility_label"]], on=key_cols, how="left", validate="many_to_one")
+    day_merged = day_pred.merge(panel[key_cols + ["price_label", "liquidity_label", "volatility_label"]], on=key_cols, how="left", validate="many_to_one")
     return day_merged
 
 
