@@ -135,10 +135,10 @@ def build_default_portfolio_backtest_config() -> PortfolioBacktestConfig:
     """Build the canonical portfolio backtest configuration."""
     # Define the fixed repo paths and canonical inference input.
     repo_root = Path("/home/maomao/prediction-NN-2")
-    inference_manifest_path = Path("/data-cache/nn/0428/date_ranges/run/inference_test/iter_140000/inference_manifest.yaml")
+    inference_manifest_path = Path("/data-cache/nn/0519/date_ranges/run/inference_test/iter_70000/inference_manifest.yaml")
 
     # Define the portfolio backtest output layout.
-    output_dir = Path("/data-cache/nn/0426/portfolio_backtest")
+    output_dir = Path("/data-cache/nn/backtests/0519_iter70000_basic_vwap")
     feature_db_path = output_dir / "portfolio_backtest.duckdb"
     feature_chunk_dir = output_dir / "feature_chunks"
     feature_manifest_path = output_dir / "feature_manifest.yaml"
@@ -167,9 +167,9 @@ def build_default_portfolio_backtest_config() -> PortfolioBacktestConfig:
     spread_bps_high = 5.0
     spread_bps_mid = 10.0
     spread_bps_low = 20.0
-    aum_list = [10_000_000.0, 50_000_000.0, 100_000_000.0]
+    aum_list = [10_000_000.0]
     impact_budget_bps_list = [10.0, 20.0]
-    report_title = "Portfolio Backtest: Execution-Aware Strategy Backtest"
+    report_title = "Portfolio Backtest: Basic VWAP Top-Bottom Strategy"
     return PortfolioBacktestConfig(
         repo_root=repo_root,
         inference_manifest_path=inference_manifest_path,
@@ -231,19 +231,14 @@ def build_output_contract(output_dir: Path) -> PortfolioBacktestOutputContract:
             "feature_audit.csv",
             "feature_audit.yaml",
             "feature_manifest.yaml",
-            "open_slot_positions.parquet",
-            "vwap_slot_positions.parquet",
-            "baseline_open_slot_bar.csv",
-            "baseline_open_combined_daily.csv",
-            "baseline_open_slot_summary.csv",
-            "realistic_vwap_slot_bar.csv",
-            "realistic_vwap_combined_daily.csv",
-            "realistic_vwap_slot_summary.csv",
+            "target_positions.parquet",
+            "bar_pnl.csv",
+            "daily_pnl.csv",
+            "slot_summary.csv",
             "strategy_summary.yaml",
             "research_report.md",
             "research_report.html",
             "strategy_curves.png",
-            "baseline_open_strategy.png",
             "drawdown_curve.png",
             "slot_sharpe.png",
             "capacity_sweep.png",

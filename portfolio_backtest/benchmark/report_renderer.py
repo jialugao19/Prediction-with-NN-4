@@ -1181,6 +1181,8 @@ def outline_aligned_report_markdown(summary: dict[str, Any]) -> str:
         "",
         "### 4.1. IC Summary",
         "",
+        markdown_table_from_csv(BENCHMARK_ROOT / "evaluation" / "core_ic_metrics.csv", 20),
+        "",
         markdown_rows_table(
             ["split", "count", "mean_ic", "std_ic", "t_stat", "positive_ratio", "icir", "pooled_ic", "pooled_rank_ic"],
             [
@@ -1199,6 +1201,12 @@ def outline_aligned_report_markdown(summary: dict[str, Any]) -> str:
         "",
         markdown_table_from_csv(BENCHMARK_ROOT / "evaluation" / "signal_bucket_metrics.csv", 12),
         "",
+        "Pooled top decile return metrics:",
+        "",
+        "```yaml",
+        yaml.safe_dump(read_yaml(BENCHMARK_ROOT / "evaluation" / "pooled_top_decile_return_metrics.yaml"), sort_keys=False, allow_unicode=True).strip(),
+        "```",
+        "",
         markdown_field_notes(["signal_bucket", "row_count", "mean_prediction", "mean_return_bps", "t_stat", "hit_rate", "mean_spread_bps"], "Signal Quality 检查 prediction 排序后收益是否随 bucket 单调变强。"),
         "",
         "### 4.3. Trading And Cost",
@@ -1209,11 +1217,17 @@ def outline_aligned_report_markdown(summary: dict[str, Any]) -> str:
         "",
         markdown_table_from_csv(BENCHMARK_ROOT / "evaluation" / "trading_rule_metrics.csv", 8),
         "",
+        markdown_table_from_csv(BENCHMARK_ROOT / "evaluation" / "cost_sensitivity_metrics.csv", 20),
+        "",
         markdown_field_notes(["strategy_name", "open_quantile", "close_quantile", "gross_daily_return_bps", "net_daily_return_bps", "gross_sharpe", "net_sharpe", "max_drawdown", "daily_turnover", "spread_cost_bps", "fee_cost_bps", "gross_bps_per_turnover", "net_bps_per_turnover", "active_names"], "Trading And Cost 判断统计 signal 转成交易后是否还能覆盖 spread 和 fee。"),
         "",
         "### 4.4. Time And Liquidity Attribution",
         "",
         markdown_table_from_csv(BENCHMARK_ROOT / "evaluation" / "time_bucket_metrics.csv", 20),
+        "",
+        markdown_table_from_csv(BENCHMARK_ROOT / "evaluation" / "time_bucket_ic_metrics.csv", 20),
+        "",
+        markdown_table_from_csv(BENCHMARK_ROOT / "evaluation" / "vwap_bucket_ic_metrics.csv", 10),
         "",
         markdown_table_from_csv(BENCHMARK_ROOT / "evaluation" / "liquidity_bucket_metrics.csv", 18),
         "",
@@ -1228,6 +1242,10 @@ def outline_aligned_report_markdown(summary: dict[str, Any]) -> str:
         markdown_table_from_csv(BENCHMARK_ROOT / "evaluation" / "month_stability_metrics.csv", 20),
         "",
         "Figure: `reports/figures/month_stability_metrics.png`.",
+        "",
+        markdown_table_from_csv(BENCHMARK_ROOT / "evaluation" / "monthly_ic_metrics.csv", 20),
+        "",
+        "Figure: `evaluation/figures/monthly_ic_metrics.png`.",
         "",
         markdown_table_from_csv(BENCHMARK_ROOT / "evaluation" / "regime_stability_metrics.csv", 10),
         "",
@@ -1266,7 +1284,7 @@ def outline_aligned_report_markdown(summary: dict[str, Any]) -> str:
         f"- TensorBoard source dir: `{tb_manifest['source_dir']}`.",
         f"- scalar rows: `{tb_manifest['scalar_rows']}`.",
         "",
-        markdown_field_notes(["step", "val_mse", "train_loss_mean", "val_minus_train", "val_over_train", "tag", "last_step", "last_value", "tail100_mean", "tail100_std", "min_value", "max_value"], "Training Monitoring 检查 train/validation loss gap、runtime scalar 和参数更新范数。"),
+        markdown_field_notes(["step", "val_mse_raw", "val_mse_normalized", "train_loss_mean", "val_minus_train", "val_over_train", "tag", "last_step", "last_value", "tail100_mean", "tail100_std", "min_value", "max_value"], "Training Monitoring 检查 train/validation loss gap、runtime scalar 和参数更新范数。"),
         "",
         "## 6. Appendix Diagnostics",
         "",
@@ -1359,7 +1377,9 @@ def write_full_benchmark_report(summary: dict[str, Any]) -> tuple[Path, Path]:
     evaluation_body = (
         render_subsection(
             "4.1. IC Summary",
-            ic_summary_table(dict(train_ic), dict(test_ic))
+            render_block_title("core_ic_metrics.csv")
+            + render_csv_table(BENCHMARK_ROOT / "evaluation" / "core_ic_metrics.csv", 20)
+            + ic_summary_table(dict(train_ic), dict(test_ic))
             + render_embedded_figure("IC Summary Bar", figures["ic_summary"], "Train/test mean_ic 与 icir 对比。")
             + render_embedded_figure("Intraday IC", BENCHMARK_ROOT / "evaluation" / "figures" / "intraday_ic.png", "Train/test intraday IC.")
             + render_field_notes(["split", "count", "mean_ic", "std_ic", "t_stat", "positive_ratio", "icir", "pooled_ic", "pooled_rank_ic"], "IC Summary 用来判断模型样本外统计信号是否稳定。test IC 越高越好, ICIR 越高说明 daily IC 的波动更小。"),
@@ -1369,6 +1389,7 @@ def write_full_benchmark_report(summary: dict[str, Any]) -> tuple[Path, Path]:
             render_block_title("Bucket Construction Principle")
             + render_field_notes([], "每个 evaluation 截面内按 prediction 从低到高排序, 再切成 signal_bucket。signal_bucket=1 代表最低 prediction 分组, signal_bucket=10 代表最高 prediction 分组。读表时应检查 mean_prediction 是否随 bucket 单调上升, 以及 mean_return_bps 和 hit_rate 是否随 bucket 改善。")
             + render_csv_table(BENCHMARK_ROOT / "evaluation" / "signal_bucket_metrics.csv", 12)
+            + render_details_code("pooled_top_decile_return_metrics.yaml", (BENCHMARK_ROOT / "evaluation" / "pooled_top_decile_return_metrics.yaml").read_text(encoding="utf-8"))
             + render_embedded_figure("Signal Bucket Return Hit Rate", figures["signal_quality"], "每个 signal_bucket 的 mean_return_bps 和 hit_rate。")
             + render_embedded_figure("Signal Decile Return", BENCHMARK_ROOT / "evaluation" / "figures" / "model_signal_decile_return.png", "Signal decile return.")
             + render_embedded_figure("Signal Top Minus Bottom", BENCHMARK_ROOT / "evaluation" / "figures" / "model_signal_top_minus_bottom.png", "Daily top-minus-bottom signal spread.")
@@ -1379,6 +1400,8 @@ def write_full_benchmark_report(summary: dict[str, Any]) -> tuple[Path, Path]:
             render_block_title("Cost Model")
             + render_field_notes([], "本报告当前使用 signal proxy 成本模型: 0519 最新训练产物尚未 materialize execution backtest, 因此 trading 表使用 top-minus-bottom signal bucket 作为 unit-turnover proxy, spread_cost_bps 和 fee_cost_bps 置为 0。它适合先检查 B-label 模型排序能力, 但不能替代后续真实 spread + fee execution backtest。")
             + render_csv_table(BENCHMARK_ROOT / "evaluation" / "trading_rule_metrics.csv", 8)
+            + render_block_title("cost_sensitivity_metrics.csv")
+            + render_csv_table(BENCHMARK_ROOT / "evaluation" / "cost_sensitivity_metrics.csv", 20)
             + render_embedded_figure("Trading Cost Bridge", figures["trading_cost"], "q95/q80 策略从 gross 到 net 的成本拆解。")
             + render_field_notes(["strategy_name", "open_quantile", "close_quantile", "gross_daily_return_bps", "net_daily_return_bps", "gross_sharpe", "net_sharpe", "max_drawdown", "daily_turnover", "spread_cost_bps", "fee_cost_bps", "gross_bps_per_turnover", "net_bps_per_turnover", "active_names"], "Trading And Cost 判断统计 signal 转成交易后是否还能覆盖 spread 和 fee。当前 gross 为正但 net 为负, 说明交易规则或成本控制仍需改进。"),
         )
@@ -1387,6 +1410,12 @@ def write_full_benchmark_report(summary: dict[str, Any]) -> tuple[Path, Path]:
             render_block_title("time_bucket_metrics.csv")
             + render_csv_table(BENCHMARK_ROOT / "evaluation" / "time_bucket_metrics.csv", 20)
             + render_embedded_figure("Time Bucket Net Bps Per Turnover", figures["time_bucket"], "按 time_bucket 展示 net_bps_per_turnover。")
+            + render_block_title("time_bucket_ic_metrics.csv")
+            + render_csv_table(BENCHMARK_ROOT / "evaluation" / "time_bucket_ic_metrics.csv", 20)
+            + render_embedded_figure("Time Bucket IC Metrics", BENCHMARK_ROOT / "evaluation" / "figures" / "time_bucket_ic_metrics.png", "按 time_bucket 展示 IC 和 Rank IC。")
+            + render_block_title("vwap_bucket_ic_metrics.csv")
+            + render_csv_table(BENCHMARK_ROOT / "evaluation" / "vwap_bucket_ic_metrics.csv", 10)
+            + render_embedded_figure("VWAP Bucket IC Metrics", BENCHMARK_ROOT / "evaluation" / "figures" / "vwap_bucket_ic_metrics.png", "按 entry_vwap bucket 展示 prediction 对 VWAP execution return 的 IC。")
             + render_block_title("liquidity_bucket_metrics.csv")
             + render_csv_table(BENCHMARK_ROOT / "evaluation" / "liquidity_bucket_metrics.csv", 18)
             + render_embedded_figure("Liquidity Top Signal Bucket", figures["liquidity_top"], "Top signal_bucket 在不同 liq_bucket 下的 entry_net_proxy_bps。")
@@ -1400,6 +1429,9 @@ def write_full_benchmark_report(summary: dict[str, Any]) -> tuple[Path, Path]:
             + render_block_title("month_stability_metrics.csv")
             + render_csv_table(BENCHMARK_ROOT / "evaluation" / "month_stability_metrics.csv", 20)
             + render_embedded_figure("Month Stability Metrics", figures["month_stability"], "按月份展示 top_minus_bottom_bps 和 q95/q80 net bps per turnover。")
+            + render_block_title("monthly_ic_metrics.csv")
+            + render_csv_table(BENCHMARK_ROOT / "evaluation" / "monthly_ic_metrics.csv", 20)
+            + render_embedded_figure("Monthly IC Metrics", BENCHMARK_ROOT / "evaluation" / "figures" / "monthly_ic_metrics.png", "按月份展示 IC 和 Rank IC。")
             + render_block_title("regime_stability_metrics.csv")
             + render_csv_table(BENCHMARK_ROOT / "evaluation" / "regime_stability_metrics.csv", 10)
             + render_embedded_figure("Regime Stability Metrics", figures["regime_stability"], "按 market regime 对比 gross_daily_bps 与 net_daily_bps。")
@@ -1434,13 +1466,15 @@ def write_full_benchmark_report(summary: dict[str, Any]) -> tuple[Path, Path]:
             + render_block_title("train_runtime_scalar_summary.csv")
             + render_csv_table(BENCHMARK_ROOT / "train" / "diagnostics" / "train_runtime_scalar_summary.csv", 12)
             + render_embedded_figure("Train Loss", BENCHMARK_ROOT / "train" / "train_loss_curve.png", "TensorBoard loss curve.")
+            + render_embedded_figure("Train Monitoring Curves", BENCHMARK_ROOT / "train" / "diagnostics" / "train_monitoring_curves.png", "train loss, validation MSE, learning rate curves.")
             + render_details_table("parameter and update norm", render_csv_table(BENCHMARK_ROOT / "train" / "diagnostics" / "checkpoint_parameter_update_norms.csv", 8))
             + render_details_table("TensorBoard storage", render_value_rows([("source_dir", str(tb_manifest["source_dir"])), ("scalar_parquet", str(tb_manifest["scalar_parquet"])), ("scalar_rows", str(tb_manifest["scalar_rows"])), ("tags", ", ".join(list(tb_manifest["tags"])))]))
-            + render_field_notes(["step", "val_mse", "train_loss_mean", "val_minus_train", "val_over_train", "tag", "last_step", "last_value", "tail100_mean", "tail100_std", "min_value", "max_value"], "Training Monitoring 检查 train/validation loss gap、runtime scalar 和参数更新范数, 用于发现训练不稳定或过拟合迹象。"),
+            + render_field_notes(["step", "val_mse_raw", "val_mse_normalized", "train_loss_mean", "val_minus_train", "val_over_train", "tag", "last_step", "last_value", "tail100_mean", "tail100_std", "min_value", "max_value"], "Training Monitoring 检查 train/validation loss gap、runtime scalar 和参数更新范数, 用于发现训练不稳定或过拟合迹象。"),
         )
     )
     appendix_body = (
         render_details_table("intraday IC table", render_csv_table(BENCHMARK_ROOT / "evaluation" / "model_ic" / "intraday_ic.csv", 12))
+        + render_details_table("future experiment metric contract", render_csv_table(BENCHMARK_ROOT / "evaluation" / "future_experiment_metric_contract.csv", 20))
         + render_details_table("extreme value metrics", render_csv_table(BENCHMARK_ROOT / "evaluation" / "extreme_value_metrics.csv", 20))
         + render_details_table("normalization metrics", render_csv_table(BENCHMARK_ROOT / "evaluation" / "normalization_metrics.csv", 30))
         + render_details_table("label availability coverage", render_csv_table(BENCHMARK_ROOT / "evaluation" / "label_availability_coverage.csv", 12))

@@ -269,6 +269,8 @@ FIELD_DEFINITIONS.update(
         "evaluation_contract": {"display_name": "evaluation_contract", "unit": "scope", "direction": "context field", "explanation": "evaluation 覆盖的数据和质量契约。"},
         "step": {"display_name": "step", "unit": "step", "direction": "time index", "explanation": "TensorBoard 或训练日志中的 step。"},
         "val_mse": {"display_name": "val_mse", "unit": "MSE", "direction": "lower is better", "explanation": "validation MSE。"},
+        "val_mse_raw": {"display_name": "val_mse_raw", "unit": "raw-label MSE", "direction": "lower is better", "explanation": "raw label space 下的 validation MSE。"},
+        "val_mse_normalized": {"display_name": "val_mse_normalized", "unit": "normalized-label MSE", "direction": "lower is better", "explanation": "转换到 normalized label space 后的 validation MSE, 用于和 train loss 比较。"},
         "train_loss_mean": {"display_name": "train_loss_mean", "unit": "loss", "direction": "lower is better", "explanation": "train loss 的窗口均值。"},
         "val_minus_train": {"display_name": "val_minus_train", "unit": "loss", "direction": "smaller gap is better", "explanation": "validation MSE 和 train loss mean 的绝对差。"},
         "val_over_train": {"display_name": "val_over_train", "unit": "ratio", "direction": "closer to 1 is expected", "explanation": "validation MSE 和 train loss mean 的比例。"},
@@ -330,4 +332,3 @@ def display_metric_name(raw_name: str) -> str:
     if field is None:
         return str(raw_name)
     return str(field["display_name"])
-

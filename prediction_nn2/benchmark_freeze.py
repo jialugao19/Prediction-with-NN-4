@@ -256,6 +256,14 @@ def summarize_state_dict(ckpt_path: Path) -> dict[str, object]:
     }
 
 
+def infer_gru_hidden_size_from_checkpoint(ckpt_path: Path) -> int:
+    """Infer the GRU hidden size from checkpoint tensor shapes."""
+    # Read the first recurrent hidden-hidden matrix, whose second dimension is hidden_size.
+    ckpt = torch.load(Path(ckpt_path), map_location="cpu")
+    weight_hh_l0 = dict(ckpt["model"])["rnn.weight_hh_l0"]
+    return int(weight_hh_l0.shape[1])
+
+
 def freeze_model_and_train() -> dict[str, object]:
     """Freeze model checkpoint, train manifests, checkpoint metrics, and TensorBoard scalars."""
     # Copy best checkpoint and core train manifests.
@@ -271,12 +279,13 @@ def freeze_model_and_train() -> dict[str, object]:
     # Persist effective model and checkpoint summaries.
     meta = load_yaml(RUN_ROOT / "artifacts" / "npz" / "meta.yaml")
     feature_dim = int(meta["storage"]["groups"]["train"]["feature_dim"])
+    gru_hidden_size = int(infer_gru_hidden_size_from_checkpoint(ckpt_src))
     effective_model_summary = {
         "model_class": "GruMlpRegressor",
         "input_tensor": f"(B, T=60, F={feature_dim})",
         "gru": {
             "input_size": feature_dim,
-            "hidden_size": 256,
+            "hidden_size": int(gru_hidden_size),
             "num_layers": 2,
             "bidirectional": False,
             "dropout": 0.0,

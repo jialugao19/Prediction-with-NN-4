@@ -20,7 +20,6 @@ from portfolio_backtest.simulator import (
     connect_duckdb,
     export_duckdb_table,
     materialize_slot_strategy_table,
-    summarize_baseline_open_strategy,
     summarize_realistic_vwap_strategy,
 )
 
@@ -36,27 +35,8 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig | None = None) -> Pat
     # Materialize feature chunks for price-based returns and costs.
     feature_glob = materialize_feature_chunks(config)
 
-    # Create the DuckDB target-position tables for the two execution definitions.
+    # Create the DuckDB target-position table for the basic VWAP execution definition.
     con = connect_duckdb(config.feature_db_path)
-    materialize_slot_strategy_table(
-        con,
-        feature_glob,
-        config.top_frac,
-        config.long_enabled,
-        config.short_enabled,
-        config.max_liq_bucket,
-        "ret_open_exec_10",
-        "fillable_open",
-        "entry_open_is_up_limit",
-        "entry_open_is_down_limit",
-        "exit_open_is_up_limit",
-        "exit_open_is_down_limit",
-        "current_tradable = true AND prediction_available = true AND adv_amount IS NOT NULL AND adv_amount > 0 AND sigma_intraday IS NOT NULL",
-        config.spread_bps_high,
-        config.spread_bps_mid,
-        config.spread_bps_low,
-        "open_slot_positions",
-    )
     materialize_slot_strategy_table(
         con,
         feature_glob,
@@ -74,45 +54,32 @@ def run_portfolio_backtest(config: PortfolioBacktestConfig | None = None) -> Pat
         config.spread_bps_high,
         config.spread_bps_mid,
         config.spread_bps_low,
-        "vwap_slot_positions",
+        "target_positions",
     )
 
-    # Export the target-position tables to CSV for pandas simulation.
-    open_position_csv = export_duckdb_table(con, config.output_dir, "open_slot_positions", "open_slot_positions.parquet")
-    vwap_position_csv = export_duckdb_table(con, config.output_dir, "vwap_slot_positions", "vwap_slot_positions.parquet")
+    # Export the target-position table for pandas simulation and audit.
+    target_position_path = export_duckdb_table(con, config.output_dir, "target_positions", "target_positions.parquet")
     con.close()
 
-    # Summarize the baseline open and realistic vwap strategies.
-    baseline_bar, baseline_daily, baseline_slot_summary, baseline_summary = summarize_baseline_open_strategy(
-        open_position_csv,
-        config.annual_days,
-        config.impact_eta,
-    )
-    baseline_bar.to_csv(config.output_dir / "baseline_open_slot_bar.csv", index=False)
-    baseline_daily.to_csv(config.output_dir / "baseline_open_combined_daily.csv", index=False)
-    baseline_slot_summary.to_csv(config.output_dir / "baseline_open_slot_summary.csv", index=False)
-    plot_strategy_curves(baseline_daily, config.output_dir / "baseline_open_strategy.png", [])
-    plot_slot_sharpe(baseline_slot_summary, config.output_dir / "baseline_open_slot_sharpe.png", "Baseline(Open) Slot Sharpe")
-
-    realistic_bar, realistic_daily, realistic_slot_summary, realistic_summary = summarize_realistic_vwap_strategy(
-        vwap_position_csv,
+    # Summarize the single basic VWAP top-bottom strategy.
+    bar_pnl, daily_pnl, slot_summary, strategy_summary = summarize_realistic_vwap_strategy(
+        target_position_path,
         config.annual_days,
         config.aum_list,
         config.impact_budget_bps_list,
         config.impact_eta,
     )
-    realistic_bar.to_csv(config.output_dir / "realistic_vwap_slot_bar.csv", index=False)
-    realistic_daily.to_csv(config.output_dir / "realistic_vwap_combined_daily.csv", index=False)
-    realistic_slot_summary.to_csv(config.output_dir / "realistic_vwap_slot_summary.csv", index=False)
-    plot_strategy_curves(realistic_daily, config.output_dir / "strategy_curves.png", config.aum_list)
-    plot_drawdown_curve(realistic_daily, config.output_dir / "drawdown_curve.png", config.aum_list)
-    plot_slot_sharpe(realistic_slot_summary, config.output_dir / "slot_sharpe.png", "Realistic(VWAP) Slot Sharpe")
-    plot_capacity_sweep(realistic_summary, config.output_dir / "capacity_sweep.png", config.aum_list)
+    bar_pnl.to_csv(config.output_dir / "bar_pnl.csv", index=False)
+    daily_pnl.to_csv(config.output_dir / "daily_pnl.csv", index=False)
+    slot_summary.to_csv(config.output_dir / "slot_summary.csv", index=False)
+    plot_strategy_curves(daily_pnl, config.output_dir / "strategy_curves.png", config.aum_list)
+    plot_drawdown_curve(daily_pnl, config.output_dir / "drawdown_curve.png", config.aum_list)
+    plot_slot_sharpe(slot_summary, config.output_dir / "slot_sharpe.png", "Basic VWAP Slot Sharpe")
+    plot_capacity_sweep(strategy_summary, config.output_dir / "capacity_sweep.png", config.aum_list)
 
     # Build the strategy summary payload and write it to YAML.
     strategy_payload: dict[str, Any] = {
-        "baseline_open": baseline_summary,
-        "realistic_vwap": realistic_summary,
+        "basic_vwap": strategy_summary,
         "cost_model": {
             "spread_bps_high": float(config.spread_bps_high),
             "spread_bps_mid": float(config.spread_bps_mid),

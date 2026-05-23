@@ -24,14 +24,13 @@ from prediction_nn2.clean_report import render_clean_report_from_meta
 from prediction_nn2.eval_ic import (
     EvalConfig,
     compute_test_evaluation_report_from_manifest,
-    core_ic_summary_from_manifest,
-    daily_pearson_ic_summary_from_manifest,
     grouped_pooled_ic_from_manifest,
-    intraday_time_series_ic_train_test_from_manifest,
+    pooled_ic_from_manifest,
     rolling_group_ic_from_manifest,
 )
 from prediction_nn2.html_report import build_page, render_embedded_figure, render_figure, render_section, render_table, render_value_rows, render_yaml_block
 from prediction_nn2.model import GruMlpConfig, GruMlpRegressor
+from prediction_nn2.tensorboard_export import write_tensorboard_scalar_export
 
 
 @dataclass(frozen=True)
@@ -73,6 +72,8 @@ class PipelineConfig:
     dataloader_persistent_workers: bool
     num_iters: int
     save_every: int
+    checkpoint_candidate_window_steps: int
+    checkpoint_selection_metric: str
     eval_every: int
     eval_during: bool
     eval_during_num_iters: int
@@ -83,6 +84,7 @@ class PipelineConfig:
     train_profile_active: int
     train_profile_repeat: int
     learning_rate: float
+    gru_hidden_size: int
     hidden_dims: list[int]
     dropout: float
     input_window_size: int
@@ -207,7 +209,7 @@ def _train_stage_contract(cfg: PipelineConfig, feature_dim: int, train_rows: int
         "model_class": "GruMlpRegressor",
         "model_config": {
             "input_size": int(feature_dim),
-            "hidden_size": 256,
+            "hidden_size": int(cfg.gru_hidden_size),
             "num_layers": 2,
             "bidirectional": False,
             "rnn_dropout": 0.0,
@@ -219,6 +221,12 @@ def _train_stage_contract(cfg: PipelineConfig, feature_dim: int, train_rows: int
         "use_lr_sched": "custom",
         "num_iters": int(effective_num_iters),
         "lr_scheduler": _lr_scheduler_contract(cfg, int(train_rows)),
+        "checkpoint_selection": {
+            "save_every": int(cfg.save_every),
+            "candidate_window_steps": int(cfg.checkpoint_candidate_window_steps),
+            "selection_metric": str(cfg.checkpoint_selection_metric),
+            "selection_rule": "max",
+        },
         "dataloader": {
             "batch_size": int(cfg.batch_size),
             "num_workers": int(cfg.num_workers),
@@ -319,7 +327,7 @@ def _model_summary(cfg: PipelineConfig, feature_dim: int, train_rows: int) -> tu
     # Materialize the exact model config used by qmodel training.
     model_cfg = GruMlpConfig(
         input_size=int(feature_dim),
-        hidden_size=256,
+        hidden_size=int(cfg.gru_hidden_size),
         num_layers=2,
         bidirectional=False,
         rnn_dropout=0.0,
@@ -360,6 +368,8 @@ def _model_summary(cfg: PipelineConfig, feature_dim: int, train_rows: int) -> tu
         ("num_iters", str(int(effective_num_iters))),
         ("approx_total_epochs", f"{float(total_epochs):.2f}"),
         ("save_every", str(int(cfg.save_every))),
+        ("checkpoint_candidate_window_steps", str(int(cfg.checkpoint_candidate_window_steps))),
+        ("checkpoint_selection_metric", str(cfg.checkpoint_selection_metric)),
         ("eval_every", str(int(cfg.eval_every))),
         ("num_workers", str(int(cfg.num_workers))),
         ("dataloader_pin_memory", str(bool(cfg.dataloader_pin_memory))),
@@ -472,7 +482,7 @@ def _build_qmodel_config(cfg: PipelineConfig, feature_dim: int, run_root: Path, 
     # Build model config and core training components.
     model_cfg = GruMlpConfig(
         input_size=int(feature_dim),
-        hidden_size=256,
+        hidden_size=int(cfg.gru_hidden_size),
         num_layers=2,
         bidirectional=False,
         rnn_dropout=0.0,
@@ -525,6 +535,7 @@ def _build_qmodel_config(cfg: PipelineConfig, feature_dim: int, run_root: Path, 
         mean_loss_length=200,
         root_dir=str(Path(run_root) / "run"),
         tensorboard_dir=str(Path(run_root) / "run" / "tb"),
+        train_rows_for_report=int(train_rows),
         lr_scheduler=LRSchedulerConfig(**lr_scheduler_cfg),
         profiler=SimpleNamespace(
             profile_section=str(cfg.train_profile_section),
@@ -558,49 +569,211 @@ def _list_checkpoint_iters(run_dir: Path) -> list[int]:
         return []
     return sorted(set(iters))
 
-def _select_best_checkpoint_by_val(run_root: Path, qconf: SimpleNamespace, checkpoint_iters: list[int]) -> tuple[int, dict[int, dict[str, float]]]:
-    """Evaluate validation metrics for checkpoints and pick the best one."""
+
+def _candidate_checkpoint_iters(cfg: PipelineConfig, checkpoint_iters: list[int], final_iter: int) -> list[int]:
+    """Select checkpoint candidates inside the configured trailing step window."""
+    # Keep only checkpoints that fall inside the trailing candidate window.
+    min_iter = int(final_iter) - int(cfg.checkpoint_candidate_window_steps)
+    candidates = [
+        int(it)
+        for it in sorted(set(int(it) for it in list(checkpoint_iters)))
+        if int(min_iter) <= int(it) <= int(final_iter)
+    ]
+
+    # Require at least one candidate so selection cannot silently fall back to stale checkpoints.
+    if len(candidates) == 0:
+        raise RuntimeError(
+            f"No checkpoint candidates inside last {int(cfg.checkpoint_candidate_window_steps)} steps: "
+            f"final_iter={int(final_iter)} checkpoint_count={len(checkpoint_iters)}"
+        )
+    return list(candidates)
+
+
+def _checkpoint_file_sha256(path: Path) -> str:
+    """Hash one checkpoint file for reproducible experiment comparison."""
+    # Stream checkpoint bytes so hashing does not allocate large tensors.
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        while True:
+            chunk = f.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _select_best_checkpoint_from_metrics(cfg: PipelineConfig, checkpoint_iters: list[int], metrics_by_it: dict[int, dict[str, float]]) -> int:
+    """Pick the best checkpoint by maximum configured pooled IC metric."""
+    # Read the configured metric from each candidate and sort deterministically.
+    metric_name = str(cfg.checkpoint_selection_metric)
+
+    def _score(it: int) -> tuple[float, float, float, int]:
+        # Use pooled IC as the primary score, then global/rank IC and MSE as stable tie breakers.
+        m = dict(metrics_by_it[int(it)])
+        return (
+            float(m[metric_name]),
+            float(m["val/quality/global_ic"]),
+            float(m["val/quality/rank_ic"]),
+            -int(it),
+        )
+
+    # Select the highest-scoring checkpoint among the evaluated candidates.
+    return int(sorted([int(it) for it in list(checkpoint_iters)], key=_score, reverse=True)[0])
+
+
+def _load_train_scalar_snapshots(tb_dir: Path, checkpoint_iters: list[int]) -> dict[int, dict[str, float]]:
+    """Load latest TensorBoard train scalars at or before each checkpoint."""
+    # Read scalar events once so checkpoint sidecars can capture training state cheaply.
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    acc = EventAccumulator(Path(tb_dir).as_posix(), size_guidance={"scalars": 0})
+    acc.Reload()
+
+    # Convert all scalar tags into sorted step/value rows.
+    tag_rows: dict[str, list[tuple[int, float]]] = {}
+    for tag in acc.Tags().get("scalars", []):
+        tag_rows[str(tag)] = [(int(s.step), float(s.value)) for s in acc.Scalars(str(tag))]
+
+    # Keep the latest scalar not newer than each checkpoint iteration.
+    snapshots: dict[int, dict[str, float]] = {}
+    for it in sorted(set(int(v) for v in list(checkpoint_iters))):
+        scalars: dict[str, float] = {}
+        for tag, rows in dict(tag_rows).items():
+            prior = [value for step, value in list(rows) if int(step) <= int(it)]
+            if len(prior) > 0:
+                scalars[str(tag)] = float(prior[-1])
+        snapshots[int(it)] = scalars
+    return snapshots
+
+
+def _write_checkpoint_metadata(
+    cfg: PipelineConfig,
+    run_root: Path,
+    qconf: SimpleNamespace,
+    checkpoint_iters: list[int],
+    candidate_iters: list[int],
+    best_it: int,
+    val_metrics_by_it: dict[int, dict[str, float]],
+    final_iter: int,
+) -> None:
+    """Write checkpoint sidecars and selection manifests for experiment comparison."""
+    # Prepare stable metadata directories under the qmodel run directory.
+    import yaml
+
+    metadata_dir = Path(qconf.root_dir) / "checkpoint_metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    candidate_set = {int(it) for it in list(candidate_iters)}
+    best_metrics = dict(val_metrics_by_it[int(best_it)])
+    train_scalars_by_it = _load_train_scalar_snapshots(Path(qconf.root_dir) / "tb", list(checkpoint_iters))
+
+    # Materialize one sidecar per checkpoint so runs remain inspectable without loading .pt files.
+    rows: list[dict[str, object]] = []
+    for it in sorted(set(int(v) for v in list(checkpoint_iters))):
+        ckpt_path = Path(qconf.root_dir) / "ckpt" / f"iter_{int(it)}.pt"
+        metrics = dict(val_metrics_by_it[int(it)]) if int(it) in val_metrics_by_it else {}
+        row = {
+            "iter": int(it),
+            "epoch_approx": float(_approx_epoch(int(it), int(qconf.train_rows_for_report), int(cfg.batch_size))),
+            "checkpoint_path": ckpt_path.as_posix(),
+            "checkpoint_sha256": _checkpoint_file_sha256(ckpt_path),
+            "candidate": bool(int(it) in candidate_set),
+            "selected": bool(int(it) == int(best_it)),
+            "selection_metric": str(cfg.checkpoint_selection_metric),
+            "selection_rule": "max",
+            "selection_value": float(metrics[str(cfg.checkpoint_selection_metric)]) if str(cfg.checkpoint_selection_metric) in metrics else None,
+            "train_scalars": dict(train_scalars_by_it[int(it)]),
+            "validation_metrics": metrics,
+            "fingerprint": {
+                "experiment_name": str(qconf.expr_name),
+                "model_class": str(qconf.model_class.__name__),
+                "data_root": Path(run_root).as_posix(),
+                "run_root": Path(qconf.root_dir).as_posix(),
+            },
+        }
+        (metadata_dir / f"iter_{int(it)}.yaml").write_text(yaml.safe_dump(row, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        rows.append(dict(row))
+
+    # Write a compact index that can be compared across experiments.
+    index = {
+        "run_root": Path(run_root).as_posix(),
+        "qmodel_root": Path(qconf.root_dir).as_posix(),
+        "final_iter": int(final_iter),
+        "save_every": int(cfg.save_every),
+        "candidate_window_steps": int(cfg.checkpoint_candidate_window_steps),
+        "selection_metric": str(cfg.checkpoint_selection_metric),
+        "selection_rule": "max",
+        "best_iter": int(best_it),
+        "candidate_iters": [int(it) for it in list(candidate_iters)],
+        "checkpoints": rows,
+    }
+    (metadata_dir / "checkpoint_index.yaml").write_text(yaml.safe_dump(index, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+    # Write the selected checkpoint manifest with the exact candidate set and best score.
+    best_path = Path(qconf.root_dir) / "ckpt" / f"iter_{int(best_it)}.pt"
+    best_manifest = {
+        "best_iter": int(best_it),
+        "best_checkpoint_path": best_path.as_posix(),
+        "best_checkpoint_sha256": _checkpoint_file_sha256(best_path),
+        "selection_metric": str(cfg.checkpoint_selection_metric),
+        "selection_rule": "max",
+        "selection_value": float(best_metrics[str(cfg.checkpoint_selection_metric)]),
+        "tie_break": [
+            {"val/quality/global_ic": "max"},
+            {"val/quality/rank_ic": "max"},
+            {"val/objective/mse": "health_check"},
+        ],
+        "candidate_iters": [int(it) for it in list(candidate_iters)],
+        "best_validation_metrics": best_metrics,
+        "retention_policy": {
+            "long_term_pt": ["best", "top_k=3", "last", "final", "epoch_boundary"],
+            "short_term_pt_window_steps": int(cfg.checkpoint_candidate_window_steps),
+            "metadata": "retain_all",
+        },
+    }
+    (metadata_dir / "best_checkpoint.yaml").write_text(yaml.safe_dump(best_manifest, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+
+def _select_best_checkpoint_by_val(
+    cfg: PipelineConfig,
+    run_root: Path,
+    qconf: SimpleNamespace,
+    checkpoint_iters: list[int],
+    final_iter: int,
+) -> tuple[int, dict[int, dict[str, float]]]:
+    """Evaluate candidate validation metrics and pick the best pooled-IC checkpoint."""
     # Evaluate each checkpoint on the validation set and keep scalar metrics per iter.
     from qmodel.core.evaluator import Evaluator
     from qmodel.core.cpu_evaluator import CpuEvaluator
 
     metrics_by_it: dict[int, dict[str, float]] = {}
-    checkpoint_iters = sorted(set(int(it) for it in list(checkpoint_iters)))[-5:]
+    candidate_iters = _candidate_checkpoint_iters(cfg, list(checkpoint_iters), int(final_iter))
     if torch.device(qconf.device).type == "cuda":
         evaluator = Evaluator(qconf, group="val", writer=None, enable_logging=True)
     else:
         evaluator = CpuEvaluator(qconf, group="val", writer=None, enable_logging=True)
-    for it in list(checkpoint_iters):
+    for it in list(candidate_iters):
         metrics = evaluator.eval_single(int(it), n_iter=0, namespace="val")
         metrics_by_it[int(it)] = {str(k): float(v) for k, v in metrics.items()}
     evaluator.close()
 
-    # Choose the best checkpoint by minimal validation MSE.
-    def _val_mse(it: int) -> float:
-        # Read MSE from computed metrics dict and require it to exist.
-        m = metrics_by_it[int(it)]
-        return float(m["val/objective/mse"])
-
-    best_it = sorted(list(checkpoint_iters), key=_val_mse)[0]
+    # Choose the best checkpoint by maximum pooled IC and persist comparison metadata.
+    best_it = int(_select_best_checkpoint_from_metrics(cfg, list(candidate_iters), dict(metrics_by_it)))
+    _write_checkpoint_metadata(cfg, Path(run_root), qconf, list(checkpoint_iters), list(candidate_iters), int(best_it), dict(metrics_by_it), int(final_iter))
     return int(best_it), metrics_by_it
 
 
-def _load_val_metrics_from_disk(run_root: Path, checkpoint_iters: list[int]) -> tuple[int, dict[int, dict[str, float]]]:
-    """Load persisted validation metrics and pick the best checkpoint."""
+def _load_val_metrics_from_disk(cfg: PipelineConfig, run_root: Path, checkpoint_iters: list[int], final_iter: int) -> tuple[int, dict[int, dict[str, float]]]:
+    """Load persisted candidate validation metrics and pick the best checkpoint."""
     # Read one metrics.json file per checkpoint and coerce all values to float.
     metrics_by_it: dict[int, dict[str, float]] = {}
-    for it in list(checkpoint_iters):
+    candidate_iters = _candidate_checkpoint_iters(cfg, list(checkpoint_iters), int(final_iter))
+    for it in list(candidate_iters):
         metrics_path = Path(run_root) / "run" / "eval_val" / f"iter_{int(it)}" / "metrics.json"
         metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
         metrics_by_it[int(it)] = {str(k): float(v) for k, v in dict(metrics).items()}
 
-    # Choose the best checkpoint by minimal validation MSE.
-    def _val_mse(it: int) -> float:
-        # Read MSE from the loaded metric dict and require it to exist.
-        m = metrics_by_it[int(it)]
-        return float(m["val/objective/mse"])
-
-    best_it = sorted(list(checkpoint_iters), key=_val_mse)[0]
+    # Choose the best checkpoint by maximum pooled IC.
+    best_it = int(_select_best_checkpoint_from_metrics(cfg, list(candidate_iters), dict(metrics_by_it)))
     return int(best_it), metrics_by_it
 
 
@@ -785,6 +958,12 @@ def _run_train_report_postprocess(
     # Export a loss-curve plot from TensorBoard events for the training log requirement.
     loss_png = Path(out_root) / "train_loss.png"
     _export_train_loss_curve(Path(qconf.root_dir) / "tb", loss_png)
+    tensorboard_manifest = write_tensorboard_scalar_export(
+        Path(qconf.root_dir) / "tb",
+        Path(out_root),
+        "prediction-nn-2",
+        Path(out_root) / "train",
+    )
 
     # Reuse an existing test manifest when it is already on disk.
     test_manifest_path: Path | None = None
@@ -819,25 +998,34 @@ def _run_train_report_postprocess(
     if train_manifest_path is None:
         train_manifest_path = _run_eval_manifest_once(qconf, "train", int(best_it), "eval_train")
 
-    # Compute train/test core IC and time-series summaries from manifests.
+    # Compute train/test pooled IC while skipping timestamp cross-sectional IC summaries.
+    import yaml
+
     t_summary0 = time.time()
     test_core_ic_yaml = Path(out_root) / "core_ic_summary_test.yaml"
-    test_core_ic = core_ic_summary_from_manifest(Path(test_manifest_path), test_core_ic_yaml, 60)
+    test_pooled = pooled_ic_from_manifest(Path(test_manifest_path))
+    test_core_ic = _skipped_cross_sectional_core_ic(test_pooled)
+    test_core_ic_yaml.write_text(yaml.safe_dump(test_core_ic, sort_keys=False, allow_unicode=True), encoding="utf-8")
     test_pooled = dict(test_core_ic["pooled"])
     test_ic_summary_yaml = Path(out_root) / "daily_ic_summary_test.yaml"
-    test_ic_summary = daily_pearson_ic_summary_from_manifest(Path(test_manifest_path), test_ic_summary_yaml)
+    test_ic_summary = _skipped_cross_sectional_daily_ic("test")
+    test_ic_summary_yaml.write_text(yaml.safe_dump(test_ic_summary, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
     train_core_ic_yaml = Path(out_root) / "core_ic_summary_train.yaml"
-    train_core_ic = core_ic_summary_from_manifest(Path(train_manifest_path), train_core_ic_yaml, 60)
+    train_pooled = pooled_ic_from_manifest(Path(train_manifest_path))
+    train_core_ic = _skipped_cross_sectional_core_ic(train_pooled)
+    train_core_ic_yaml.write_text(yaml.safe_dump(train_core_ic, sort_keys=False, allow_unicode=True), encoding="utf-8")
     train_pooled = dict(train_core_ic["pooled"])
     train_ic_summary_yaml = Path(out_root) / "daily_ic_summary_train.yaml"
-    train_ic_summary = daily_pearson_ic_summary_from_manifest(Path(train_manifest_path), train_ic_summary_yaml)
+    train_ic_summary = _skipped_cross_sectional_daily_ic("train")
+    train_ic_summary_yaml.write_text(yaml.safe_dump(train_ic_summary, sort_keys=False, allow_unicode=True), encoding="utf-8")
     t_summary1 = time.time()
 
-    # Emit train/test intraday Pearson IC diagnostics from streamed manifests.
+    # Keep intraday artifact paths for report compatibility but do not compute them.
     intraday_csv = Path(out_root) / "intraday_ic.csv"
     intraday_png = Path(out_root) / "intraday_ic.png"
-    intraday_time_series_ic_train_test_from_manifest(Path(train_manifest_path), Path(test_manifest_path), intraday_csv, intraday_png)
+    intraday_csv.unlink(missing_ok=True)
+    intraday_png.unlink(missing_ok=True)
     eval_cfg = EvalConfig(
         stock1m_dir=Path(cfg.stock1m_dir),
         window_size=int(cfg.rolling_window),
@@ -885,8 +1073,6 @@ def _run_train_report_postprocess(
             "rolling_ic_seconds": float(t_roll1 - t_roll0),
         },
     }
-    import yaml
-
     (Path(out_root) / "perf_audit.yaml").write_text(yaml.safe_dump(perf, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
     # Render and persist the self-contained HTML train report.
@@ -916,6 +1102,7 @@ def _run_train_report_postprocess(
         grouped_ic_yaml,
         grouped_ic_summary,
         loss_png,
+        tensorboard_manifest,
         vol_agg,
         price_agg,
         perf,
@@ -948,6 +1135,7 @@ def _render_train_report_html(
     grouped_ic_yaml: Path,
     grouped_ic_summary: dict[str, object],
     loss_png: Path,
+    tensorboard_manifest: dict[str, object],
     vol_agg,
     price_agg,
     perf: dict[str, object],
@@ -994,7 +1182,7 @@ def _render_train_report_html(
             float(metrics["val/quality/rank_ic"]),
         )
 
-    sweep = sorted([_mse_row(it) for it in list(val_metrics_by_it.keys())], key=lambda r: float(r[1]))[:10]
+    sweep = sorted([_mse_row(it) for it in list(val_metrics_by_it.keys())], key=lambda r: float(r[2]), reverse=True)[:10]
     sweep_table = render_table(
         ["iter", "val_mse", "val_ic", "val_rank_ic"],
         [[str(int(it)), f"{float(mse):.6e}", f"{float(ic):.6f}", f"{float(ric):.6f}"] for it, mse, ic, ric in list(sweep)],
@@ -1054,9 +1242,16 @@ def _render_train_report_html(
         ("best_val_mse", f"{float(val_mse):.6e}"),
         ("best_val_ic", f"{float(val_ic):.6f}"),
         ("best_val_rank_ic", f"{float(val_rank_ic):.6f}"),
+        ("selection_metric", str(cfg.checkpoint_selection_metric)),
+        ("selection_rule", "max"),
+        ("candidate_window_steps", str(int(cfg.checkpoint_candidate_window_steps))),
+        ("checkpoint_index_yaml", (meta_path.parent.parent.parent / "run" / "checkpoint_metadata" / "checkpoint_index.yaml").as_posix()),
+        ("best_checkpoint_yaml", (meta_path.parent.parent.parent / "run" / "checkpoint_metadata" / "best_checkpoint.yaml").as_posix()),
         ("train_loss_space", "normalized_label" if str(meta.get("label_transform", {"type": "none"})["type"]) == "pooled_zscore" else "raw_label"),
         ("eval_metric_space", "raw_label / " + str(label_meta["definition"])),
         ("train_loss_png", loss_png.as_posix()),
+        ("tensorboard_scalar_rows", str(int(tensorboard_manifest["scalar_rows"]))),
+        ("tensorboard_scalar_parquet", str(tensorboard_manifest["scalar_parquet"])),
     ]
     # Summarize the training-time LR schedule and initialization policy for reproducibility.
     lr_sched = _lr_scheduler_contract(cfg, int(prep["train_rows"]))
@@ -1089,20 +1284,8 @@ def _render_train_report_html(
         ("pooled_rank_ic_test", f"{float(test_pooled['rank_ic']):.6f}"),
         ("pooled_count_train", str(int(train_pooled["count"]))),
         ("pooled_count_test", str(int(test_pooled["count"]))),
-        ("train_rolling_60d_rank_ic_mean", f"{float(train_core_ic['rolling_rank_ic']['rank_ic_mean']):.6f}"),
-        ("test_rolling_60d_rank_ic_mean", f"{float(test_core_ic['rolling_rank_ic']['rank_ic_mean']):.6f}"),
-        ("train_rolling_60d_rank_icir", f"{float(train_core_ic['rolling_rank_ic']['rank_icir_mean']):.6f}"),
-        ("test_rolling_60d_rank_icir", f"{float(test_core_ic['rolling_rank_ic']['rank_icir_mean']):.6f}"),
-        ("train_daily_ic_mean", f"{float(train_ic_summary['pearson_ic']['mean']):.6f}"),
-        ("test_daily_ic_mean", f"{float(test_ic_summary['pearson_ic']['mean']):.6f}"),
-        ("train_daily_ic_std", f"{float(train_ic_summary['pearson_ic']['std']):.6f}"),
-        ("test_daily_ic_std", f"{float(test_ic_summary['pearson_ic']['std']):.6f}"),
-        ("train_daily_icir", f"{float(train_ic_summary['pearson_ic']['icir']):.6f}"),
-        ("test_daily_icir", f"{float(test_ic_summary['pearson_ic']['icir']):.6f}"),
-        ("train_daily_t_stat", f"{float(train_ic_summary['pearson_ic']['t_stat']):.4f}"),
-        ("test_daily_t_stat", f"{float(test_ic_summary['pearson_ic']['t_stat']):.4f}"),
-        ("train_day_count", str(int(train_ic_summary["day_count"]))),
-        ("test_day_count", str(int(test_ic_summary["day_count"]))),
+        ("timestamp_cross_sectional_ic", "skipped"),
+        ("skip_reason", str(train_ic_summary["reason"])),
     ]
     grouped_ic_rows = [
         (
@@ -1152,7 +1335,14 @@ def _render_train_report_html(
         ),
         render_section(
             "Intraday IC",
-            render_value_rows([("intraday_ic_csv", intraday_csv.as_posix())]) + render_embedded_figure("Intraday IC", intraday_png, "Train and test Pearson IC are plotted on the same intraday axis."),
+            render_value_rows(
+                [
+                    ("status", "skipped"),
+                    ("reason", str(train_ic_summary["reason"])),
+                    ("intraday_ic_csv", intraday_csv.as_posix()),
+                    ("intraday_ic_png", intraday_png.as_posix()),
+                ]
+            ),
         ),
         render_section(
             "Volatility Rolling IC",
@@ -1173,6 +1363,28 @@ def _render_train_report_html(
         render_section("Performance Audit", render_value_rows(perf_rows) + render_yaml_block(perf)),
     ]
     return build_page("NN Train Report", "Self-contained HTML report with vertically stacked sections.", sections)
+
+
+def _skipped_cross_sectional_core_ic(pooled: dict[str, float]) -> dict[str, object]:
+    """Build a core-IC payload without timestamp cross-sectional IC work."""
+    # Preserve pooled IC while making skipped timestamp-derived metrics explicit.
+    return {
+        "pooled": dict(pooled),
+        "rolling_rank_ic": {
+            "status": "skipped",
+            "reason": "timestamp cross-sectional IC is temporarily disabled in report postprocess",
+        },
+    }
+
+
+def _skipped_cross_sectional_daily_ic(split: str) -> dict[str, object]:
+    """Build a skipped daily-IC payload for one split."""
+    # Keep a small YAML artifact so downstream readers can distinguish skipped from missing.
+    return {
+        "split": str(split),
+        "status": "skipped",
+        "reason": "timestamp cross-sectional IC is temporarily disabled in report postprocess",
+    }
 
 def _approx_epoch(step: int, train_rows: int, batch_size: int) -> float:
     """Convert qmodel iteration step into an approximate epoch count."""
@@ -1350,8 +1562,11 @@ def run_train_stage(
         "seed": int(cfg.seed),
         "num_iters": int(effective_num_iters),
         "save_every": int(cfg.save_every),
+        "checkpoint_candidate_window_steps": int(cfg.checkpoint_candidate_window_steps),
+        "checkpoint_selection_metric": str(cfg.checkpoint_selection_metric),
         "batch_size": int(cfg.batch_size),
         "learning_rate": float(cfg.learning_rate),
+        "gru_hidden_size": int(cfg.gru_hidden_size),
         "hidden_dims": list(cfg.hidden_dims),
         "dropout": float(cfg.dropout),
         "input_window_size": int(cfg.input_window_size),
@@ -1374,7 +1589,7 @@ def run_train_stage(
         m = _load_stage_manifest(manifest_path)
         if str(m.get("fingerprint")) == str(fp):
             best_it = int(m["best_it"])
-            val_metrics_by_it = _load_val_metrics_from_disk(Path(out_root), _list_checkpoint_iters(Path(out_root)))[1]
+            val_metrics_by_it = _load_val_metrics_from_disk(cfg, Path(out_root), _list_checkpoint_iters(Path(out_root)), int(final_iter))[1]
             return qconf, int(best_it), dict(val_metrics_by_it)
 
     # Skip training when enough checkpoints exist but a prior run did not write the train manifest.
@@ -1384,7 +1599,7 @@ def run_train_stage(
             flush=True,
         )
         ckpt_iters = _list_checkpoint_iters(Path(out_root))
-        best_it, val_metrics_by_it = _select_best_checkpoint_by_val(Path(out_root), qconf, ckpt_iters)
+        best_it, val_metrics_by_it = _select_best_checkpoint_by_val(cfg, Path(out_root), qconf, ckpt_iters, int(final_iter))
         _write_stage_manifest(
             manifest_path,
             {
@@ -1393,6 +1608,9 @@ def run_train_stage(
                 "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "final_iter": int(final_iter),
                 "best_it": int(best_it),
+                "checkpoint_candidate_window_steps": int(cfg.checkpoint_candidate_window_steps),
+                "checkpoint_selection_metric": str(cfg.checkpoint_selection_metric),
+                "checkpoint_selection_rule": "max",
             },
         )
         return qconf, int(best_it), dict(val_metrics_by_it)
@@ -1439,7 +1657,7 @@ def run_train_stage(
 
     # Evaluate validation metrics for all checkpoints and pick the best one.
     ckpt_iters = _list_checkpoint_iters(Path(out_root))
-    best_it, val_metrics_by_it = _select_best_checkpoint_by_val(Path(out_root), qconf, ckpt_iters)
+    best_it, val_metrics_by_it = _select_best_checkpoint_by_val(cfg, Path(out_root), qconf, ckpt_iters, int(final_iter))
     _write_stage_manifest(
         manifest_path,
         {
@@ -1448,6 +1666,9 @@ def run_train_stage(
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "final_iter": int(final_iter),
             "best_it": int(best_it),
+            "checkpoint_candidate_window_steps": int(cfg.checkpoint_candidate_window_steps),
+            "checkpoint_selection_metric": str(cfg.checkpoint_selection_metric),
+            "checkpoint_selection_rule": "max",
         },
     )
     return qconf, int(best_it), dict(val_metrics_by_it)
@@ -1468,7 +1689,7 @@ def run_train_report_stage(
     # Build a stage fingerprint so report rebuild can skip when inputs are unchanged.
     stage_cfg = {
         "stage": "train_report",
-        "report_version": 6,
+        "report_version": 7,
         "best_it": int(best_it),
         "data_contract": _load_data_contract_from_meta(Path(prep["meta_path"])),
         "lr_scheduler": _lr_scheduler_contract(cfg, int(prep["train_rows"])),
@@ -1583,6 +1804,8 @@ def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path
 
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     pooled = dict(artifacts.pooled)
+    pooled_nonzero_prediction = dict(artifacts.pooled_nonzero_prediction)
+    top_decile_return = dict(artifacts.top_decile_return)
     ic_summary = dict(artifacts.ic_summary)
     core_ic = dict(artifacts.core_ic)
     grouped_ic = dict(artifacts.grouped_ic)
@@ -1632,8 +1855,14 @@ def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path
                     ("report_dir", Path(report_dir).as_posix()),
                     ("pooled_pearson_ic", f"{float(pooled['pearson_ic']):.6f}"),
                     ("pooled_rank_ic", f"{float(pooled['rank_ic']):.6f}"),
-                    ("rolling_60d_rank_ic_mean", f"{float(core_ic['rolling_rank_ic']['rank_ic_mean']):.6f}"),
-                    ("rolling_60d_rank_icir", f"{float(core_ic['rolling_rank_ic']['rank_icir_mean']):.6f}"),
+                    ("pooled_nonzero_prediction_pearson_ic", f"{float(pooled_nonzero_prediction['pearson_ic']):.6f}"),
+                    ("pooled_nonzero_prediction_rank_ic", f"{float(pooled_nonzero_prediction['rank_ic']):.6f}"),
+                    ("top_decile_return_bps", f"{float(top_decile_return['top_decile_return_bps']):.6f}"),
+                    ("bottom10_mean_target_bps", f"{float(top_decile_return['bottom10_mean_target_bps']):.6f}"),
+                    ("top10_hit_rate", f"{float(top_decile_return['top10_hit_rate']):.6f}"),
+                    ("top10_pred_mean", f"{float(top_decile_return['top10_pred_mean']):.6e}"),
+                    ("top10_pred_std", f"{float(top_decile_return['top10_pred_std']):.6e}"),
+                    ("timestamp_cross_sectional_ic", "skipped"),
                     ("count", str(int(pooled["count"]))),
                 ]
             ),
@@ -1645,14 +1874,12 @@ def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path
                 [
                     ("core_ic_yaml", Path(artifacts.core_ic_yaml).as_posix()),
                     ("ic_summary_yaml", Path(artifacts.ic_summary_yaml).as_posix()),
-                    ("daily_ic_mean", f"{float(ic_summary['pearson_ic']['mean']):.6f}"),
-                    ("daily_ic_std", f"{float(ic_summary['pearson_ic']['std']):.6f}"),
-                    ("daily_icir", f"{float(ic_summary['pearson_ic']['icir']):.6f}"),
-                    ("daily_t_stat", f"{float(ic_summary['pearson_ic']['t_stat']):.4f}"),
-                    ("day_count", str(int(ic_summary["day_count"]))),
+                    ("top_decile_return_yaml", Path(artifacts.top_decile_return_yaml).as_posix()),
+                    ("status", str(ic_summary["status"])),
+                    ("reason", str(ic_summary["reason"])),
                 ]
             )
-            + render_yaml_block({"core": core_ic, "daily": ic_summary}),
+            + render_yaml_block({"core": core_ic, "top_decile_return": top_decile_return, "daily": ic_summary}),
         ),
         render_section(
             f"Annual IC ({year_range})",
@@ -1660,8 +1887,14 @@ def _render_test_evaluation_report_html(cfg: PipelineConfig, manifest_path: Path
         ),
         render_section(
             "Intraday IC",
-            render_value_rows([("intraday_csv", Path(artifacts.intraday_csv).as_posix())])
-            + render_embedded_figure("Test Intraday IC", Path(artifacts.intraday_png), "Test-side intraday IC curve."),
+            render_value_rows(
+                [
+                    ("status", "skipped"),
+                    ("reason", str(ic_summary["reason"])),
+                    ("intraday_csv", Path(artifacts.intraday_csv).as_posix()),
+                    ("intraday_png", Path(artifacts.intraday_png).as_posix()),
+                ]
+            ),
         ),
         render_section(
             "Volatility Rolling IC",
@@ -1769,7 +2002,7 @@ def _run_single_split_staged(cfg: PipelineConfig, *, out_root: Path, start_trade
         prep = _load_prep_summary_from_meta(meta_path)
         qconf = _build_qmodel_config(cfg, feature_dim=len(prep["feature_names"]), run_root=Path(out_root), train_rows=int(prep["train_rows"]))
         ckpt_iters = _list_checkpoint_iters(Path(out_root))
-        best_it, val_metrics_by_it = _load_val_metrics_from_disk(Path(out_root), ckpt_iters)
+        best_it, val_metrics_by_it = _load_val_metrics_from_disk(cfg, Path(out_root), ckpt_iters, int(_resolved_num_iters(cfg, int(prep["train_rows"])) - 1))
         run_train_report_stage(
             cfg,
             out_root=out_root,
@@ -1815,7 +2048,7 @@ def _run_single_split_staged(cfg: PipelineConfig, *, out_root: Path, start_trade
         prep = _load_prep_summary_from_meta(meta_path)
         qconf = _build_qmodel_config(cfg, feature_dim=len(prep["feature_names"]), run_root=Path(out_root), train_rows=int(prep["train_rows"]))
         ckpt_iters = _list_checkpoint_iters(Path(out_root))
-        best_it, _val_metrics_by_it = _load_val_metrics_from_disk(Path(out_root), ckpt_iters)
+        best_it, _val_metrics_by_it = _load_val_metrics_from_disk(cfg, Path(out_root), ckpt_iters, int(_resolved_num_iters(cfg, int(prep["train_rows"])) - 1))
         test_manifest_path = run_test_evaluation_stage(cfg, out_root=out_root, qconf=qconf, best_it=int(best_it), require_existing_eval=True)
         run_test_evaluation_report_stage(cfg, out_root=out_root, test_manifest_path=test_manifest_path)
         return
@@ -1860,8 +2093,10 @@ def _default_config() -> PipelineConfig:
         dataloader_pin_memory=True,
         dataloader_prefetch_factor=4,
         dataloader_persistent_workers=True,
-        num_iters=140001,
-        save_every=35000,
+        num_iters=350001,
+        save_every=10000,
+        checkpoint_candidate_window_steps=150000,
+        checkpoint_selection_metric="val/quality/global_ic",
         eval_every=10000,
         eval_during=False,
         eval_during_num_iters=0,
@@ -1872,6 +2107,7 @@ def _default_config() -> PipelineConfig:
         train_profile_active=20,
         train_profile_repeat=1,
         learning_rate=1e-3,
+        gru_hidden_size=384,
         hidden_dims=[512, 512],
         dropout=0.0,
         input_window_size=60,

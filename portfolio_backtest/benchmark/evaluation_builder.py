@@ -19,6 +19,7 @@ import torch
 import yaml
 
 from prediction_nn2.html_report import build_page, render_block_title, render_code_block, render_embedded_figure, render_html_table, render_section, render_subsection, render_table, render_value_rows
+from prediction_nn2.tensorboard_export import write_tensorboard_scalar_export
 
 
 matplotlib.use("Agg")
@@ -242,7 +243,7 @@ def sync_latest_training_artifacts() -> dict[str, str]:
         SOURCE_RUN_ROOT / "run" / "inference_test" / f"iter_{BEST_CHECKPOINT_ITER}" / "inference_manifest.yaml",
         SOURCE_RUN_ROOT / "train_report.html",
         SOURCE_RUN_ROOT / "run" / "ckpt" / f"iter_{BEST_CHECKPOINT_ITER}.pt",
-    ]
+    ] + sorted((SOURCE_RUN_ROOT / "run" / "tb").glob("events.out.tfevents*"))
     output_paths = [
         BENCHMARK_ROOT / "data" / "npz_meta.yaml",
         BENCHMARK_ROOT / "data" / "normalization_contract.yaml",
@@ -254,6 +255,7 @@ def sync_latest_training_artifacts() -> dict[str, str]:
         BENCHMARK_ROOT / "train" / "checkpoint_metrics.csv",
         BENCHMARK_ROOT / "train" / "train_config.yaml",
         BENCHMARK_ROOT / "train" / "tensorboard_manifest.yaml",
+        BENCHMARK_ROOT / "train" / "tensorboard_scalars.parquet",
         BENCHMARK_ROOT / "train" / "train_loss_curve.png",
         BENCHMARK_ROOT / "model" / "best_checkpoint.pt",
     ]
@@ -341,15 +343,14 @@ def sync_latest_training_artifacts() -> dict[str, str]:
     train_config["source_log"] = "/data-cache/nn/b_label_full_0519_pipeline.log"
     write_yaml(BENCHMARK_ROOT / "train" / "train_config.yaml", train_config)
     copy_file(SOURCE_RUN_ROOT / "train_loss.png", BENCHMARK_ROOT / "train" / "train_loss_curve.png")
-    write_yaml(
-        BENCHMARK_ROOT / "train" / "tensorboard_manifest.yaml",
-        {
-            "source_dir": (SOURCE_RUN_ROOT / "run" / "tb").as_posix(),
-            "scalar_parquet": "not_materialized_for_0519_report",
-            "scalar_rows": 0,
-            "tags": [],
-        },
+    tb_manifest = write_tensorboard_scalar_export(
+        SOURCE_RUN_ROOT / "run" / "tb",
+        SOURCE_RUN_ROOT,
+        BENCHMARK_ID,
+        BENCHMARK_ROOT / "train",
     )
+    tb_manifest["scalar_parquet"] = "train/tensorboard_scalars.parquet"
+    write_yaml(BENCHMARK_ROOT / "train" / "tensorboard_manifest.yaml", tb_manifest)
 
     # Sync model IC artifacts that exist in the latest run.
     copy_training_post_eval_artifacts()
@@ -527,12 +528,13 @@ def standardize_signal_metrics() -> pd.DataFrame:
     output_paths = [
         BENCHMARK_ROOT / "evaluation" / "signal_bucket_metrics.csv",
         BENCHMARK_ROOT / "evaluation" / "top_tail_metrics.csv",
+        BENCHMARK_ROOT / "evaluation" / "pooled_top_decile_return_metrics.yaml",
         BENCHMARK_ROOT / "evaluation" / "model_signal_monotonicity_daily.csv",
         BENCHMARK_ROOT / "evaluation" / "figures" / "model_signal_decile_return.png",
         BENCHMARK_ROOT / "evaluation" / "figures" / "model_signal_top_minus_bottom.png",
     ]
     cache_path = BENCHMARK_ROOT / "evaluation" / "cache" / "signal_bucket_metrics.yaml"
-    expected_cache = artifact_cache_payload("signal_bucket_metrics", 2, pred_manifest, output_paths)
+    expected_cache = artifact_cache_payload("signal_bucket_metrics", 3, pred_manifest, output_paths)
     if cached_artifacts_are_current(cache_path, expected_cache, output_paths):
         return pd.read_csv(BENCHMARK_ROOT / "evaluation" / "signal_bucket_metrics.csv")
 
@@ -566,6 +568,33 @@ def standardize_signal_metrics() -> pd.DataFrame:
         order by date, signal_bucket
         """
     ).fetchdf()
+    pooled_tail_row = con.execute(
+        f"""
+        with base as (
+          select
+            prediction::DOUBLE as prediction,
+            target::DOUBLE as target
+          from read_parquet({pred_sql_paths})
+          where prediction is not null and target is not null
+        ),
+        bucketed as (
+          select
+            prediction,
+            target,
+            ntile(10) over (order by prediction) as prediction_decile
+          from base
+        )
+        select
+          avg(case when prediction_decile = 10 then target else null end) * 1e4 as top_decile_return_bps,
+          avg(case when prediction_decile = 1 then target else null end) * 1e4 as bottom10_mean_target_bps,
+          avg(case when prediction_decile = 10 and target > 0.0 then 1.0 when prediction_decile = 10 then 0.0 else null end) as top10_hit_rate,
+          avg(case when prediction_decile = 10 then prediction else null end) as top10_pred_mean,
+          stddev_pop(case when prediction_decile = 10 then prediction else null end) as top10_pred_std,
+          count(case when prediction_decile = 10 then 1 else null end)::BIGINT as top10_count,
+          count(*)::BIGINT as count
+        from bucketed
+        """
+    ).fetchone()
     con.close()
 
     # Aggregate daily bucket metrics into report rows.
@@ -587,6 +616,18 @@ def standardize_signal_metrics() -> pd.DataFrame:
     out = grouped[["signal_bucket", "row_count", "mean_prediction", "mean_return_bps", "t_stat", "hit_rate", "mean_spread_bps"]]
     out.to_csv(BENCHMARK_ROOT / "evaluation" / "signal_bucket_metrics.csv", index=False)
     out.rename(columns={"signal_bucket": "signal_decile", "mean_return_bps": "daily_return_bps", "row_count": "mean_row_count"}).to_csv(BENCHMARK_ROOT / "evaluation" / "top_tail_metrics.csv", index=False)
+    write_yaml(
+        BENCHMARK_ROOT / "evaluation" / "pooled_top_decile_return_metrics.yaml",
+        {
+            "top_decile_return_bps": float(pooled_tail_row[0]),
+            "bottom10_mean_target_bps": float(pooled_tail_row[1]),
+            "top10_hit_rate": float(pooled_tail_row[2]),
+            "top10_pred_mean": float(pooled_tail_row[3]),
+            "top10_pred_std": float(pooled_tail_row[4]),
+            "top10_count": int(pooled_tail_row[5]),
+            "count": int(pooled_tail_row[6]),
+        },
+    )
 
     # Save compatible signal figures for the report.
     figure_dir = BENCHMARK_ROOT / "evaluation" / "figures"
@@ -692,6 +733,436 @@ def build_time_bucket_metrics() -> pd.DataFrame:
     )
     write_artifact_cache(cache_path, expected_cache)
     return out
+
+
+def build_ic_power_metrics() -> dict[str, str]:
+    """Build fixed IC metrics used for future experiment comparison."""
+    # Resolve selected-checkpoint train and test manifests.
+    train_manifest = SOURCE_RUN_ROOT / "run" / "eval_train" / f"iter_{BEST_CHECKPOINT_ITER}" / "predict_manifest.yaml"
+    test_manifest = SOURCE_RUN_ROOT / "run" / "eval_test" / f"iter_{BEST_CHECKPOINT_ITER}" / "predict_manifest.yaml"
+    output_paths = [
+        BENCHMARK_ROOT / "evaluation" / "core_ic_metrics.csv",
+        BENCHMARK_ROOT / "evaluation" / "daily_ic_metrics.csv",
+        BENCHMARK_ROOT / "evaluation" / "monthly_ic_metrics.csv",
+        BENCHMARK_ROOT / "evaluation" / "figures" / "monthly_ic_metrics.png",
+        BENCHMARK_ROOT / "evaluation" / "future_experiment_metric_contract.csv",
+        BENCHMARK_ROOT / "evaluation" / "future_experiment_metric_contract.yaml",
+    ]
+    cache_path = BENCHMARK_ROOT / "evaluation" / "cache" / "ic_power_metrics.yaml"
+    expected_cache = multi_file_stat_cache_payload("ic_power_metrics", 1, [train_manifest, test_manifest], output_paths)
+    if cached_artifacts_are_current(cache_path, expected_cache, output_paths):
+        return {
+            "core_ic_metrics": "evaluation/core_ic_metrics.csv",
+            "daily_ic_metrics": "evaluation/daily_ic_metrics.csv",
+            "monthly_ic_metrics": "evaluation/monthly_ic_metrics.csv",
+            "metric_contract": "evaluation/future_experiment_metric_contract.yaml",
+        }
+
+    # Compute test daily Pearson IC and Rank IC from timestamp cross-sections.
+    test_sql_paths = duckdb_path_list(parquet_paths_from_manifest(test_manifest, "chunk_files"))
+    con = duckdb.connect()
+    con.execute("set threads to 8")
+    daily = con.execute(
+        f"""
+        with base as (
+          select
+            date::BIGINT as date,
+            time::BIGINT as time,
+            prediction::DOUBLE as prediction,
+            target::DOUBLE as target
+          from read_parquet({test_sql_paths})
+          where prediction is not null and target is not null
+        ),
+        ranked as (
+          select
+            date,
+            time,
+            prediction,
+            target,
+            rank() over (partition by date, time order by prediction)
+              + (count(*) over (partition by date, time, prediction) - 1) / 2.0 as prediction_rank,
+            rank() over (partition by date, time order by target)
+              + (count(*) over (partition by date, time, target) - 1) / 2.0 as target_rank
+          from base
+        ),
+        timestamp_ic as (
+          select
+            date,
+            time,
+            corr(prediction, target) as ic,
+            corr(prediction_rank, target_rank) as rank_ic,
+            count(*)::BIGINT as row_count
+          from ranked
+          group by date, time
+        )
+        select
+          date,
+          cast(floor(date / 100) as BIGINT) as month,
+          avg(ic) as ic,
+          avg(rank_ic) as rank_ic,
+          sum(row_count)::BIGINT as row_count,
+          count(*)::BIGINT as timestamp_count
+        from timestamp_ic
+        group by date
+        order by date
+        """
+    ).fetchdf()
+    pooled_test = con.execute(
+        f"""
+        with ranked as (
+          select
+            prediction::DOUBLE as prediction,
+            target::DOUBLE as target,
+            rank() over (order by prediction) + (count(*) over (partition by prediction) - 1) / 2.0 as prediction_rank,
+            rank() over (order by target) + (count(*) over (partition by target) - 1) / 2.0 as target_rank
+          from read_parquet({test_sql_paths})
+          where prediction is not null and target is not null
+        )
+        select corr(prediction, target) as pearson_ic, corr(prediction_rank, target_rank) as rank_ic, count(*)::BIGINT as row_count
+        from ranked
+        """
+    ).fetchone()
+    pooled_nonzero_test = con.execute(
+        f"""
+        with ranked as (
+          select
+            prediction::DOUBLE as prediction,
+            target::DOUBLE as target,
+            rank() over (order by prediction) + (count(*) over (partition by prediction) - 1) / 2.0 as prediction_rank,
+            rank() over (order by target) + (count(*) over (partition by target) - 1) / 2.0 as target_rank
+          from read_parquet({test_sql_paths})
+          where prediction is not null and target is not null and prediction != 0.0
+        )
+        select corr(prediction, target) as pearson_ic, corr(prediction_rank, target_rank) as rank_ic, count(*)::BIGINT as row_count
+        from ranked
+        """
+    ).fetchone()
+    con.close()
+
+    # Load train/test daily Pearson summaries from the frozen run.
+    train_daily_summary = read_yaml(BENCHMARK_ROOT / "evaluation" / "model_ic" / "daily_ic_summary_train.yaml")
+    test_daily_summary = read_yaml(BENCHMARK_ROOT / "evaluation" / "model_ic" / "daily_ic_summary_test.yaml")
+    pooled = source_pooled_ic_values_from_report()
+
+    # Persist daily and monthly IC tables.
+    daily.to_csv(BENCHMARK_ROOT / "evaluation" / "daily_ic_metrics.csv", index=False)
+    monthly = daily.groupby("month").agg(
+        mean_ic=("ic", "mean"),
+        mean_rank_ic=("rank_ic", "mean"),
+        std_ic=("ic", "std"),
+        std_rank_ic=("rank_ic", "std"),
+        day_count=("date", "count"),
+        row_count=("row_count", "sum"),
+    ).reset_index()
+    monthly["icir"] = monthly["mean_ic"].astype(float) / monthly["std_ic"].astype(float)
+    monthly["rank_icir"] = monthly["mean_rank_ic"].astype(float) / monthly["std_rank_ic"].astype(float)
+    monthly.to_csv(BENCHMARK_ROOT / "evaluation" / "monthly_ic_metrics.csv", index=False)
+
+    # Draw monthly IC and Rank IC together for stability review.
+    figure_dir = BENCHMARK_ROOT / "evaluation" / "figures"
+    figure_dir.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(9, 4))
+    labels = monthly["month"].astype(str).tolist()
+    ax.plot(labels, monthly["mean_ic"].astype(float), marker="o", label="mean_ic", color="#2b6cb0")
+    ax.plot(labels, monthly["mean_rank_ic"].astype(float), marker="o", label="mean_rank_ic", color="#805ad5")
+    ax.axhline(0.0, color="#334155", linewidth=0.9)
+    ax.set_title("Monthly IC and Rank IC")
+    ax.set_xlabel("month")
+    ax.set_ylabel("IC")
+    ax.tick_params(axis="x", rotation=45)
+    ax.legend()
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(figure_dir / "monthly_ic_metrics.png", dpi=160)
+    plt.close(fig)
+
+    # Write the scalar core IC table used by experiment comparison.
+    test_ic_std = float(daily["ic"].astype(float).std(ddof=1))
+    test_rank_std = float(daily["rank_ic"].astype(float).std(ddof=1))
+    core_rows = [
+        {"metric": "test_daily_mean_ic", "value": float(daily["ic"].astype(float).mean()), "unit": "correlation", "direction": "higher_is_better"},
+        {"metric": "test_daily_mean_rank_ic", "value": float(daily["rank_ic"].astype(float).mean()), "unit": "correlation", "direction": "higher_is_better"},
+        {"metric": "test_icir", "value": float(daily["ic"].astype(float).mean() / test_ic_std), "unit": "ratio", "direction": "higher_is_better"},
+        {"metric": "test_rank_icir", "value": float(daily["rank_ic"].astype(float).mean() / test_rank_std), "unit": "ratio", "direction": "higher_is_better"},
+        {"metric": "test_pooled_ic", "value": float(pooled_test[0]), "unit": "correlation", "direction": "higher_is_better"},
+        {"metric": "test_pooled_rank_ic", "value": float(pooled_test[1]), "unit": "correlation", "direction": "higher_is_better"},
+        {"metric": "test_pooled_nonzero_prediction_ic", "value": float(pooled_nonzero_test[0]), "unit": "correlation", "direction": "higher_is_better"},
+        {"metric": "test_pooled_nonzero_prediction_rank_ic", "value": float(pooled_nonzero_test[1]), "unit": "correlation", "direction": "higher_is_better"},
+        {"metric": "test_pooled_nonzero_prediction_count", "value": float(pooled_nonzero_test[2]), "unit": "rows", "direction": "coverage"},
+        {"metric": "train_ic", "value": float(train_daily_summary["pearson_ic"]["mean"]), "unit": "correlation", "direction": "higher_is_better"},
+        {"metric": "test_ic", "value": float(test_daily_summary["pearson_ic"]["mean"]), "unit": "correlation", "direction": "higher_is_better"},
+        {"metric": "train_pooled_ic", "value": float(pooled["train_pooled_ic"]), "unit": "correlation", "direction": "higher_is_better"},
+        {"metric": "train_minus_test_ic", "value": float(train_daily_summary["pearson_ic"]["mean"]) - float(test_daily_summary["pearson_ic"]["mean"]), "unit": "correlation", "direction": "smaller_abs_is_better"},
+        {"metric": "train_minus_test_pooled_ic", "value": float(pooled["train_pooled_ic"]) - float(pooled_test[0]), "unit": "correlation", "direction": "smaller_abs_is_better"},
+    ]
+    pd.DataFrame(core_rows).to_csv(BENCHMARK_ROOT / "evaluation" / "core_ic_metrics.csv", index=False)
+    write_future_experiment_metric_contract()
+    write_artifact_cache(cache_path, expected_cache)
+    return {
+        "core_ic_metrics": "evaluation/core_ic_metrics.csv",
+        "daily_ic_metrics": "evaluation/daily_ic_metrics.csv",
+        "monthly_ic_metrics": "evaluation/monthly_ic_metrics.csv",
+        "metric_contract": "evaluation/future_experiment_metric_contract.yaml",
+    }
+
+
+def source_pooled_ic_values_from_report() -> dict[str, float]:
+    """Read train/test pooled IC values from the frozen train report."""
+    # Extract pooled values from the HTML report because 0519 benchmark froze them there.
+    text = (SOURCE_RUN_ROOT / "train_report.html").read_text(encoding="utf-8")
+    values: dict[str, float] = {}
+    for key in ["pooled_ic_train", "pooled_ic_test"]:
+        match = re.search(rf"<div class=\"kv-key\">{key}</div>\s*<div class=\"kv-value\">([-+0-9.eE]+)</div>", text)
+        if match is None:
+            raise RuntimeError(f"missing pooled IC field in train report: {key}")
+        values[str(key).replace("pooled_ic_", "") + "_pooled_ic"] = float(match.group(1))
+    return {"train_pooled_ic": float(values["train_pooled_ic"]), "test_pooled_ic": float(values["test_pooled_ic"])}
+
+
+def build_time_bucket_ic_metrics() -> dict[str, str]:
+    """Build intraday time-bucket IC and Rank IC tables."""
+    # Resolve selected eval-test prediction chunks.
+    pred_manifest = SOURCE_RUN_ROOT / "run" / "eval_test" / f"iter_{BEST_CHECKPOINT_ITER}" / "predict_manifest.yaml"
+    output_paths = [
+        BENCHMARK_ROOT / "evaluation" / "time_bucket_ic_metrics.csv",
+        BENCHMARK_ROOT / "evaluation" / "figures" / "time_bucket_ic_metrics.png",
+    ]
+    cache_path = BENCHMARK_ROOT / "evaluation" / "cache" / "time_bucket_ic_metrics.yaml"
+    expected_cache = artifact_cache_payload("time_bucket_ic_metrics", 1, pred_manifest, output_paths)
+    if cached_artifacts_are_current(cache_path, expected_cache, output_paths):
+        return {"time_bucket_ic_metrics": "evaluation/time_bucket_ic_metrics.csv"}
+
+    # Compute timestamp cross-sectional IC and aggregate by time bucket.
+    pred_sql_paths = duckdb_path_list(parquet_paths_from_manifest(pred_manifest, "chunk_files"))
+    con = duckdb.connect()
+    con.execute("set threads to 8")
+    out = con.execute(
+        f"""
+        with base as (
+          select
+            date::BIGINT as date,
+            time::BIGINT as time,
+            prediction::DOUBLE as prediction,
+            target::DOUBLE as target
+          from read_parquet({pred_sql_paths})
+          where prediction is not null and target is not null
+        ),
+        ranked as (
+          select
+            date,
+            time,
+            prediction,
+            target,
+            rank() over (partition by date, time order by prediction)
+              + (count(*) over (partition by date, time, prediction) - 1) / 2.0 as prediction_rank,
+            rank() over (partition by date, time order by target)
+              + (count(*) over (partition by date, time, target) - 1) / 2.0 as target_rank
+          from base
+        ),
+        timestamp_ic as (
+          select
+            time,
+            date,
+            corr(prediction, target) as ic,
+            corr(prediction_rank, target_rank) as rank_ic,
+            count(*)::BIGINT as row_count
+          from ranked
+          group by time, date
+        )
+        select
+          cast(time as varchar) as time_bucket,
+          avg(ic) as mean_ic,
+          avg(rank_ic) as mean_rank_ic,
+          stddev_samp(ic) as std_ic,
+          stddev_samp(rank_ic) as std_rank_ic,
+          count(*)::BIGINT as day_count,
+          sum(row_count)::BIGINT as row_count
+        from timestamp_ic
+        group by time
+        order by time
+        """
+    ).fetchdf()
+    con.close()
+    out.to_csv(BENCHMARK_ROOT / "evaluation" / "time_bucket_ic_metrics.csv", index=False)
+
+    # Plot intraday IC and Rank IC curves.
+    fig, ax = plt.subplots(figsize=(10, 4))
+    labels = out["time_bucket"].astype(str).tolist()
+    ax.plot(labels, out["mean_ic"].astype(float), label="mean_ic", color="#2b6cb0", linewidth=1.6)
+    ax.plot(labels, out["mean_rank_ic"].astype(float), label="mean_rank_ic", color="#805ad5", linewidth=1.6)
+    ax.axhline(0.0, color="#334155", linewidth=0.9)
+    ax.set_title("Intraday time-bucket IC")
+    ax.set_xlabel("time bucket")
+    ax.set_ylabel("IC")
+    ax.tick_params(axis="x", labelrotation=45)
+    ax.legend()
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(BENCHMARK_ROOT / "evaluation" / "figures" / "time_bucket_ic_metrics.png", dpi=160)
+    plt.close(fig)
+    write_artifact_cache(cache_path, expected_cache)
+    return {"time_bucket_ic_metrics": "evaluation/time_bucket_ic_metrics.csv"}
+
+
+def build_vwap_bucket_ic_metrics() -> dict[str, str]:
+    """Build VWAP-bucket IC metrics using execution VWAP returns."""
+    # Resolve feature chunks that include prediction and VWAP execution labels.
+    feature_manifest = SOURCE_FEATURE_ROOT / "feature_manifest.yaml"
+    output_paths = [
+        BENCHMARK_ROOT / "evaluation" / "vwap_bucket_ic_metrics.csv",
+        BENCHMARK_ROOT / "evaluation" / "figures" / "vwap_bucket_ic_metrics.png",
+    ]
+    cache_path = BENCHMARK_ROOT / "evaluation" / "cache" / "vwap_bucket_ic_metrics.yaml"
+    expected_cache = multi_file_stat_cache_payload("vwap_bucket_ic_metrics", 1, [feature_manifest], output_paths)
+    if cached_artifacts_are_current(cache_path, expected_cache, output_paths):
+        return {"vwap_bucket_ic_metrics": "evaluation/vwap_bucket_ic_metrics.csv"}
+
+    # Bucket by entry VWAP level within each date/time and compute IC against VWAP execution return.
+    feature_sql_paths = duckdb_path_list(parquet_paths_from_manifest(feature_manifest, "chunk_files"))
+    con = duckdb.connect()
+    con.execute("set threads to 8")
+    out = con.execute(
+        f"""
+        with base as (
+          select
+            date::BIGINT as date,
+            time::BIGINT as time,
+            prediction::DOUBLE as prediction,
+            ret_vwap_exec_10::DOUBLE as target_vwap,
+            entry_vwap::DOUBLE as entry_vwap
+          from read_parquet({feature_sql_paths})
+          where prediction_available = true
+            and fillable_vwap = true
+            and prediction is not null
+            and ret_vwap_exec_10 is not null
+            and entry_vwap is not null
+        ),
+        bucketed as (
+          select
+            *,
+            ntile(5) over (partition by date, time order by entry_vwap) as vwap_bucket
+          from base
+        ),
+        ranked as (
+          select
+            vwap_bucket,
+            prediction,
+            target_vwap,
+            rank() over (partition by vwap_bucket order by prediction)
+              + (count(*) over (partition by vwap_bucket, prediction) - 1) / 2.0 as prediction_rank,
+            rank() over (partition by vwap_bucket order by target_vwap)
+              + (count(*) over (partition by vwap_bucket, target_vwap) - 1) / 2.0 as target_rank
+          from bucketed
+        )
+        select
+          vwap_bucket,
+          corr(prediction, target_vwap) as mean_ic,
+          corr(prediction_rank, target_rank) as mean_rank_ic,
+          count(*)::BIGINT as row_count
+        from ranked
+        group by vwap_bucket
+        order by vwap_bucket
+        """
+    ).fetchdf()
+    con.close()
+    out.to_csv(BENCHMARK_ROOT / "evaluation" / "vwap_bucket_ic_metrics.csv", index=False)
+
+    # Plot VWAP bucket IC and Rank IC for execution-target diagnostics.
+    fig, ax = plt.subplots(figsize=(7.5, 4))
+    labels = out["vwap_bucket"].astype(str).tolist()
+    ax.plot(labels, out["mean_ic"].astype(float), marker="o", label="mean_ic", color="#2b6cb0")
+    ax.plot(labels, out["mean_rank_ic"].astype(float), marker="o", label="mean_rank_ic", color="#805ad5")
+    ax.axhline(0.0, color="#334155", linewidth=0.9)
+    ax.set_title("VWAP bucket IC")
+    ax.set_xlabel("entry_vwap bucket")
+    ax.set_ylabel("IC vs ret_vwap_exec_10")
+    ax.legend()
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(BENCHMARK_ROOT / "evaluation" / "figures" / "vwap_bucket_ic_metrics.png", dpi=160)
+    plt.close(fig)
+    write_artifact_cache(cache_path, expected_cache)
+    return {"vwap_bucket_ic_metrics": "evaluation/vwap_bucket_ic_metrics.csv"}
+
+
+def build_cost_sensitivity_metrics() -> pd.DataFrame:
+    """Build spread/fee/turnover/net-return cost sensitivity scenarios."""
+    # Load the proxy trading rule and expand deterministic cost scenarios.
+    trading = pd.read_csv(BENCHMARK_ROOT / "evaluation" / "trading_rule_metrics.csv")
+    base = trading.loc[trading["strategy_name"].astype(str) == "q95_q80"].iloc[0]
+    gross = float(base["gross_daily_return_bps"])
+    rows: list[dict[str, object]] = []
+    for spread_cost_bps in [0.0, 2.0, 5.0, 10.0]:
+        for fee_cost_bps in [0.0, 1.0]:
+            for turnover in [0.5, 1.0, 2.0]:
+                # Compute net return after per-turnover costs.
+                total_cost = float(turnover) * (float(spread_cost_bps) + float(fee_cost_bps))
+                net = float(gross - total_cost)
+                rows.append(
+                    {
+                        "strategy_name": "q95_q80",
+                        "spread_cost_bps": float(spread_cost_bps),
+                        "fee_cost_bps": float(fee_cost_bps),
+                        "turnover": float(turnover),
+                        "gross_daily_return_bps": float(gross),
+                        "net_daily_return_bps": float(net),
+                        "net_bps_per_turnover": float(net / float(turnover)),
+                    }
+                )
+    out = pd.DataFrame(rows)
+    out.to_csv(BENCHMARK_ROOT / "evaluation" / "cost_sensitivity_metrics.csv", index=False)
+    return out
+
+
+def build_train_monitoring_figures() -> dict[str, str]:
+    """Build train loss, validation MSE, and LR monitoring curves."""
+    # Load exported TensorBoard scalars.
+    manifest = read_yaml(BENCHMARK_ROOT / "train" / "tensorboard_manifest.yaml")
+    scalar_path = BENCHMARK_ROOT / str(manifest["scalar_parquet"]) if not Path(str(manifest["scalar_parquet"])).is_absolute() else Path(str(manifest["scalar_parquet"]))
+    scalars = pd.read_parquet(scalar_path)
+
+    # Pivot the small scalar subset needed for monitoring plots.
+    tags = ["train/objective/loss_mean", "train/optim/lr", "val/objective/mse"]
+    fig, axes = plt.subplots(3, 1, figsize=(9, 7), sharex=False)
+    for ax, tag, color, ylabel in zip(axes, tags, ["#2b6cb0", "#805ad5", "#2f855a"], ["train loss mean", "lr", "val MSE"], strict=True):
+        sub = scalars.loc[scalars["tag"].astype(str) == str(tag)].sort_values("step")
+        ax.plot(sub["step"].astype(int), sub["value"].astype(float), color=color, linewidth=1.4)
+        ax.set_title(str(tag))
+        ax.set_ylabel(str(ylabel))
+        ax.grid(alpha=0.25)
+    axes[-1].set_xlabel("step")
+    fig.tight_layout()
+    out_png = BENCHMARK_ROOT / "train" / "diagnostics" / "train_monitoring_curves.png"
+    fig.savefig(out_png, dpi=160)
+    plt.close(fig)
+    return {"train_monitoring_curves": "train/diagnostics/train_monitoring_curves.png"}
+
+
+def write_future_experiment_metric_contract() -> dict[str, object]:
+    """Write the fixed metric contract for future power experiments."""
+    # Define every required comparison artifact in one stable table.
+    rows = [
+        (1, "Core IC", "test_daily_mean_ic", "evaluation/core_ic_metrics.csv", "higher_is_better"),
+        (2, "Rank IC", "test_daily_mean_rank_ic", "evaluation/core_ic_metrics.csv", "higher_is_better"),
+        (3, "ICIR", "test_icir", "evaluation/core_ic_metrics.csv", "higher_is_better"),
+        (4, "Pooled IC", "test_pooled_ic, train_pooled_ic", "evaluation/core_ic_metrics.csv", "higher_is_better"),
+        (5, "Generalization gap", "train_minus_test_ic, train_minus_test_pooled_ic", "evaluation/core_ic_metrics.csv", "smaller_abs_is_better"),
+        (6, "Prediction scale", "pred_std_over_target_std, pred/target p01/p50/p99", "evaluation/normalization_metrics.csv", "context"),
+        (7, "Decile table", "signal_bucket 1-10 mean_return_bps, hit_rate", "evaluation/signal_bucket_metrics.csv", "monotonic_higher_bucket"),
+        (11, "Monthly stability", "monthly IC / rank IC table and figure", "evaluation/monthly_ic_metrics.csv", "stable_positive"),
+        (12, "Volatility bucket", "vol bucket x IC / rank IC table and figure", "evaluation/volatility_bucket_stability_metrics.csv", "stable_positive"),
+        (13, "Intraday bucket", "time bucket IC table and figure", "evaluation/time_bucket_ic_metrics.csv", "stable_positive"),
+        (14, "VWAP bucket", "VWAP bucket IC table and figure", "evaluation/vwap_bucket_ic_metrics.csv", "stable_positive"),
+        (15, "Cost sensitivity", "spread/fee/turnover/net return table", "evaluation/cost_sensitivity_metrics.csv", "net_positive_after_cost"),
+        (16, "Checkpoint selection", "checkpoint x val MSE/IC/rank IC/scale", "train/diagnostics/checkpoint_selector_table.csv", "stable_selection"),
+        (17, "Train monitoring", "train loss, val MSE, lr curves", "train/diagnostics/train_monitoring_curves.png", "stable_training"),
+        (18, "Residual diagnostics", "residual distribution, tail error", "evaluation/model_ic/test_residual_diagnostics.yaml", "low_tail_error"),
+    ]
+    df = pd.DataFrame(rows, columns=["category_id", "category", "metric_or_artifact", "path", "decision_direction"])
+    df.to_csv(BENCHMARK_ROOT / "evaluation" / "future_experiment_metric_contract.csv", index=False)
+    payload = {"schema_version": 1, "metrics": df.to_dict(orient="records")}
+    write_yaml(BENCHMARK_ROOT / "evaluation" / "future_experiment_metric_contract.yaml", payload)
+    return payload
 
 
 def build_extreme_value_metrics() -> dict[str, Any]:
@@ -901,6 +1372,8 @@ def build_evaluation_summary(
     q95_q80 = trading.loc[trading["strategy_name"].astype(str) == "q95_q80"].iloc[0]
     best_time = time_bucket.sort_values("net_bps_per_turnover", ascending=False).iloc[0]
     worst_time = time_bucket.sort_values("net_bps_per_turnover", ascending=True).iloc[0]
+    core_ic = pd.read_csv(BENCHMARK_ROOT / "evaluation" / "core_ic_metrics.csv").set_index("metric")["value"].astype(float).to_dict()
+    pooled_tail = read_yaml(BENCHMARK_ROOT / "evaluation" / "pooled_top_decile_return_metrics.yaml")
 
     # Assemble the summary payload.
     payload: dict[str, Any] = {
@@ -909,7 +1382,11 @@ def build_evaluation_summary(
         "status": "complete" if join_validation["status"] == "passed" else "failed",
         "join_validation_status": join_validation["status"],
         "headline_metrics": {
-            "top_decile_return_bps": float(top["mean_return_bps"]),
+            "top_decile_return_bps": float(pooled_tail["top_decile_return_bps"]),
+            "bottom10_mean_target_bps": float(pooled_tail["bottom10_mean_target_bps"]),
+            "top10_hit_rate": float(pooled_tail["top10_hit_rate"]),
+            "top10_pred_mean": float(pooled_tail["top10_pred_mean"]),
+            "top10_pred_std": float(pooled_tail["top10_pred_std"]),
             "bottom_decile_return_bps": float(bottom["mean_return_bps"]),
             "top_minus_bottom_bps": float(top["mean_return_bps"] - bottom["mean_return_bps"]),
             "high_liq_top_decile_net_proxy_bps": float(high_liq_top["entry_net_proxy_bps"]),
@@ -920,16 +1397,33 @@ def build_evaluation_summary(
             "best_time_bucket_net_bps_per_turnover": float(best_time["net_bps_per_turnover"]),
             "worst_time_bucket_by_net_bps_per_turnover": str(worst_time["time_bucket"]),
             "worst_time_bucket_net_bps_per_turnover": float(worst_time["net_bps_per_turnover"]),
+            "test_daily_mean_ic": float(core_ic["test_daily_mean_ic"]),
+            "test_daily_mean_rank_ic": float(core_ic["test_daily_mean_rank_ic"]),
+            "test_icir": float(core_ic["test_icir"]),
+            "test_pooled_ic": float(core_ic["test_pooled_ic"]),
+            "test_pooled_nonzero_prediction_ic": float(core_ic["test_pooled_nonzero_prediction_ic"]),
+            "test_pooled_nonzero_prediction_rank_ic": float(core_ic["test_pooled_nonzero_prediction_rank_ic"]),
+            "train_pooled_ic": float(core_ic["train_pooled_ic"]),
+            "train_minus_test_ic": float(core_ic["train_minus_test_ic"]),
+            "train_minus_test_pooled_ic": float(core_ic["train_minus_test_pooled_ic"]),
         },
         "artifacts": {
             "evaluation_input_manifest": "evaluation/evaluation_input_manifest.yaml",
             "join_validation": "evaluation/join_validation.yaml",
             "signal_bucket_metrics": "evaluation/signal_bucket_metrics.csv",
+            "pooled_top_decile_return_metrics": "evaluation/pooled_top_decile_return_metrics.yaml",
             "liquidity_bucket_metrics": "evaluation/liquidity_bucket_metrics.csv",
             "time_bucket_metrics": "evaluation/time_bucket_metrics.csv",
             "extreme_value_metrics": "evaluation/extreme_value_metrics.yaml",
             "normalization_metrics": "evaluation/normalization_metrics.yaml",
             "trading_rule_metrics": "evaluation/trading_rule_metrics.csv",
+            "core_ic_metrics": "evaluation/core_ic_metrics.csv",
+            "daily_ic_metrics": "evaluation/daily_ic_metrics.csv",
+            "monthly_ic_metrics": "evaluation/monthly_ic_metrics.csv",
+            "time_bucket_ic_metrics": "evaluation/time_bucket_ic_metrics.csv",
+            "vwap_bucket_ic_metrics": "evaluation/vwap_bucket_ic_metrics.csv",
+            "cost_sensitivity_metrics": "evaluation/cost_sensitivity_metrics.csv",
+            "future_experiment_metric_contract": "evaluation/future_experiment_metric_contract.yaml",
         },
     }
     write_yaml(BENCHMARK_ROOT / "evaluation" / "evaluation_summary.yaml", payload)
@@ -959,6 +1453,11 @@ def build_comparison(summary: dict[str, Any]) -> dict[str, Any]:
             "top_decile_return_bps": float(metrics["top_decile_return_bps"]),
             "top_minus_bottom_bps": float(metrics["top_minus_bottom_bps"]),
             "high_liq_top_decile_net_proxy_bps": float(metrics["high_liq_top_decile_net_proxy_bps"]),
+            "test_daily_mean_ic": float(metrics["test_daily_mean_ic"]),
+            "test_daily_mean_rank_ic": float(metrics["test_daily_mean_rank_ic"]),
+            "test_icir": float(metrics["test_icir"]),
+            "test_pooled_ic": float(metrics["test_pooled_ic"]),
+            "train_pooled_ic": float(metrics["train_pooled_ic"]),
             "daily_turnover": float(pd.read_csv(BENCHMARK_ROOT / "evaluation" / "trading_rule_metrics.csv").query("strategy_name == 'q95_q80'").iloc[0]["daily_turnover"]),
         },
         "stability_checks": {
@@ -1089,7 +1588,12 @@ def build_training_diagnostics() -> dict[str, str]:
         out_dir / "checkpoint_selector_table.csv",
     ]
     cache_path = BENCHMARK_ROOT / "evaluation" / "cache" / "training_diagnostics.yaml"
-    expected_cache = file_cache_payload("training_diagnostics", 1, BENCHMARK_ROOT / "train" / "checkpoint_manifest.yaml", output_paths)
+    expected_cache = multi_file_stat_cache_payload(
+        "training_diagnostics",
+        3,
+        [BENCHMARK_ROOT / "train" / "checkpoint_manifest.yaml", BENCHMARK_ROOT / "train" / "checkpoint_metrics.csv", BENCHMARK_ROOT / "train" / "tensorboard_manifest.yaml"],
+        output_paths,
+    )
     if cached_artifacts_are_current(cache_path, expected_cache, output_paths):
         return {
             "checkpoint_parameter_update_norms": "train/diagnostics/checkpoint_parameter_update_norms.csv",
@@ -1144,25 +1648,46 @@ def build_training_diagnostics() -> dict[str, str]:
         },
     )
 
-    # Build train-vs-val gap from retained checkpoint metrics.
+    # Load TensorBoard scalars for train/validation monitoring.
     ckpt_metrics = pd.read_csv(BENCHMARK_ROOT / "train" / "checkpoint_metrics.csv")
-    gap = ckpt_metrics[["iter", "val/objective/mse"]].rename(columns={"iter": "step", "val/objective/mse": "val_mse"}).copy()
-    gap["train_loss_mean"] = np.nan
-    gap["val_minus_train"] = np.nan
-    gap["val_over_train"] = np.nan
+    tb_manifest = read_yaml(BENCHMARK_ROOT / "train" / "tensorboard_manifest.yaml")
+    scalar_path = BENCHMARK_ROOT / str(tb_manifest["scalar_parquet"]) if not Path(str(tb_manifest["scalar_parquet"])).is_absolute() else Path(str(tb_manifest["scalar_parquet"]))
+    scalar_df = pd.read_parquet(scalar_path)
+
+    # Build train-vs-val gap in normalized label space.
+    label_zscore = read_yaml(BENCHMARK_ROOT / "data" / "label_zscore.yaml")
+    label_std = float(dict(label_zscore["label"])["std"])
+    gap = ckpt_metrics[["iter", "val/objective/mse"]].rename(columns={"iter": "step", "val/objective/mse": "val_mse_raw"}).copy()
+    gap["val_mse_normalized"] = gap["val_mse_raw"].astype(float) / float(label_std * label_std)
+    train_loss = scalar_df.loc[scalar_df["tag"].astype(str) == "train/objective/loss_mean", ["step", "value"]].rename(columns={"value": "train_loss_mean"}).copy()
+    gap = gap.merge(train_loss, on="step", how="left")
+    gap["val_minus_train"] = gap["val_mse_normalized"].astype(float) - gap["train_loss_mean"].astype(float)
+    gap["val_over_train"] = gap["val_mse_normalized"].astype(float) / gap["train_loss_mean"].astype(float)
     gap.to_csv(out_dir / "train_val_gap.csv", index=False)
 
-    # Summarize retained validation metrics as the available training monitor.
+    # Summarize TensorBoard scalar tags used by the training monitor.
     perf_rows: list[dict[str, Any]] = []
-    for tag in ["val/objective/mse", "val/quality/global_ic", "val/quality/rank_ic"]:
-        sub = ckpt_metrics[["iter", tag]].rename(columns={"iter": "step", tag: "value"}).dropna().sort_values("step")
+    monitor_tags = [
+        "train/objective/loss",
+        "train/objective/loss_mean",
+        "train/optim/lr",
+        "train/time/iter_ms",
+        "val/objective/mse",
+        "val/quality/global_ic",
+        "val/quality/rank_ic",
+        "val/dist/pred_std_over_target_std",
+    ]
+    for tag in monitor_tags:
+        sub = scalar_df.loc[scalar_df["tag"].astype(str) == str(tag), ["step", "value"]].dropna().sort_values("step")
+        if int(sub.shape[0]) == 0:
+            continue
         perf_rows.append(
             {
                 "tag": tag,
                 "last_step": int(sub.iloc[-1]["step"]),
                 "last_value": float(sub.iloc[-1]["value"]),
-                "tail100_mean": float(sub["value"].mean()),
-                "tail100_std": float(sub["value"].std(ddof=0)),
+                "tail100_mean": float(sub["value"].tail(100).mean()),
+                "tail100_std": float(sub["value"].tail(100).std(ddof=0)),
                 "min_value": float(sub["value"].min()),
                 "max_value": float(sub["value"].max()),
             }
@@ -1417,6 +1942,13 @@ def update_benchmark_and_replay(summary: dict[str, Any]) -> dict[str, Any]:
         "extreme_value_metrics": "evaluation/extreme_value_metrics.yaml",
         "normalization_metrics": "evaluation/normalization_metrics.yaml",
         "trading_rule_metrics": "evaluation/trading_rule_metrics.csv",
+        "core_ic_metrics": "evaluation/core_ic_metrics.csv",
+        "daily_ic_metrics": "evaluation/daily_ic_metrics.csv",
+        "monthly_ic_metrics": "evaluation/monthly_ic_metrics.csv",
+        "time_bucket_ic_metrics": "evaluation/time_bucket_ic_metrics.csv",
+        "vwap_bucket_ic_metrics": "evaluation/vwap_bucket_ic_metrics.csv",
+        "cost_sensitivity_metrics": "evaluation/cost_sensitivity_metrics.csv",
+        "future_experiment_metric_contract": "evaluation/future_experiment_metric_contract.yaml",
         "comparison_against_parent": "evaluation/comparison_against_parent.yaml",
         "bootstrap_confidence_intervals": "evaluation/bootstrap_confidence_intervals.yaml",
         "month_stability_metrics": "evaluation/month_stability_metrics.csv",
@@ -1448,6 +1980,13 @@ def update_benchmark_and_replay(summary: dict[str, Any]) -> dict[str, Any]:
         "extreme_value_metrics_readable": readable_yaml(BENCHMARK_ROOT / "evaluation" / "extreme_value_metrics.yaml"),
         "normalization_metrics_readable": readable_yaml(BENCHMARK_ROOT / "evaluation" / "normalization_metrics.yaml"),
         "trading_rule_metrics_readable": readable_csv(BENCHMARK_ROOT / "evaluation" / "trading_rule_metrics.csv"),
+        "core_ic_metrics_readable": readable_csv(BENCHMARK_ROOT / "evaluation" / "core_ic_metrics.csv"),
+        "daily_ic_metrics_readable": readable_csv(BENCHMARK_ROOT / "evaluation" / "daily_ic_metrics.csv"),
+        "monthly_ic_metrics_readable": readable_csv(BENCHMARK_ROOT / "evaluation" / "monthly_ic_metrics.csv"),
+        "time_bucket_ic_metrics_readable": readable_csv(BENCHMARK_ROOT / "evaluation" / "time_bucket_ic_metrics.csv"),
+        "vwap_bucket_ic_metrics_readable": readable_csv(BENCHMARK_ROOT / "evaluation" / "vwap_bucket_ic_metrics.csv"),
+        "cost_sensitivity_metrics_readable": readable_csv(BENCHMARK_ROOT / "evaluation" / "cost_sensitivity_metrics.csv"),
+        "future_experiment_metric_contract_readable": readable_yaml(BENCHMARK_ROOT / "evaluation" / "future_experiment_metric_contract.yaml"),
         "comparison_against_parent_readable": readable_yaml(BENCHMARK_ROOT / "evaluation" / "comparison_against_parent.yaml"),
         "bootstrap_confidence_intervals_readable": readable_yaml(BENCHMARK_ROOT / "evaluation" / "bootstrap_confidence_intervals.yaml"),
         "month_stability_metrics_readable": readable_csv(BENCHMARK_ROOT / "evaluation" / "month_stability_metrics.csv"),
@@ -1461,6 +2000,7 @@ def update_benchmark_and_replay(summary: dict[str, Any]) -> dict[str, Any]:
         "checkpoint_parameter_update_norms_readable": readable_csv(BENCHMARK_ROOT / "train" / "diagnostics" / "checkpoint_parameter_update_norms.csv"),
         "train_val_gap_readable": readable_csv(BENCHMARK_ROOT / "train" / "diagnostics" / "train_val_gap.csv"),
         "train_runtime_scalar_summary_readable": readable_csv(BENCHMARK_ROOT / "train" / "diagnostics" / "train_runtime_scalar_summary.csv"),
+        "train_monitoring_curves_exists": (BENCHMARK_ROOT / "train" / "diagnostics" / "train_monitoring_curves.png").exists(),
         "train_monitoring_html_exists": (BENCHMARK_ROOT / "reports" / "train_monitoring.html").exists(),
         "model_signal_evaluation_html_exists": (BENCHMARK_ROOT / "reports" / "model_signal_evaluation.html").exists(),
         "trading_evaluation_html_exists": (BENCHMARK_ROOT / "reports" / "trading_evaluation.html").exists(),

@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+
+# Make direct script execution resolve repo-local packages.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from portfolio_backtest.benchmark.evaluation_builder import (
     BENCHMARK_ROOT,
     REPO_BENCHMARK_REPORT_DIR,
@@ -10,13 +19,18 @@ from portfolio_backtest.benchmark.evaluation_builder import (
     build_evaluation_input_manifest,
     build_evaluation_summary,
     build_extreme_value_metrics,
+    build_cost_sensitivity_metrics,
     build_label_availability_coverage,
+    build_ic_power_metrics,
     build_normalization_metrics,
     build_short_side_diagnostics,
     build_stability_diagnostics,
     build_time_bucket_metrics,
+    build_time_bucket_ic_metrics,
     build_training_diagnostics,
+    build_train_monitoring_figures,
     build_turnover_and_capacity_diagnostics,
+    build_vwap_bucket_ic_metrics,
     copy_training_post_eval_artifacts,
     run_join_validation,
     standardize_liquidity_metrics,
@@ -54,12 +68,17 @@ def run_baseline_evaluation():
     build_normalization_metrics()
     copy_training_post_eval_artifacts()
     build_training_diagnostics()
+    build_train_monitoring_figures()
+    build_ic_power_metrics()
+    build_time_bucket_ic_metrics()
+    build_vwap_bucket_ic_metrics()
     build_bootstrap_confidence_intervals()
     build_stability_diagnostics()
     build_label_availability_coverage()
     build_turnover_and_capacity_diagnostics()
     build_short_side_diagnostics()
     trading = standardize_trading_rule_metrics()
+    build_cost_sensitivity_metrics()
     summary = build_evaluation_summary(join_validation, signal, liquidity, time_bucket, trading)
     comparison = build_comparison(summary)
 

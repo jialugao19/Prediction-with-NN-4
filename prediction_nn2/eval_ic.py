@@ -549,6 +549,89 @@ def pooled_ic_from_manifest(manifest_path: Path) -> dict[str, float]:
     return {"pearson_ic": float(row[0]), "rank_ic": float(row[1]), "count": int(row[2])}
 
 
+def pooled_nonzero_prediction_ic_from_manifest(manifest_path: Path) -> dict[str, float]:
+    """Compute pooled Pearson/Rank IC on rows where prediction is nonzero."""
+    # Use DuckDB window ranks over the filtered finite nonzero prediction sample.
+    import duckdb
+
+    scan = _duckdb_manifest_scan(Path(manifest_path))
+    con = duckdb.connect(database=":memory:")
+    con.execute("PRAGMA threads=16")
+    row = con.execute(
+        f"""
+        WITH base AS (
+            SELECT prediction::DOUBLE AS prediction, target::DOUBLE AS target
+            FROM {scan}
+            WHERE isfinite(prediction) AND isfinite(target) AND prediction != 0.0
+        ),
+        ranked AS (
+            SELECT
+                prediction,
+                target,
+                rank() OVER (ORDER BY prediction) + (count(*) OVER (PARTITION BY prediction) - 1) / 2.0 AS prediction_rank,
+                rank() OVER (ORDER BY target) + (count(*) OVER (PARTITION BY target) - 1) / 2.0 AS target_rank
+            FROM base
+        )
+        SELECT
+            corr(prediction, target) AS pearson_ic,
+            corr(prediction_rank, target_rank) AS rank_ic,
+            count(*) AS count
+        FROM ranked
+        """
+    ).fetchone()
+    con.close()
+    return {
+        "pearson_ic": float(row[0]),
+        "rank_ic": float(row[1]),
+        "count": int(row[2]),
+    }
+
+
+def pooled_top_decile_return_from_manifest(manifest_path: Path) -> dict[str, float]:
+    """Compute pooled top prediction decile return and related target diagnostics."""
+    # Rank globally by prediction, then summarize the pooled top and bottom deciles.
+    import duckdb
+
+    scan = _duckdb_manifest_scan(Path(manifest_path))
+    con = duckdb.connect(database=":memory:")
+    con.execute("PRAGMA threads=16")
+    row = con.execute(
+        f"""
+        WITH base AS (
+            SELECT prediction::DOUBLE AS prediction, target::DOUBLE AS target
+            FROM {scan}
+            WHERE isfinite(prediction) AND isfinite(target)
+        ),
+        bucketed AS (
+            SELECT
+                prediction,
+                target,
+                ntile(10) OVER (ORDER BY prediction) AS prediction_decile
+            FROM base
+        )
+        SELECT
+            avg(CASE WHEN prediction_decile = 10 THEN target ELSE NULL END) * 1e4 AS top_decile_return_bps,
+            avg(CASE WHEN prediction_decile = 1 THEN target ELSE NULL END) * 1e4 AS bottom10_mean_target_bps,
+            avg(CASE WHEN prediction_decile = 10 AND target > 0.0 THEN 1.0 WHEN prediction_decile = 10 THEN 0.0 ELSE NULL END) AS top10_hit_rate,
+            avg(CASE WHEN prediction_decile = 10 THEN prediction ELSE NULL END) AS top10_pred_mean,
+            stddev_pop(CASE WHEN prediction_decile = 10 THEN prediction ELSE NULL END) AS top10_pred_std,
+            count(CASE WHEN prediction_decile = 10 THEN 1 ELSE NULL END) AS top10_count,
+            count(*) AS count
+        FROM bucketed
+        """
+    ).fetchone()
+    con.close()
+    return {
+        "top_decile_return_bps": float(row[0]),
+        "bottom10_mean_target_bps": float(row[1]),
+        "top10_hit_rate": float(row[2]),
+        "top10_pred_mean": float(row[3]),
+        "top10_pred_std": float(row[4]),
+        "top10_count": int(row[5]),
+        "count": int(row[6]),
+    }
+
+
 def pooled_pearson_ic_from_manifest(manifest_path: Path) -> dict[str, float]:
     """Compute pooled Pearson IC from a manifest without exact rank IC work."""
     # Stream prediction chunks once and accumulate only Pearson moments.
@@ -1612,6 +1695,9 @@ class TestEvaluationReportArtifacts:
     """Bundle the test-evaluation streaming report outputs computed from a manifest."""
 
     pooled: dict[str, float]
+    pooled_nonzero_prediction: dict[str, float]
+    top_decile_return: dict[str, float]
+    top_decile_return_yaml: Path
     ic_summary: dict[str, object]
     ic_summary_yaml: Path
     core_ic: dict[str, object]
@@ -1645,6 +1731,8 @@ class TestEvaluationReportArtifacts:
 def compute_test_evaluation_report_from_manifest(manifest_path: Path, eval_cfg: EvalConfig, out_root: Path) -> TestEvaluationReportArtifacts:
     """Compute the test-evaluation report artifacts by streaming parquet chunks from a manifest."""
     # Resolve all output paths under the report root to keep pipeline wiring minimal.
+    import yaml
+
     out_root = Path(out_root)
     ic_summary_yaml = Path(out_root) / "test_daily_ic_summary.yaml"
     core_ic_yaml = Path(out_root) / "test_core_ic_summary.yaml"
@@ -1667,18 +1755,36 @@ def compute_test_evaluation_report_from_manifest(manifest_path: Path, eval_cfg: 
     price_png = Path(out_root) / "test_price_rolling_ic.png"
     price_yaml = Path(out_root) / "test_price_rolling_ic.yaml"
 
-    # Compute exact pooled Pearson/Rank IC and rolling 60d Rank IC summary.
-    core_ic = core_ic_summary_from_manifest(Path(manifest_path), Path(core_ic_yaml), 60)
-    pooled = dict(core_ic["pooled"])
+    # Compute exact pooled Pearson/Rank IC and pooled tail return diagnostics.
+    pooled = pooled_ic_from_manifest(Path(manifest_path))
+    pooled_nonzero_prediction = pooled_nonzero_prediction_ic_from_manifest(Path(manifest_path))
+    top_decile_return = pooled_top_decile_return_from_manifest(Path(manifest_path))
+    top_decile_return_yaml = Path(out_root) / "test_top_decile_return.yaml"
+    Path(top_decile_return_yaml).write_text(yaml.safe_dump(top_decile_return, sort_keys=False, allow_unicode=True), encoding="utf-8")
+    core_ic = {
+        "pooled": dict(pooled),
+        "pooled_nonzero_prediction": dict(pooled_nonzero_prediction),
+        "rolling_rank_ic": {
+            "status": "skipped",
+            "reason": "timestamp cross-sectional IC is temporarily disabled in report postprocess",
+        },
+    }
+    Path(core_ic_yaml).write_text(yaml.safe_dump(core_ic, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
-    # Compute day-level Pearson IC summaries from intraday cross-sectional ICs.
-    ic_summary = daily_pearson_ic_summary_from_manifest(Path(manifest_path), Path(ic_summary_yaml))
+    # Write a skipped daily-IC artifact so downstream readers can distinguish skipped from missing.
+    ic_summary = {
+        "split": "test",
+        "status": "skipped",
+        "reason": "timestamp cross-sectional IC is temporarily disabled in report postprocess",
+    }
+    Path(ic_summary_yaml).write_text(yaml.safe_dump(ic_summary, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
     # Compute annual pooled Pearson IC by streaming and bucketing rows by year.
     annual_tbl = annual_pooled_pearson_ic_from_manifest(Path(manifest_path), Path(annual_csv), Path(annual_png))
 
-    # Compute intraday IC curve by streaming timestamp groups and aggregating by minute-of-day.
-    intraday_time_series_ic_from_manifest(Path(manifest_path), Path(intraday_csv), Path(intraday_png))
+    # Remove stale intraday artifacts because this report no longer computes timestamp IC curves.
+    Path(intraday_csv).unlink(missing_ok=True)
+    Path(intraday_png).unlink(missing_ok=True)
 
     # Compute test-side diagnostics that depend on per-timestamp ranks or residuals.
     score_ret_rank_plot_from_manifest(Path(manifest_path), Path(rank_png))
@@ -1693,6 +1799,9 @@ def compute_test_evaluation_report_from_manifest(manifest_path: Path, eval_cfg: 
     # Return a compact artifact bundle so the pipeline can render report.html without extra IO.
     return TestEvaluationReportArtifacts(
         pooled=dict(pooled),
+        pooled_nonzero_prediction=dict(pooled_nonzero_prediction),
+        top_decile_return=dict(top_decile_return),
+        top_decile_return_yaml=Path(top_decile_return_yaml),
         ic_summary=dict(ic_summary),
         ic_summary_yaml=Path(ic_summary_yaml),
         core_ic=dict(core_ic),

@@ -310,7 +310,7 @@ def simulate_slot_book(slot_positions: pd.DataFrame, impact_eta: float) -> pd.Da
                 "adv_amount": adv_amount,
             }
             executed_rows[code] = {
-                "weight": target_weight if fillable else 0.0,
+                "weight": target_weight if fillable else np.nan,
                 "simple_return": simple_return,
                 "spread_bps": spread_bps,
                 "sigma_intraday": sigma_intraday,
@@ -329,7 +329,10 @@ def simulate_slot_book(slot_positions: pd.DataFrame, impact_eta: float) -> pd.Da
         for code in union_codes:
             prev_after_weight = float(position_state.get(code, {}).get("weight", 0.0))
             target_weight = float(target_rows.get(code, {}).get("target_weight", 0.0))
-            executed_weight = float(executed_rows.get(code, {}).get("weight", 0.0))
+            raw_executed_weight = float(executed_rows.get(code, {}).get("weight", 0.0))
+            executed_weight = prev_after_weight if np.isnan(raw_executed_weight) else raw_executed_weight
+            if code in executed_rows:
+                executed_rows[code]["weight"] = float(executed_weight)
             meta = executed_rows.get(code, position_state.get(code))
             planned_turnover += abs(target_weight - prev_after_weight)
             abs_delta = abs(executed_weight - prev_after_weight)
@@ -492,6 +495,9 @@ def attach_net_returns_for_aums(combined_daily: pd.DataFrame, aum_list: list[flo
         out[name] = out["gross_return"].astype(float) - out["spread_cost"].astype(float) - out["impact_coeff"].astype(float) * np.sqrt(
             float(aum)
         )
+    if len(list(aum_list)) == 1:
+        only_aum = float(list(aum_list)[0])
+        out["net_return"] = out[f"net_return_aum_{int(only_aum/1_000_000):d}m"]
     return out
 
 

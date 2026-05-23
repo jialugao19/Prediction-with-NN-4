@@ -141,8 +141,8 @@ def build_report_text(config: PortfolioBacktestConfig, strategy_summary_path: Pa
     """Compose one markdown report focused on portfolio backtest outputs."""
     # Load the strategy summary payload for textual reporting.
     strategy_summary = yaml.safe_load(strategy_summary_path.read_text(encoding="utf-8"))
-    baseline = strategy_summary["baseline_open"]
-    realistic = strategy_summary["realistic_vwap"]
+    strategy = strategy_summary["basic_vwap"]
+    net_key = f"net_{int(float(config.aum_list[0]) / 1_000_000):d}m"
 
     # Compose the markdown lines.
     lines: list[str] = []
@@ -153,8 +153,8 @@ def build_report_text(config: PortfolioBacktestConfig, strategy_summary_path: Pa
 
     lines.append("## 研究范围")
     lines.append("")
-    lines.append("- 本报告只覆盖 execution-aware 组合回测, 不输出 prediction vs target 的信号质量结论。")
-    lines.append("- 信号质量(IC/RankIC/ICIR/rolling group IC/rank turnover)应由独立的信号评估报告负责。")
+    lines.append("- 本报告只覆盖最基础的 VWAP execution-aware top-bottom decile 回测。")
+    lines.append("- 信号质量由独立 evaluation report 负责, 本报告只回答 execution 后 net result 是否还能成立。")
     lines.append("- 回测使用分钟级数据重建 point-in-time universe, 再与 inference prediction 做时间对齐。")
     lines.append("")
 
@@ -184,7 +184,7 @@ def build_report_text(config: PortfolioBacktestConfig, strategy_summary_path: Pa
     lines.append("")
     lines.append("- Universe 以分钟级当时可见信息(point-in-time)构建: 价格/成交量/成交额为正、ST 剔除。")
     lines.append("- 一字涨跌停 bar 视为不可交易, 不用于入场/出场撮合。")
-    lines.append("- 本回测不建模 borrow/shortable 约束, 也不做市值分桶等额外限制。")
+    lines.append("- 本回测不建模 borrow/shortable 约束, 也不做市值分桶、hysteresis、buffer 或 cost-aware sizing。")
     lines.append("")
 
     lines.append("### 涨跌停执行约束(简化且保守)")
@@ -200,7 +200,7 @@ def build_report_text(config: PortfolioBacktestConfig, strategy_summary_path: Pa
     lines.append("### 成交、持仓与失败处理")
     lines.append("")
     lines.append("- 先生成目标权重, 再在执行层判定是否可成交(fillable)。")
-    lines.append("- 某标的若入场或出场在该方向上不可成交, 则该标的当次执行权重记为 0, 等价于回到现金, 不反向污染排序选股。")
+    lines.append("- 新开仓不可成交则不开仓; 已有仓位遇到当次目标行不可成交时保留旧仓位。")
     lines.append("- 持仓在 bar 间滚动更新为自融资权重(按组合当根收益归一化), 用于后续换手与成本计算。")
     lines.append("")
 
@@ -214,25 +214,23 @@ def build_report_text(config: PortfolioBacktestConfig, strategy_summary_path: Pa
 
     lines.append("## 结果摘要")
     lines.append("")
-    lines.append("### Baseline(Open, no cost)")
+    lines.append("### Basic VWAP top-bottom")
     lines.append("")
-    lines.append(f"- Mean fill ratio: {baseline['execution']['mean_fill_ratio'] * 100:.2f}%.")
-    lines.append(f"- Mean executed gross exposure: {baseline['execution']['mean_executed_gross_exposure']:.4f}.")
-    lines.append(f"- Mean cash buffer: {baseline['execution']['mean_cash_buffer']:.4f}.")
-    lines.append("")
-
-    lines.append("### Realistic(VWAP, with costs)")
-    lines.append("")
-    lines.append(f"- Mean fill ratio: {realistic['execution']['mean_fill_ratio'] * 100:.2f}%.")
-    lines.append(f"- Mean executed gross exposure: {realistic['execution']['mean_executed_gross_exposure']:.4f}.")
-    lines.append(f"- Mean cash buffer: {realistic['execution']['mean_cash_buffer']:.4f}.")
+    lines.append(f"- Gross mean daily return: {strategy['gross']['mean_daily_return'] * 1e4:.2f} bps.")
+    lines.append(f"- Net mean daily return at {int(float(config.aum_list[0]) / 1_000_000)}M: {strategy[net_key]['mean_daily_return'] * 1e4:.2f} bps.")
+    lines.append(f"- Net Sharpe: {strategy[net_key]['annualized_sharpe']:.3f}.")
+    lines.append(f"- Net max drawdown: {strategy[net_key]['max_drawdown'] * 100:.2f}%.")
+    lines.append(f"- Mean daily turnover: {strategy['turnover']['mean_daily_turnover']:.4f}.")
+    lines.append(f"- Mean fill ratio: {strategy['execution']['mean_fill_ratio'] * 100:.2f}%.")
+    lines.append(f"- Mean executed gross exposure: {strategy['execution']['mean_executed_gross_exposure']:.4f}.")
+    lines.append(f"- Mean cash buffer: {strategy['execution']['mean_cash_buffer']:.4f}.")
     lines.append("")
 
     lines.append("### Capacity (impact budget)")
     lines.append("")
     for budget_bps in list(config.impact_budget_bps_list):
         key = f"capacity_at_{int(budget_bps)}bps"
-        lines.append(f"- {int(budget_bps)}bps: AUM ~= {realistic['capacity'][key] / 1_000_000:.2f}M.")
+        lines.append(f"- {int(budget_bps)}bps: AUM ~= {strategy['capacity'][key] / 1_000_000:.2f}M.")
     return "\n".join(lines)
 
 
@@ -242,29 +240,26 @@ def build_self_contained_html_report(config: PortfolioBacktestConfig, strategy_s
     strategy_summary = yaml.safe_load(strategy_summary_path.read_text(encoding="utf-8"))
     report_md_path = Path(config.output_dir) / "research_report.md"
     report_md = report_md_path.read_text(encoding="utf-8")
-    baseline = dict(strategy_summary["baseline_open"])
-    realistic = dict(strategy_summary["realistic_vwap"])
+    strategy = dict(strategy_summary["basic_vwap"])
     cost_model = dict(strategy_summary["cost_model"])
 
-    # Build the baseline overview rows.
-    baseline_rows = [
-        ("mean_daily_return", f"{float(baseline['gross']['mean_daily_return']) * 100:.4f}%"),
-        ("annualized_return", f"{float(baseline['gross']['annualized_return']) * 100:.2f}%"),
-        ("annualized_sharpe", f"{float(baseline['gross']['annualized_sharpe']):.3f}"),
-        ("max_drawdown", f"{float(baseline['gross']['max_drawdown']) * 100:.2f}%"),
-        ("mean_fill_ratio", f"{float(baseline['execution']['mean_fill_ratio']) * 100:.2f}%"),
-        ("mean_cash_buffer", f"{float(baseline['execution']['mean_cash_buffer']):.4f}"),
+    # Build the gross/net summary rows.
+    strategy_headers = ["return_type", "mean_daily_return", "annualized_return", "annualized_sharpe", "max_drawdown"]
+    strategy_rows: list[list[str]] = [
+        [
+            "Gross",
+            f"{float(strategy['gross']['mean_daily_return']) * 100:.4f}%",
+            f"{float(strategy['gross']['annualized_return']) * 100:.2f}%",
+            f"{float(strategy['gross']['annualized_sharpe']):.3f}",
+            f"{float(strategy['gross']['max_drawdown']) * 100:.2f}%",
+        ]
     ]
-
-    # Build the realistic net-by-aum table.
-    realistic_headers = ["AUM", "mean_daily_return", "annualized_return", "annualized_sharpe", "max_drawdown"]
-    realistic_rows: list[list[str]] = []
     for aum in list(config.aum_list):
         key = f"net_{int(aum / 1_000_000):d}m"
-        block = dict(realistic[key])
-        realistic_rows.append(
+        block = dict(strategy[key])
+        strategy_rows.append(
             [
-                f"{int(aum / 1_000_000)}M",
+                f"Net {int(aum / 1_000_000)}M",
                 f"{float(block['mean_daily_return']) * 100:.4f}%",
                 f"{float(block['annualized_return']) * 100:.2f}%",
                 f"{float(block['annualized_sharpe']):.3f}",
@@ -277,7 +272,7 @@ def build_self_contained_html_report(config: PortfolioBacktestConfig, strategy_s
     capacity_rows: list[list[str]] = []
     for budget_bps in list(config.impact_budget_bps_list):
         key = f"capacity_at_{int(budget_bps)}bps"
-        capacity_rows.append([f"{int(budget_bps)}bps", f"{float(realistic['capacity'][key]) / 1_000_000:.2f}M"])
+        capacity_rows.append([f"{int(budget_bps)}bps", f"{float(strategy['capacity'][key]) / 1_000_000:.2f}M"])
 
     # Build the self-contained sections.
     sections = [
@@ -312,13 +307,23 @@ def build_self_contained_html_report(config: PortfolioBacktestConfig, strategy_s
             )
             + render_code_block(yaml.safe_dump(cost_model, sort_keys=False, allow_unicode=True)),
         ),
-        render_section("Baseline Open Summary", render_value_rows(baseline_rows)),
-        render_section("Realistic VWAP Net Summary", render_table(realistic_headers, realistic_rows)),
+        render_section("Basic VWAP Summary", render_table(strategy_headers, strategy_rows)),
+        render_section(
+            "Execution",
+            render_value_rows(
+                [
+                    ("mean_fill_ratio", f"{float(strategy['execution']['mean_fill_ratio']) * 100:.2f}%"),
+                    ("mean_executed_gross_exposure", f"{float(strategy['execution']['mean_executed_gross_exposure']):.4f}"),
+                    ("mean_cash_buffer", f"{float(strategy['execution']['mean_cash_buffer']):.4f}"),
+                    ("mean_daily_turnover", f"{float(strategy['turnover']['mean_daily_turnover']):.4f}"),
+                    ("p95_daily_turnover", f"{float(strategy['turnover']['p95_daily_turnover']):.4f}"),
+                ]
+            ),
+        ),
         render_section("Capacity", render_table(capacity_headers, capacity_rows)),
         render_section(
             "Figures",
-            render_embedded_figure("Baseline Open Strategy", Path(config.output_dir) / "baseline_open_strategy.png", "Baseline open gross strategy curve and diagnostics.")
-            + render_embedded_figure("Realistic VWAP Strategy", Path(config.output_dir) / "strategy_curves.png", "Gross and net wealth curves under multiple AUM assumptions.")
+            render_embedded_figure("Basic VWAP Strategy", Path(config.output_dir) / "strategy_curves.png", "Gross and net wealth curves under the configured AUM assumption.")
             + render_embedded_figure("Drawdown Curve", Path(config.output_dir) / "drawdown_curve.png", "Gross and net drawdown curves.")
             + render_embedded_figure("Slot Sharpe", Path(config.output_dir) / "slot_sharpe.png", "Per-slot annualized Sharpe for the realistic VWAP strategy.")
             + render_embedded_figure("Capacity Sweep", Path(config.output_dir) / "capacity_sweep.png", "Capacity diagnostics under multiple AUM assumptions."),
